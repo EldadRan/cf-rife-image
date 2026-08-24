@@ -1,0 +1,410 @@
+# Build and publish the CF upscale worker to GHCR.
+#
+# **The toolchain gates the publish**, so a bad ffmpeg pin ships nothing and a pull request never
+# publishes. CI publishes; the endpoint is pinned to a sha; that sha is the only link between
+# them.
+#
+# **The contract suite does not run here, and that is deliberate rather than missing.** It lives
+# in the private project repository with the harness and the operating scripts, and it is run
+# locally before a dispatch is ordered — its green run is quoted in the dispatch order, which
+# makes it evidence rather than a claim. What CI keeps is the half of the old gate that needs no
+# test tree: the pinned ffmpeg and the capabilities the encode path depends on.
+name: cf-upscale-image
+
+on:
+  # **No `push` trigger, deliberately.** Not every push is meant to be tested on CI and none of
+  # them is meant to produce an image: work lands in several commits and gets built once, when
+  # somebody decides it is ready. The suite runs on a laptop in seconds, which is where a push
+  # should be checked.
+  #
+  # It used to trigger on pushes touching `handler/**` or `tests/**` back when both lived here,
+  # and the `publish` job was
+  # already gated to `workflow_dispatch` — so those runs never built anything. They still did
+  # damage: a one-minute test run shares the concurrency group below with an in-flight publish and
+  # **cancelled it**. A stray commit killed a build that had been asked for on purpose, twice in
+  # one session.
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      # **Which image this dispatch builds.** `full` is the worker as it has always been; `routec`
+      # is the same tree with the SeedVR2 checkpoint left out (contract §6b) — route C never loads
+      # it, so that image is the correct worker for that route rather than a reduced one. Default
+      # `full`, so a dispatch that says nothing builds what a dispatch has always built.
+      variant:
+        description: "full = weights baked; routec = weightless route-C worker"
+        type: choice
+        default: full
+        options: [full, routec]
+
+# **One build per ref at a time, and the newest wins.** Two pushes in quick succession otherwise
+# run two publishes concurrently, racing to push the same `:latest` tag — the loser can land last
+# and leave `:latest` pointing at the older commit. It also doubles a ~40 minute build's cost for
+# a result nobody wants. Superseded runs are cancelled rather than left to finish.
+# **Keyed on the event as well as the ref**, so a test run and a publish are never in the same
+# group. Two publishes on one ref still supersede each other — which is what this is for, since
+# they race to push the same `:latest` tag — but nothing that does not publish can cancel one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # Python 3.11 because that is what the base image ships. **It has exactly one consumer left:**
+  # the `sys.version_info[:2] == (3, 11)` assertion in the toolchain gate, which is what makes
+  # `setup-python` there load-bearing rather than habit — delete the step and that assertion
+  # checks whatever Python the runner image happened to ship.
+  PYTHON_VERSION: "3.11"
+  # Kept in step with handler/Dockerfile. The distribution's ffmpeg is 4.4 and this code is
+  # written against 9.x; `-vsync` and `-fps_mode` have no version accepting both.
+  # **Month-end tag, deliberately** — see the Dockerfile's note. A daily ages out in fourteen
+  # days and the build's uncached fetch dies with it. This gate used to survive that, because the
+  # cache key was the asset name and a dead tag does not change it: a warm runner passed without
+  # ever resolving the release URL, which is how the last dead pin reached a dispatch green. The
+  # key below now carries this value, so moving it forces one cold fetch and the gate finds out.
+  #
+  # **These two lines are duplicated in handler/Dockerfile and nothing enforces the match.** No
+  # build-arg carries them; each file declares its own. Move one alone and the gate certifies a
+  # tarball the image will not install, which is the same blindness by a different route.
+  FFMPEG_RELEASE: autobuild-2026-07-31-14-10
+  FFMPEG_ASSET: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-gpl-8.1
+
+jobs:
+  # **The gate that survives the suite living elsewhere.** It installs the *pinned* ffmpeg and
+  # asserts the capabilities the encode path needs, which is what stops a bad pin costing
+  # twenty-one minutes of build. It requires no `tests/` tree, so it keeps working with the suite
+  # in another repository — and it is the only thing between a dispatch and a publish, which is
+  # worth knowing when reading what it does and does not check.
+  toolchain-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # **Cached because the release CDN is not reliable from a runner.** This exact 125 MB object
+      # returned 503 to six consecutive attempts, twice, while downloading fine from a laptop and
+      # while a *different* asset on the same host succeeded in the same run.
+      #
+      # **The key carries the release as well as the asset, and the release is the half that
+      # matters.** It used to be the asset name alone, on the reasoning that the tarball is
+      # "pinned and immutable" — but immutable was never the property on offer here. RETAINED
+      # was, and BtbN deleted the pinned release out from under us. Two consequences, both of
+      # which happened: a warm runner satisfied this cache without ever resolving the release
+      # URL, so the gate went green against a tarball it had not fetched and a dead pin reached
+      # a dispatch unseen; and two releases can serve the same asset NAME with different bytes,
+      # which the old key could not tell apart even in principle. Keying on the release means
+      # moving the pin forces one cold fetch, which is exactly when we want to learn it is gone.
+      - name: Cache the pinned ffmpeg
+        uses: actions/cache@v6
+        with:
+          path: ~/ffmpeg-cache
+          key: ffmpeg-${{ env.FFMPEG_RELEASE }}-${{ env.FFMPEG_ASSET }}
+
+      # **The same pinned build the image installs**, which is the whole point of fetching a 125 MB
+      # tarball rather than `apt install ffmpeg`: the assertion below is only worth making against
+      # the exact binary the worker will run. It used to also host rung 1 so the suite ran on that
+      # encoder; the suite runs locally now, and this install survives on the assertion alone.
+      # **Do not simplify it to a distro ffmpeg** — that would leave a capability check that
+      # passes for a binary this image never uses.
+      #
+      # A ~10 minute retry window rather than the ~15 seconds `--retry 5 --retry-delay 3` gives.
+      # The outage that broke this twice lasted longer than the old window and not much longer
+      # than a coffee, which is the range worth waiting out rather than failing in.
+      - name: Install the pinned ffmpeg
+        run: |
+          set -euxo pipefail
+          mkdir -p ~/ffmpeg-cache
+          if [ ! -s ~/ffmpeg-cache/"${FFMPEG_ASSET}".tar.xz ]; then
+            curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 600 \
+              -o ~/ffmpeg-cache/"${FFMPEG_ASSET}".tar.xz \
+              "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_ASSET}.tar.xz"
+          else
+            echo "cache hit: no network needed"
+          fi
+          tar -xJf ~/ffmpeg-cache/"${FFMPEG_ASSET}".tar.xz -C /tmp
+          sudo install -m755 "/tmp/${FFMPEG_ASSET}/bin/ffmpeg" /usr/local/bin/ffmpeg
+          sudo install -m755 "/tmp/${FFMPEG_ASSET}/bin/ffprobe" /usr/local/bin/ffprobe
+
+      # Assert the capabilities the code needs rather than trusting the tarball's name. A build
+      # without libwebp fails every poster and every crop on the first job; a muxer without
+      # use_metadata_tags drops the identity tags with a zero exit code.
+      # **libx265 is asserted for the same reason and not because it has ever been missing.** The
+      # pin is a GPL static build and those normally carry it — "normally" is not evidence, and a
+      # codec the request can ask for is one the image has to have before a job asks for it.
+      # Files, not `grep -q` on a pipe — see the Dockerfile's note. `grep -q` exits on first match
+      # and SIGPIPEs ffmpeg, which `pipefail` turns into exit 141. These lines passed here and
+      # failed in the image build on the same commit: it is a race, so a green run proves nothing.
+      - name: Assert the toolchain
+        run: |
+          set -euxo pipefail
+          python3 -c "import sys; assert sys.version_info[:2] == (3, 11), sys.version"
+          ffmpeg -hide_banner -encoders > /tmp/encoders.txt
+          ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
+          grep -q libwebp /tmp/encoders.txt
+          grep -q libx264 /tmp/encoders.txt
+          grep -q libx265 /tmp/encoders.txt
+          grep -q use_metadata_tags /tmp/mp4muxer.txt
+          ffmpeg -version > /tmp/ffver.txt
+          head -1 /tmp/ffver.txt
+
+
+  # Non-blocking. It reports drift rather than gating a release on someone else's tree, and when
+  # it fires it is a signal to read rather than a build to fix.
+  #
+  # **A canary that only asks whether a suite passes catches nothing** — it has to assert what the
+  # toolchain *reports*. So this one checks the flags and behaviours the worker depends on, and
+  # reports them; it runs no tests, and never usefully did.
+  toolchain-drift:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install ffmpeg master
+        run: |
+          set -euxo pipefail
+          # Same long retry window as the pinned fetch — same CDN, and this asset 503'd too. Not
+          # cached, because `latest` moves by design and a cached copy of it would defeat the
+          # entire point of a drift canary.
+          curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 600 \
+            -o /tmp/ffmpeg.tar.xz \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          tar -xJf /tmp/ffmpeg.tar.xz -C /tmp
+          sudo install -m755 /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg
+          sudo install -m755 /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/ffprobe
+
+      - name: Report what master does with the flags this worker depends on
+        run: |
+          set -uxo pipefail
+          ffmpeg -version > /tmp/ffver.txt
+          head -1 /tmp/ffver.txt
+          echo "--- flags and encoders the encode path needs ---"
+          ffmpeg -hide_banner -encoders > /tmp/encoders.txt
+          ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt
+          grep -E 'libwebp|libx264' /tmp/encoders.txt || echo "MISSING an encoder"
+          grep -q use_metadata_tags /tmp/mp4muxer.txt \
+            && echo "use_metadata_tags: present" || echo "use_metadata_tags: GONE — identity tags would silently vanish"
+          # `-vsync` is already removed in 9.x and `-fps_mode` did not exist before 5.0. Neither
+          # is used, and this records what master thinks of them so a future reader knows the
+          # state rather than the history.
+          ffmpeg -hide_banner -h full > /tmp/ffhelp.txt 2>/dev/null || true
+          grep -q -- '-fps_mode' /tmp/ffhelp.txt \
+            && echo "fps_mode: present" || echo "fps_mode: absent"
+
+  publish:
+    needs: toolchain-gate
+    # **Publishing is asked for, never automatic.** The image is ~21 minutes and only matters
+    # when something is about to be deployed; tying it to every push meant a comment in a
+    # handler docstring rebuilt 26 GB.
+    #
+    # So: `workflow_dispatch` from `main`, behind the toolchain gate, and a pull request still
+    # never publishes. **The contract suite is green before a dispatch is ordered, not because
+    # this workflow ran it** — it runs locally against the private repository's harness and its
+    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run docker-publish.yml -R eldadran/cf-upscale-image --ref main`.
+    # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
+    # it can only be pinned to a sha that somebody chose to build.
+    # **Two conditions, and neither is the redundant one.** The ref refuses a `workflow_dispatch`
+    # fired from a branch, which is the only way a non-`main` tree could otherwise publish. The
+    # event refuses a trigger that fires on its own: it held while `push:` was live (see `on:`
+    # above) and would hold again if one returned. Trim the ref and a dispatch from any branch
+    # publishes, today. Trim the event and nothing stops a self-firing trigger the day one is
+    # added back.
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # **A GitHub-hosted runner needs help to hold this image.** Whether it can hold it at all is
+      # still unmeasured — no build has yet reached the weights stage, and the sibling worker bakes
+      # a 15.68 GB fp16 layer on this same runner class with no cleanup whatsoever.
+      # All measured from this workflow's own `df`, not estimated: the runner ships with **15 GB
+      # free** of 72 GB; this cleanup recovers ~23 GB; the base costs **27 GB extracted** from 10.05
+      # GB compressed; the checkpoint and VAE are 17 GB, and safetensors do not compress, so the
+      # pushed blob is ~16 GB again — though whether the extracted layer and the blob are resident
+      # at the same time is an assumption about BuildKit, not something observed.
+      #
+      # **There is no second disk to escape to** — `/mnt` is a directory on `/`, and the only real
+      # filesystem is `/dev/root`. See docs/decisions.md 3.5; the remaining levers all cost either
+      # money or model quality.
+      #
+      # Removed inline rather than via a third-party action: this step runs with `packages: write`
+      # and a registry login, which is not where an unpinned action belongs. The sizes are what
+      # the runner image documents; `df` below reports what was actually recovered.
+      - name: Make room for the image
+        run: |
+          # **No `pipefail` here, and nothing piped into `head`.** `head` exits after its count and
+          # SIGPIPEs whatever is upstream; under `pipefail` plus the runner's default `-e` that
+          # kills the step. It killed this one, in the very step added to diagnose the last
+          # SIGPIPE — cleanup never ran and the build never started. Written to a file instead.
+          set -ux
+          echo "--- every filesystem, before ---"
+          df -h
+          echo "--- what is large under / ---"
+          sudo du -shx /* 2>/dev/null | sort -rh > /tmp/usage.txt || true
+          head -12 /tmp/usage.txt
+          # Everything here is preinstalled tooling this build never touches. **This job does not
+          # use setup-python**, so the whole tool cache goes, not just CodeQL — it only checks out
+          # and builds. The target is the ~44 GB peak the image needs (27 GB base extracted plus
+          # a 17 GB weights layer); the sibling worker's equivalent peak is ~36 GB and it fits,
+          # which is why more cleanup is the cheap thing to try before anything that costs.
+          sudo rm -rf /usr/local/lib/android       # ~9-14 GB, the single biggest win
+          sudo rm -rf /opt/hostedtoolcache         # ~9 GB — CodeQL, Python, Node, Go, Ruby
+          sudo rm -rf /usr/share/dotnet            # ~2 GB
+          sudo rm -rf /opt/ghc /usr/local/.ghcup   # ~5 GB — Haskell
+          sudo rm -rf /usr/share/swift /usr/lib/jvm /usr/share/miniconda /opt/az
+          sudo rm -rf /usr/local/share/powershell /usr/local/share/chromium /usr/local/share/vcpkg
+          sudo rm -rf /usr/local/lib/node_modules /usr/lib/google-cloud-sdk /usr/lib/firefox
+          sudo rm -rf /usr/local/graalvm /usr/local/share/boost /usr/local/julia* /opt/pipx
+          # ~3 GB, and this build is I/O bound rather than memory bound on a 16 GB runner.
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo docker system prune --all --force --volumes  # preinstalled images and volumes
+          echo "--- every filesystem, after ---"
+          df -h
+          # Also to a file, for the artifact below.
+          { echo "=== after cleanup ==="; df -h; echo; echo "=== largest under / before ==="; \
+            head -12 /tmp/usage.txt; } > /tmp/disk-report.txt 2>&1 || true
+
+      # **Uploaded immediately, because a runner that fills its disk takes every log with it.**
+      # Two failures so far ended with the job's entire log missing — not just the failing step's
+      # — so a reading that only exists in the log is a reading that vanishes exactly when it
+      # matters. The artifact is written while the runner is still healthy.
+      - name: Keep the disk report even if the runner dies
+        uses: actions/upload-artifact@v7
+        with:
+          name: disk-report-after-cleanup
+          path: /tmp/disk-report.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      # The default `docker` driver cannot export a cache at all, and fails in seconds.
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A GHCR repository name must be lowercase and a GitHub owner name need not be, so the
+      # name is folded rather than interpolated — otherwise the build runs and *then* fails on
+      # the push with `repository name must be lowercase`.
+      - name: Compute the image name
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          # Stamped here rather than in the Dockerfile: a `date` inside a RUN would be a new
+          # value on every layer rebuild and would invalidate everything below it.
+          echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+          # **The variant decides the tag, the reference the worker reports, and whether the
+          # weights are baked — all three from one input, so they cannot disagree.** A default of
+          # `full` on a `pull_request` run matters: that event carries no inputs at all, and the
+          # gate must keep behaving as it did.
+          if [ "${{ github.event.inputs.variant }}" = "routec" ]; then
+            REF="$IMAGE:sha-${GITHUB_SHA}-routec"
+            TAGS="$REF"
+            echo "BAKE_WEIGHTS=0" >> "$GITHUB_ENV"
+          else
+            REF="$IMAGE:sha-${GITHUB_SHA}"
+            TAGS="$(printf '%s\n%s' "$IMAGE:latest" "$REF")"
+            echo "BAKE_WEIGHTS=1" >> "$GITHUB_ENV"
+          fi
+          echo "IMAGE_REF=$REF" >> "$GITHUB_ENV"
+          # **Heredoc form, because TAGS can be two lines.** `NAME=value` in `$GITHUB_ENV` is
+          # parsed one line at a time, so a second tag would arrive as a line with no `=` and
+          # fail the step. The delimiter is what makes a multi-line value legal.
+          {
+            echo "TAGS<<__TAGS__"
+            echo "$TAGS"
+            echo "__TAGS__"
+          } >> "$GITHUB_ENV"
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: ./handler
+          push: true
+          platforms: linux/amd64
+          # **One commit can produce two images and one tag must not name both** (§6b). The
+          # route-C build takes a suffixed tag and **never `:latest`** — latest is the full
+          # worker's, and moving it to a weightless image would repoint every consumer that
+          # tracks it at a build with no checkpoint.
+          tags: ${{ env.TAGS }}
+          # **What the image needs in order to identify itself in its own bundles.** Ten
+          # calibration runs were banked against an image that reported `"image": null`, so the
+          # only evidence they shared a build was that nobody remembered changing one. The
+          # immutable `:sha-` tag rather than `:latest`, because `:latest` moves and a worker
+          # reporting it would name a build it is not necessarily running.
+          #
+          # Below the weights layer in the Dockerfile, so these change every build and cost one
+          # small layer rather than a 17 GB re-download.
+          #
+          # `IMAGE_REF` is the tag this build is actually pushed under, suffix and all, because a
+          # worker that reports the unsuffixed tag would name the image beside it rather than
+          # itself. `BAKE_WEIGHTS` is what makes the two builds differ at all.
+          build-args: |
+            IMAGE_REF=${{ env.IMAGE_REF }}
+            BUILD_COMMIT=${{ github.sha }}
+            BUILD_UTC=${{ env.BUILD_UTC }}
+            BAKE_WEIGHTS=${{ env.BAKE_WEIGHTS }}
+          # **Registry cache, never type=gha.** The weights layer is ~17 GB and GitHub's Actions
+          # cache budget is 10 GB per repository, so `type=gha` cannot hold it — it fails to help
+          # while evicting whatever else was there. The media worker uses type=gha and is right
+          # to; it has nothing large to cache. Do not copy that line from it.
+          #
+          # **Inline, against `:latest`, not a separate `:buildcache` tag.** `mode=max` to a second
+          # tag exports every intermediate layer — but this Dockerfile is single-stage and linear,
+          # so every one of those layers is already in the published image. It bought a duplicate
+          # ~42 GB push and the disk to stage it, to cache what the image caches for free. Inline
+          # metadata rides in the image itself and gives the same handler-only rebuild.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to: type=inline
+
+      # `always()`, because the reading that matters most is the one taken after a build that ran
+      # out of disk — and that is exactly the run where a normal step is skipped.
+      - name: What the build actually cost in disk
+        if: always()
+        run: |
+          set -uxo pipefail
+          df -h / | tail -1
+          echo "Record the headroom in docs/deployment.md. If it is thin, the next checkpoint"
+          echo "size change is what breaks this, and it will look like an unrelated failure."
+
+      # **Pin the endpoint to this, never to `:latest`.** `:latest` moves, and an endpoint on it
+      # cannot tell you what it is running — neither can RunPod.
+      #
+      # `IMAGE_REF` rather than the sha tag spelled out again: one commit can produce a full and a
+      # route-C image, and a summary naming the unsuffixed tag beside the route-C digest would
+      # publish a reference this run never pushed — tying one image's name to another's bytes.
+      - name: The tag to pin
+        run: |
+          echo "Pin the endpoint to: ${IMAGE_REF}"
+          echo "Record it in docs/deployment.md — RunPod's API will not tell anyone what an endpoint is."
+
+      # **The half of the image's identity the image cannot hold.** A digest exists only once the
+      # push completes, so no layer can carry it; the worker reports the immutable `:sha-` tag it
+      # was built as, and this is where that tag is tied to the digest it resolved to. Written to
+      # the run summary rather than only the log, because a calibration key assembled six weeks
+      # later is assembled from whatever is still readable.
+      - name: Record the digest this build resolved to
+        if: always()
+        run: |
+          {
+            echo "## Image identity"
+            echo
+            echo '| field | value |'
+            echo '|---|---|'
+            echo "| reference | \`${IMAGE_REF}\` |"
+            echo "| digest | \`${{ steps.build.outputs.digest }}\` |"
+            echo "| commit | \`${GITHUB_SHA}\` |"
+            echo "| built (UTC) | ${BUILD_UTC} |"
+            echo
+            echo "The worker self-reports every row above except the digest, in \`build\` on each"
+            echo "bundle and ledger row. Pair them here when keying a calibration measurement."
+          } >> "$GITHUB_STEP_SUMMARY"

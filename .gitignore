@@ -1,0 +1,30 @@
+# **Build-side rules only.** This repository is handler/ and the workflow that builds it;
+# nothing here generates a tree, so this file is short and that is the correct length rather
+# than a sign something was dropped in the seed.
+
+.DS_Store
+__pycache__/
+*.pyc
+
+# **Credentials, and this repository is public.** Neither is read at build time — the workflow
+# takes its secrets from Actions and the worker takes its own from the job envelope — so a file
+# by either name here is a local convenience that must never become a commit. Ignored by name
+# so that `git add -A` cannot publish one irreversibly.
+.env
+.venv/
+
+# **The RIFE weights and the model package, when a local run points at a checkout.**
+# handler/rife.py reads RIFE_MODEL_DIR and needs a directory holding train_log/ and model/;
+# the image gets them from the bake, and a developer gets them by unpacking the archive —
+# often into this tree. flownet.pkl is a PICKLE, so committing one publishes executable code
+# under the name of a weights file, and the build's own sha256 assertion is the only thing
+# that ever checks it.
+train_log/
+model/
+*.pkl
+
+# **Serena's project state and symbol cache.** Written into the repository root by a tool run
+# against this checkout rather than by anything that builds the image. Ignored because a clean
+# tree is asserted when certifying a pinned image, and an untracked directory turns that check
+# red for a reason unrelated to the image.
+.serena/
