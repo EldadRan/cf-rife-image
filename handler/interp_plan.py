@@ -32,6 +32,15 @@ from interpolate import pad_multiple
 #: The registry line this route would read, once it has one. Named here so the absence is a
 #: lookup that fails rather than a silence: `registry-v1.json` models the four SeedVR2 phases and
 #: nothing else, and **a route-C job cannot be quoted from the current registry.**
+#: **Present and null until Phase 2** (excision plan §7.1). `build_identity` reports this, and it
+#: reported `planner.REGISTRY_VERSION` until the planner left — a version of a registry that
+#: cannot quote a route-C job, bumped when a document this project does not hold is re-keyed. The
+#: KEY survives because it is the worker's answer to "which version am I talking to"; the VALUE
+#: does not, because there is nothing here yet for it to name. **Null rather than a placeholder**,
+#: for this module's own reason: a minted string would be indistinguishable from a measurement.
+#: It gets a value when Phase 2 measures route C's line, in this file, beside the coefficients.
+REGISTRY_VERSION = None
+
 REGISTRY_PHASE = "interpolate"
 
 #: What the benchmark must report beyond §8's peak VRAM: **at least three distinct padded areas**

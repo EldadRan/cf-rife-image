@@ -26,7 +26,6 @@ import time
 import urllib.request
 import zipfile
 
-from huggingface_hub import hf_hub_download
 
 REPO = "numz/SeedVR2_comfyUI"
 
@@ -74,8 +73,14 @@ RIFE_SOURCE_FILES = {
         4641, "9e4679cd685a37add8d8bb4a963b9822df0e1d344b82d01f975fc3426c8fc77a"),
 }
 
+#: **The weights file itself, named once.** `build_identity` reports it as `model` and reads it
+#: from here (§7.1: read, not restated) — it used to be `MODEL_BUILD`, an env read with a SeedVR2
+#: filename as its literal default, so dropping that ENV would have pinned every envelope and
+#: every muxed tag to a checkpoint this image does not contain rather than nulling them.
+WEIGHTS_FILE = "flownet.pkl"
+
 RIFE_MEMBERS = {
-    "flownet.pkl": (
+    WEIGHTS_FILE: (
         24636301, "45c7f74156704769dc9f85cfcaf8552e1e926f9399dcfa3a553dee88fac6f53f"),
     "RIFE_HDv3.py": (
         3101, "81bbd0648e499de79e44768d284005d9d57d0f6eb7c30adae407f22675055730"),
@@ -149,6 +154,8 @@ def bake_seedvr2():
 
     total = 0.0
     for filename in (dit_file, VAE_FILE):
+        from huggingface_hub import hf_hub_download  # noqa: PLC0415 — build-time only
+
         path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir,
                                revision=REVISION)
         size = os.path.getsize(path)
@@ -216,6 +223,8 @@ def bake_rife():
     rife_dir = os.environ["RIFE_MODEL_DIR"]
     train_log = os.path.join(rife_dir, "train_log")
     os.makedirs(train_log, exist_ok=True)
+
+    from huggingface_hub import hf_hub_download  # noqa: PLC0415 — build-time only
 
     archive = hf_hub_download(repo_id=RIFE_REPO, filename=RIFE_ARCHIVE, local_dir=rife_dir,
                               revision=RIFE_REVISION)
@@ -285,10 +294,17 @@ def bake_rife():
 # **RIFE first, and the order is not cosmetic.** It is 23 MB and fails in seconds; SeedVR2 is
 # ~16 GiB and takes minutes. Baking the large one first meant a transient blip on the small one's
 # fetch discarded the whole download with the layer. Fail fast, then spend.
-bake_rife()
+# **GATED ON `__main__` SO THE PINS ARE READABLE WITHOUT BAKING ANYTHING.** The Dockerfile runs
+# this as a script (`python3 bake_weights.py`, Dockerfile:225), so the build is unchanged. But
+# `build_identity` now reads `RIFE_REVISION`, `RIFE_ARCHIVE_SHA256` and the weights filename from
+# here rather than restating them (§7.1: read, not restated), and an unguarded call would have
+# made `import handler` fetch 23 MB from HuggingFace. **One fact, one home** — the pins live where
+# the bake asserts them, and the identity reads them there.
+if __name__ == "__main__":
+    bake_rife()
 
-if os.environ.get("BAKE_WEIGHTS") == "0":
-    print("BAKE_WEIGHTS=0 — no SeedVR2 checkpoint; RIFE is baked regardless (contract 6b)",
-          flush=True)
-else:
-    bake_seedvr2()
+    if os.environ.get("BAKE_WEIGHTS") == "0":
+        print("BAKE_WEIGHTS=0 — no SeedVR2 checkpoint; RIFE is baked regardless (contract 6b)",
+              flush=True)
+    else:
+        bake_seedvr2()
