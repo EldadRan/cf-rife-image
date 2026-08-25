@@ -163,6 +163,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             n_in=n_in, src_fps=source["fps"], dst_fps=target_fps,
             tol=snap_tolerance or 0.0)
 
+        # **Frame-level, because decode, RIFE and encode are ONE streaming loop** (contract §1).
+        # There are no phases to report the completion of — the writer pulls each frame through
+        # the whole chain — so "decode complete" is never true and the only quantity that is true
+        # per frame is the frame count. Both halves were already in hand and neither was used:
+        # `n_out` in the stats returned before the loop begins, and `frames_written` on the writer.
+        if progress is not None:
+            progress.plan_frames(stats.get("n_out"))
+
         writer_cm = encoder.MasterWriter(
             master_path, width, height, float(target_fps), identity,
             audio_source=audio_source, audio_codec=source.get("audio_codec"),
@@ -179,6 +187,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             with writer_cm as writer:
                 for frame in stream:
                     writer.write(_to_rgb24(frame))
+                    # **Every frame, and the rate limiter decides what is SENT.** progress._emit
+                    # drops anything inside MIN_INTERVAL_S, so calling per frame costs a
+                    # comparison and publishes at the module's own cadence rather than at one this
+                    # loop would have to invent. `boundary=True` because in a one-frame-at-a-time
+                    # stream every written frame IS a completed unit of work — there are no chunks
+                    # whose mid-flight count would make `elapsed/done` lie.
+                    if progress is not None:
+                        progress.frames(writer.frames_written, phase="interpolate")
         except WorkerError as exc:
             peak = writer_cm.encoder_peak_rss_gb
             if peak is None:

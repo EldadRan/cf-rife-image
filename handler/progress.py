@@ -124,6 +124,18 @@ class Progress:
             self._expected_basis = ("predicted" if basis in (None, "measured")
                                     else "predicted_{}".format(basis))
 
+    def plan_frames(self, count):
+        """Name the planned output count once it is known, rather than at construction.
+
+        **Route C cannot pass `estimated_frames` to the constructor.** The count comes out of the
+        frame plan, which is built after `Progress` exists — so without this the retime path had
+        no `_estimated_frames`, `frames()` published no `pct`, and `eta_s` had no denominator to
+        decay a prediction against. A public setter rather than a caller reaching into the
+        private, because the value is a fact the caller learns and not a state it manages.
+        """
+        if count:
+            self._estimated_frames = int(count)
+
     def phase(self, name, pct=None, force=False, **facts):
         payload = {"phase": name}
         if pct is not None:

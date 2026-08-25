@@ -304,6 +304,10 @@ def _retime(request, machine, warnings, workdir, progress, started):
             request, source["width"], source["height"]),
         snap_tolerance=config["snap_tolerance"],
         crf=request.get("crf"),
+        # **Passed at last.** `retime` has declared this parameter since it was written and
+        # `_retime` never supplied it, so the retime path published two payloads for a
+        # 239-second job — `progress_emitted: 2`, the worker counting its own silence.
+        progress=progress,
         audio_source=source_path if request["keep_audio"] else None,
         variant=request.get("force_variant") or "direct", scale=scale)
 
@@ -340,10 +344,25 @@ def _retime(request, machine, warnings, workdir, progress, started):
         "status": "DELIVERED",
         "route": "C",
         "output": output_entry,
+        # **`crf` and `preset` beside the x264 params** (instrumentation §2). §6a rules five
+        # encode settings changeable with today's values as defaults; the record carried three, so
+        # a corpus could not attribute a difference between two runs to the settings that differed.
+        # Read from the same place the encoder reads them, so a default cannot be restated wrongly.
         "retime": dict(stats, target_fps=config["target_fps"],
-                       snap_tolerance=config["snap_tolerance"]),
+                       snap_tolerance=config["snap_tolerance"],
+                       crf=request.get("crf") if request.get("crf") is not None
+                       else encoder.DEFAULT_CRF,
+                       preset=encoder.DEFAULT_PRESET),
+        # **`padded_megapixels` is the fit's independent variable and nothing computed it**
+        # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
+        # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
+        # written against padded area are two axes that agree on nothing in particular, and the
+        # difference is recoverable only by someone who remembers the padding rule of the day the
+        # row was written. READ FROM `interp_plan`, which owns the rule, so the two cannot disagree.
         "source": {"width": source["width"], "height": source["height"],
-                   "fps": source["fps"], "duration_s": source["duration_s"]},
+                   "fps": source["fps"], "duration_s": source["duration_s"],
+                   "padded_megapixels": interp_plan.padded_megapixels(
+                       source["width"], source["height"], scale)},
         "build": build_identity(),
     }, machine, [], warnings, progress, started)
 
@@ -414,6 +433,22 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
 
 
 def _decorate(payload, machine, attempts, warnings, progress, started):
+    # **The three CPU numbers, into the block a reader looks for machine facts in**
+    # (instrumentation §3). `hardware.read` already carries `cpu_quota`; `usable_cores` and
+    # `affinity_cores` are the two that stopped reaching the envelope when Wave 2 removed
+    # `cpu_configuration`. All three, never collapsed: a container throttled by `cpu.max` and one
+    # pinned by an affinity mask are different machines that a single number reports identically
+    # (F-2026-08-19-37), and CPU power is an estimator input CF has named.
+    #
+    # Here rather than in `hardware.read` so that module keeps its own shape, and here rather than
+    # on the success path so a FAILING run carries it too — a run that does not fit is the reading
+    # a fit predicate most needs, and it needs to know what machine it did not fit on.
+    cpu = phasewatch.cpu_configuration()
+    machine = dict(machine or {})
+    for name in ("usable_cores", "affinity_cores"):
+        machine[name] = cpu.get(name)
+    if machine.get("cpu_quota") is None:
+        machine["cpu_quota"] = cpu.get("cpu_quota")
     payload["hardware"] = machine
     payload["execution_ms"] = int((time.time() - started) * 1000)
     if attempts:

@@ -152,6 +152,16 @@ TOP_LEVEL_FIELDS = {
     # the leniency rule, so a worker that did not know this name would silently discard it and
     # keep failing at the wall. Support ships first; CF starts sending second.
     "execution_timeout_ms",
+    # **THE THIRTEEN BELOW AND ABOVE ARE LISTED SO THEY CAN BE REFUSED** (excision plan §7.6).
+    # Every one validated and was then silently dropped: nine had no consumer at all and four were
+    # echoed into the diagnostics bundle and nowhere else — which reads as supported HARDER than
+    # being ignored, because the caller gets their value back. They were already dead when the
+    # excision started, which is why they were not among the five Wave 3 closed.
+    #
+    # The names stay because the top level is LENIENT and `KNOWN_FIELD_NAMES` is built from this
+    # tuple: deleting a name makes the field silently ignored rather than refused, which is the
+    # defect being closed rather than a smaller version of it.
+    #
     # **Listed so it can be REFUSED.** It priced a job and returned without touching the GPU, by
     # calling the planner; there is no planner and no plan. **This is the sharpest instance of the
     # silent-acceptance class in this file and it has a price attached**: until it was refused, a
@@ -665,56 +675,46 @@ def validate(job_input):
             minimum=1),
         # Snapped to the 4n+1 lattice by the pipeline, not refused here: a caller asking for 20
         # means "about twenty", and the nearest valid value is a better answer than an error.
-        "force_batch_size": _positive_int_or_none(
-            job_input.get("force_batch_size"), "force_batch_size", 129),
-        "force_temporal_overlap": _positive_int_or_none(
-            job_input.get("force_temporal_overlap"), "force_temporal_overlap", 32),
-        # No lattice — chunk size is a streaming granularity, not a model constraint. The ceiling
-        # is generous because the ceiling is not what protects memory: the capacity refusal and
-        # the OOM ladder are, and a chunk that does not fit should be discovered by measurement
-        # rather than forbidden by a number chosen in advance.
-        # `(width, height)` or None. The wire shape is an object; this is the normalised form, and
-        # the tuple is deliberate — it is passed straight to the fit, which takes a pair.
         "output_size": output_size,
-        "force_chunk_size": _positive_int_or_none(
-            job_input.get("force_chunk_size"), "force_chunk_size", 4096, minimum=1),
-        # Tile sizes are floored to a multiple of 8 by the VAE (the grid is laid out in latent
-        # space at scale factor 8), so a value between two multiples is silently the lower one.
-        # Not snapped here: the worker reports what it was given and what actually applied, and
-        # rounding on the caller's behalf hides the quantisation from the person calibrating.
-        "force_vae_encode_tiled": _bool_or_none(
-            job_input.get("force_vae_encode_tiled"), "force_vae_encode_tiled"),
-        "force_vae_encode_tile_size": _positive_int_or_none(
-            job_input.get("force_vae_encode_tile_size"), "force_vae_encode_tile_size",
-            4096, minimum=8),
-        "force_vae_encode_tile_overlap": _positive_int_or_none(
-            job_input.get("force_vae_encode_tile_overlap"), "force_vae_encode_tile_overlap",
-            2048),
-        "force_vae_decode_tiled": _bool_or_none(
-            job_input.get("force_vae_decode_tiled"), "force_vae_decode_tiled"),
-        "force_vae_decode_tile_size": _positive_int_or_none(
-            job_input.get("force_vae_decode_tile_size"), "force_vae_decode_tile_size",
-            4096, minimum=8),
-        "force_vae_decode_tile_overlap": _positive_int_or_none(
-            job_input.get("force_vae_decode_tile_overlap"), "force_vae_decode_tile_overlap",
-            2048),
-        # 0-36 on the 7B checkpoint this image bakes. Refused above that rather than clamped: a
-        # caller asking for 48 has misread the model, and silently giving them 36 would report a
-        # calibration row against a configuration they did not run.
-        "force_blocks_to_swap": _positive_int_or_none(
-            job_input.get("force_blocks_to_swap"), "force_blocks_to_swap", 36),
-        "force_swap_io_components": _bool_or_none(
-            job_input.get("force_swap_io_components"), "force_swap_io_components"),
-        "pin": (False if job_input.get("pin") is None
-                else _as_bool(job_input["pin"], "pin")),
-        "keep_alpha_in_model": (
-            False if job_input.get("keep_alpha_in_model") is None
-            else _as_bool(job_input["keep_alpha_in_model"], "keep_alpha_in_model")),
-        # **Plan-only: price the job and return, without touching the GPU.** Top level rather
-        # than in `params`, because it does not change what the output *is* — it says whether to
-        # produce one. The source is still fetched and probed, because the plan is a function of
-        # the real geometry and a plan computed from a caller's guess at the frame count would be
-        # answering a different question from the one the run would ask.
+        "pin": _refused_upscale_field(
+            "pin", job_input.get("pin"),
+            "it pinned a configuration on the upscaler's rung ladder so a mid-run ratchet could not move it; there is no ladder and no ratchet, and `_rung_name` sixteen lines above refuses `force_rung` on exactly that ground"),
+        "keep_alpha_in_model": _refused_upscale_field(
+            "keep_alpha_in_model", job_input.get("keep_alpha_in_model"),
+            "it chose which upscaler handled the alpha channel; there is no upscaler, and route C's writer is rgb24"),
+        "force_batch_size": _refused_upscale_field(
+            "force_batch_size", job_input.get("force_batch_size"),
+            "it set the model's temporal window in frames per batch; RIFE takes a frame pair and has no batch"),
+        "force_chunk_size": _refused_upscale_field(
+            "force_chunk_size", job_input.get("force_chunk_size"),
+            "it sized the vendored coder's streaming chunks; there are no chunks — decode, interpolation and encode are one streaming loop"),
+        "force_temporal_overlap": _refused_upscale_field(
+            "force_temporal_overlap", job_input.get("force_temporal_overlap"),
+            "it set the overlap blended between chunks; there are no chunks to overlap"),
+        "force_blocks_to_swap": _refused_upscale_field(
+            "force_blocks_to_swap", job_input.get("force_blocks_to_swap"),
+            "it tuned BlockSwap, the vendored model's VRAM-relief mechanism"),
+        "force_swap_io_components": _refused_upscale_field(
+            "force_swap_io_components", job_input.get("force_swap_io_components"),
+            "it tuned the same mechanism's IO components"),
+        "force_vae_encode_tiled": _refused_upscale_field(
+            "force_vae_encode_tiled", job_input.get("force_vae_encode_tiled"),
+            "it tiled the VAE encode; there is no VAE"),
+        "force_vae_encode_tile_size": _refused_upscale_field(
+            "force_vae_encode_tile_size", job_input.get("force_vae_encode_tile_size"),
+            "it sized those tiles; there is no VAE"),
+        "force_vae_encode_tile_overlap": _refused_upscale_field(
+            "force_vae_encode_tile_overlap", job_input.get("force_vae_encode_tile_overlap"),
+            "it overlapped those tiles; there is no VAE"),
+        "force_vae_decode_tiled": _refused_upscale_field(
+            "force_vae_decode_tiled", job_input.get("force_vae_decode_tiled"),
+            "it tiled the VAE decode; there is no VAE"),
+        "force_vae_decode_tile_size": _refused_upscale_field(
+            "force_vae_decode_tile_size", job_input.get("force_vae_decode_tile_size"),
+            "it sized those tiles; there is no VAE"),
+        "force_vae_decode_tile_overlap": _refused_upscale_field(
+            "force_vae_decode_tile_overlap", job_input.get("force_vae_decode_tile_overlap"),
+            "it overlapped those tiles; there is no VAE"),
         "plan_only": _refused_upscale_field(
             "plan_only", job_input.get("plan_only"),
             "it priced a job through the planner and returned without touching the GPU; this "

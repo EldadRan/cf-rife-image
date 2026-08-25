@@ -90,6 +90,50 @@ def cpu_count():
     return min(counts) if counts else None
 
 
+def affinity_cores():
+    """Cores in this process's mask, BEFORE any quota is applied.
+
+    **Reported beside the quota because they answer different questions**, and this project has
+    already been bitten by conflating them (F-2026-08-19-37): a container pinned by an affinity
+    mask is visible here; one throttled by `cpu.max` sees every CPU in its mask and is simply
+    stopped when its slice is spent. A single number reports two different machines identically.
+    """
+    try:
+        import os as _os  # noqa: PLC0415
+
+        return len(_os.sched_getaffinity(0))
+    except Exception:  # noqa: BLE001
+        try:
+            import os as _os  # noqa: PLC0415
+
+            return _os.cpu_count()
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def cpu_configuration():
+    """The three CPU numbers a corpus needs, never collapsed into one.
+
+    **Deleted in Wave 2 under §4e's boundary and restored here by CF's ruling.** Every caller was
+    inside `_run`, so it went with the upscale path — correct on the evidence then, and wrong for
+    what this project now needs: CPU power is an estimator input, and §6a's open question is
+    whether `threads=4` caps something x264 could use, which no corpus can answer without
+    recording how many cores the container actually had.
+
+    `usable_cores` is the minimum of the two mechanisms and is what the worker actually gets.
+    """
+    quota = None
+    try:
+        import hardware  # noqa: PLC0415 — stdlib-only
+
+        quota = hardware.cpu_quota()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"usable_cores": cpu_count(),
+            "affinity_cores": affinity_cores(),
+            "cpu_quota": int(quota) if quota else None}
+
+
 #: The environment variable the image bakes its commit into. Named here rather than spelled into
 #: the format string so this banner and `handler.build_identity` cannot come to read different
 #: names — the rung-1 witness asserts the two agree, and this constant is what makes that cheap.
