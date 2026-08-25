@@ -9,7 +9,7 @@
 # locally before a dispatch is ordered — its green run is quoted in the dispatch order, which
 # makes it evidence rather than a claim. What CI keeps is the half of the old gate that needs no
 # test tree: the pinned ffmpeg and the capabilities the encode path depends on.
-name: cf-upscale-image
+name: cf-rife-image
 
 on:
   # **No `push` trigger, deliberately.** Not every push is meant to be tested on CI and none of
@@ -24,17 +24,11 @@ on:
   # **cancelled it**. A stray commit killed a build that had been asked for on purpose, twice in
   # one session.
   pull_request:
+  # **No inputs, because there is one image.** `variant` chose between `full` and a weightless
+  # `routec` build, and the excision made those the same bytes under two names — the checkpoint it
+  # selected between does not exist in this repository. A choice whose arms are identical is a
+  # question nobody can answer wrongly and nobody should be asked.
   workflow_dispatch:
-    inputs:
-      # **Which image this dispatch builds.** `full` is the worker as it has always been; `routec`
-      # is the same tree with the SeedVR2 checkpoint left out (contract §6b) — route C never loads
-      # it, so that image is the correct worker for that route rather than a reduced one. Default
-      # `full`, so a dispatch that says nothing builds what a dispatch has always built.
-      variant:
-        description: "full = weights baked; routec = weightless route-C worker"
-        type: choice
-        default: full
-        options: [full, routec]
 
 # **One build per ref at a time, and the newest wins.** Two pushes in quick succession otherwise
 # run two publishes concurrently, racing to push the same `:latest` tag — the loser can land last
@@ -201,7 +195,7 @@ jobs:
     # So: `workflow_dispatch` from `main`, behind the toolchain gate, and a pull request still
     # never publishes. **The contract suite is green before a dispatch is ordered, not because
     # this workflow ran it** — it runs locally against the private repository's harness and its
-    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run docker-publish.yml -R eldadran/cf-upscale-image --ref main`.
+    # result is quoted in the order that asks for the build. Run it from the Actions tab, or `gh workflow run docker-publish.yml -R eldadran/cf-rife-image --ref main`.
     # **Nothing else produces an image**, so an endpoint cannot silently fall behind `main` —
     # it can only be pinned to a sha that somebody chose to build.
     # **Two conditions, and neither is the redundant one.** The ref refuses a `workflow_dispatch`
@@ -302,19 +296,11 @@ jobs:
           # value on every layer rebuild and would invalidate everything below it.
           echo "BUILD_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
-          # **The variant decides the tag, the reference the worker reports, and whether the
-          # weights are baked — all three from one input, so they cannot disagree.** A default of
-          # `full` on a `pull_request` run matters: that event carries no inputs at all, and the
-          # gate must keep behaving as it did.
-          if [ "${{ github.event.inputs.variant }}" = "routec" ]; then
-            REF="$IMAGE:sha-${GITHUB_SHA}-routec"
-            TAGS="$REF"
-            echo "BAKE_WEIGHTS=0" >> "$GITHUB_ENV"
-          else
-            REF="$IMAGE:sha-${GITHUB_SHA}"
-            TAGS="$(printf '%s\n%s' "$IMAGE:latest" "$REF")"
-            echo "BAKE_WEIGHTS=1" >> "$GITHUB_ENV"
-          fi
+          # **One image, two tags, no branch.** The immutable `:sha-<commit>` is what an endpoint
+          # pins to; `:latest` is a convenience that moves and must never be pinned. Both are
+          # pushed every build, which is what they were before the variant existed.
+          REF="$IMAGE:sha-${GITHUB_SHA}"
+          TAGS="$(printf '%s\n%s' "$IMAGE:latest" "$REF")"
           echo "IMAGE_REF=$REF" >> "$GITHUB_ENV"
           # **Heredoc form, because TAGS can be two lines.** `NAME=value` in `$GITHUB_ENV` is
           # parsed one line at a time, so a second tag would arrive as a line with no `=` and
@@ -345,14 +331,17 @@ jobs:
           # Below the weights layer in the Dockerfile, so these change every build and cost one
           # small layer rather than a 17 GB re-download.
           #
-          # `IMAGE_REF` is the tag this build is actually pushed under, suffix and all, because a
-          # worker that reports the unsuffixed tag would name the image beside it rather than
-          # itself. `BAKE_WEIGHTS` is what makes the two builds differ at all.
+          # `IMAGE_REF` is the tag this build is actually pushed under, because a worker that
+          # reported a different tag would name an image beside itself rather than itself.
+          #
+          # **`BAKE_WEIGHTS` is gone from here because its `ARG` is gone from the Dockerfile.**
+          # It gated the SeedVR2 checkpoint and never gated RIFE, so the excision took the flag
+          # with the checkpoint. Docker only warns on a build-arg nothing consumes, which is why
+          # this survived a green build — a warning is not a failure and nobody reads a green log.
           build-args: |
             IMAGE_REF=${{ env.IMAGE_REF }}
             BUILD_COMMIT=${{ github.sha }}
             BUILD_UTC=${{ env.BUILD_UTC }}
-            BAKE_WEIGHTS=${{ env.BAKE_WEIGHTS }}
           # **Registry cache, never type=gha.** The weights layer is ~17 GB and GitHub's Actions
           # cache budget is 10 GB per repository, so `type=gha` cannot hold it — it fails to help
           # while evicting whatever else was there. The media worker uses type=gha and is right
