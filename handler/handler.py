@@ -184,10 +184,13 @@ def handle(job_input, job=None):
 
     warnings = []
     attempts = []
-    # **What the diagnostics bundle needs, filled in as the run learns it.** The estimator's
-    # rationale is built inside `_run` and the bundle is written out here, so without somewhere
-    # shared to put it the most diagnostic number in a failed job — what the worker expected
-    # before it started — could not be written at all.
+    # **What the diagnostics bundle needs, filled in as the run learns it — AND NOTHING FILLS IT
+    # IN NOW.** Its three writers were inside `_run`; `_retime` never wrote it and does not. So
+    # every run record files `rationale`, `source`, `output` and `load_strip` as null while
+    # `_retime` demonstrably has those numbers and returns them in the envelope. **Left as it is
+    # deliberately**: what the worker records is contract §1's entry condition, and an excision
+    # that started filling in a record shape would be answering a question nobody has ruled.
+    # Filed to the gate; the empty dict is the honest state until it is.
     trace = {}
     workdir = tempfile.mkdtemp(prefix="cf-upscale-")
     progress = progress_module.Progress(job=job)
@@ -215,11 +218,11 @@ def handle(job_input, job=None):
             # is a test until the samples are seen, so it gets no `configuration`, no
             # rationale and no manifest equivalence — the production response shape is
             # deferred rather than dropped, and nobody can rule it before the samples exist.
-            if not request["release_3"]["upscale"]:
-                response = _retime(request, machine, warnings, workdir, progress, started)
-            else:
-                response = _run(request, job, machine, warnings, attempts, workdir, progress,
-                                captured, started, trace)
+            # **One route, so no branch.** This was `if not upscale: _retime() else: _run()`;
+            # `_run` left with the upscale path and `validation` now refuses anything that
+            # resolves to an upscale, so the else arm was both unreachable and a call to a name
+            # that no longer exists — a latent NameError preserved in the shape of a step.
+            response = _retime(request, machine, warnings, workdir, progress, started)
             outcome["status"] = "refused" if response.get("cf_error") else "ok"
             outcome["error"] = response.get("cf_error")
             return response
@@ -255,10 +258,10 @@ def handle(job_input, job=None):
 def _retime(request, machine, warnings, workdir, progress, started):
     """Route C end to end: fetch, decode, interpolate, encode, upload. **No model of ours.**
 
-    Deliberately not a second `_run` and not a copy of its master-to-upload half. It calls the
-    same `storage` helpers and nothing else — a test that starts absorbing the pipeline is what
-    scope review exists to stop, and every guarantee `_run` carries is about model memory
-    (contract §6), so borrowing its shape would borrow answers to questions route C does not ask.
+    **The only route.** It was written deliberately not as a second `_run` and not as a copy of
+    its master-to-upload half — it calls the same `storage` helpers and nothing else — and that
+    restraint is why it survived the excision intact while `_run` did not. Every guarantee `_run`
+    carried was about model memory (contract §6), which is not a question this path asks.
     """
     import interpolate as interpolate_module  # noqa: PLC0415 — GPU-box imports, like the rest
     import rife  # noqa: PLC0415

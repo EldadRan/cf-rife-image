@@ -597,6 +597,25 @@ def validate(job_input):
             "'interpolate' beside an upscale is route A or B and this worker serves neither yet; "
             "only 'upscale: false' — interpolation alone — is wired. Refused rather than "
             "silently upscaling without it.")
+    # **AND AN UPSCALE ITSELF IS REFUSED, because this worker no longer has one.** The upscale
+    # path, its estimator and its rung ladder left with the SeedVR2 excision; `handle` has one
+    # route. **This is the DEFAULT request shape, not an exotic one** — `envelope.py:66` says
+    # "Omit it to upscale", so every request that does not spell `upscale: false` resolves here.
+    # Refusing it by name is the whole of §5c's argument: until this existed the request validated,
+    # reached a branch calling a function that had been deleted, and came back `internal` — a
+    # request-shape problem reported as a worker fault, which is the defect `handle`'s two error
+    # tables exist to prevent.
+    #
+    # **NO SURFACE CHANGE.** `upscale: false` still means exactly what it meant. Making omission
+    # mean "retime" would be redesigning the request surface, which is an entry condition and not
+    # an excision's to answer.
+    if release_3["upscale"]:
+        raise WorkerError(
+            FIELD_NOT_SUPPORTED,
+            "this worker performs frame interpolation and nothing else: it has no upscaler. A "
+            "request must ask for a retime explicitly with 'upscale: false' in 'params'. Refused "
+            "rather than retimed without being asked, because a caller who asked to be upscaled "
+            "has not asked for this.")
     if release_3["codec"] != envelope.DEFAULT_CODEC:
         raise WorkerError(
             INVALID_FIELD_VALUE,
