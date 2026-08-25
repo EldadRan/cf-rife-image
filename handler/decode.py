@@ -59,7 +59,18 @@ def open_source(source_path):
         if not width or not height:
             raise WorkerError(INVALID_SOURCE, "the decoder reports no dimensions for the source")
     except BaseException:
-        capture.release()
+        # **The release must never displace the refusal it is cleaning up after.** A raising
+        # `release()` would propagate in place of the `WorkerError`, demoting INVALID_SOURCE to
+        # `__context__`: the caller sees a non-`WorkerError`, `handle` reports `internal`, and the
+        # operator loses the message naming the decoder — a bad request diagnosed as a worker
+        # fault. **That defect has been paid for once here**, when `handle`'s validation step sat
+        # outside its `try` and every bad field came back as a worker fault through three retries.
+        # The same trade is already ruled next door: `routec._reset_peak` swallows so that a
+        # measurement never costs a delivered master.
+        try:
+            capture.release()
+        except BaseException:  # noqa: BLE001 — nothing here can act on a failed release
+            pass
         raise
     # **Outside the `try` on purpose.** A `return` inside it would put the success path one
     # editing mistake away from releasing the capture it is handing to the caller.
