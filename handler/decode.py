@@ -29,13 +29,17 @@ def open_source(source_path):
     Returns `(capture, {"fps", "width", "height"})`. **The caller owns the capture's lifetime**
     and must release it; `routec.retime` does so in a `finally`.
 
-    **That is true of the capture this RETURNS and not of the one it refuses on.** The dimension
-    check below raises after the capture is open, so nothing is bound and nothing releases it —
-    the demuxer, its FFmpeg context and its file descriptor live until the traceback is dropped.
-    Carried verbatim from `pipeline.open_source` rather than repaired here, because Wave 1 is an
-    extraction and a behaviour change inside one is a change nobody reviewed as one. **Filed to
-    the gate as a claim; the docstring says so rather than asserting a release that does not
-    happen.**
+    **A capture this REFUSES on is released here, because the caller never gets one to release.**
+    Both checks below raise with the capture already constructed, and a refusal that returned
+    nothing while holding a demuxer, an FFmpeg context and a file descriptor left them alive
+    until the traceback was dropped — with `handle`'s `shutil.rmtree(workdir)` free to remove the
+    file underneath a live handle in the meantime. **Inherited verbatim from
+    `pipeline.open_source` (`pipeline.py:372-373`) and older than this module**, so it is not
+    damage the extraction did; it is repaired here because this is now the only copy.
+
+    The guard is `except BaseException` rather than `except Exception`: a `KeyboardInterrupt` or
+    a `SystemExit` arriving between the constructor and the return leaks exactly the same handle,
+    and a cleanup that declines to run on the interesting exceptions is not a cleanup.
 
     **`fps` here is the MEASURED rate and must not be used to plan.** `CAP_PROP_FPS` is
     `avg_frame_rate` — frames divided by duration — while the container's declared cadence is
@@ -46,11 +50,17 @@ def open_source(source_path):
     18/455/2 where the contract's arithmetic says 16/458/1.
     """
     capture = cv2.VideoCapture(source_path)
-    if not capture.isOpened():
-        raise WorkerError(INVALID_SOURCE, "the decoder could not open the source")
-    fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
-    width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if not width or not height:
-        raise WorkerError(INVALID_SOURCE, "the decoder reports no dimensions for the source")
+    try:
+        if not capture.isOpened():
+            raise WorkerError(INVALID_SOURCE, "the decoder could not open the source")
+        fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if not width or not height:
+            raise WorkerError(INVALID_SOURCE, "the decoder reports no dimensions for the source")
+    except BaseException:
+        capture.release()
+        raise
+    # **Outside the `try` on purpose.** A `return` inside it would put the success path one
+    # editing mistake away from releasing the capture it is handing to the caller.
     return capture, {"fps": fps, "width": width, "height": height}
