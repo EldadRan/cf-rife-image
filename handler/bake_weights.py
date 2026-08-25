@@ -1,21 +1,24 @@
-"""Build-time: bake the SeedVR2 weights into the image.
+"""Build-time: bake the RIFE weights into the image.
 
-Runs during the build so the worker ships with its weights and needs **no network volume** at
-runtime. That is not a build-speed decision: **RunPod network volumes exist in only a few
-datacentres, which often do not overlap with GPU availability**, so baking is what lets the
-endpoint run wherever there is a free card. On a worker whose whole design is about landing on a
-card with enough memory, being able to use any datacentre's free cards is the point.
+**Run as a script by the `Dockerfile`, imported as a module by `build_identity`.** The second is
+why the fetches sit behind `if __name__ == "__main__"` at the bottom: the identity reads
+`RIFE_REVISION`, `RIFE_ARCHIVE_SHA256` and `WEIGHTS_FILE` from here rather than restating them
+(excision plan §7.1), and an unguarded call would have made `import handler` download 23 MB.
 
-**Downloaded directly from HuggingFace rather than through SeedVR2's own downloader**, which
-imports the model registry and with it the DiT/VAE torch classes and their optional attention
-backends — a chain that can fail at build time for reasons unrelated to the files. Downloading
-plain files avoids it. The repo id and filenames mirror `src/utils/model_registry.py` at the
-pinned commit, and the destination is what the runtime pipeline reads.
+**The pins and the assertions that check them live in one file, deliberately.** `verify` compares
+size and sha256 against the constants above it on every fetch, so a pin and its verification
+cannot drift apart by being edited in different places. `WEIGHTS_FILE` keys straight into
+`RIFE_MEMBERS` for the same reason — the member table asserts the hash of the file the identity
+names.
 
-**One model per image**, and which one is `--build-arg SEEDVR2_MODEL=…`. The weights are too
-large to bake two, so a different checkpoint is a different build of this repo. Anything not
-baked would download at runtime on first use and, with no volume, re-download on every cold
-start — a per-job cost, billed, on a path nobody chose.
+**`flownet.pkl` is a pickle and `torch.load` on a pickle executes code.** The hash below makes it
+the SAME pickle on every build; it does not make it an inert one. Recorded rather than mitigated
+(CF, 2026-08-23), so nobody reads "hash-asserted" as "safe to load from anywhere".
+
+**The SeedVR2 half of this file is gone** — its checkpoint, its pins, its file table and the
+`BAKE_WEIGHTS` flag that gated it. `sha256_of`, `verify` and `_fetch` are NOT its: they were
+always shared, and `_fetch` in particular sits between the two halves, so a block deletion of
+"the SeedVR2 part" would have taken RIFE's own downloader with it.
 """
 
 import hashlib
@@ -27,23 +30,6 @@ import urllib.request
 import zipfile
 
 
-REPO = "numz/SeedVR2_comfyUI"
-
-#: **RIFE, and it is baked on EVERY variant including the weightless one.** `BAKE_WEIGHTS=0`
-#: means "no SeedVR2 checkpoint" — route C is the image that has no upscaler, and it is precisely
-#: the image that must interpolate. Fetched rather than vendored because it pins the same way
-#: SeedVR2's does, and baked rather than downloaded at runtime for `bake_weights`'s own reason:
-#: a fresh worker on a lazily-streaming host paid 6m06s and 12m29s for weights it had to read.
-#:
-#: **The archive carries the model CODE as well as the weights**, which is stronger than what
-#: SeedVR2 gets: `RIFE_HDv3.Model` — the class the pipeline constructs — is inside the same zip
-#: as `flownet.pkl`, so the definition is pinned by the hash of its own weights. There is no
-#: second pin to keep in step.
-#:
-#: **`flownet.pkl` is a pickle and `torch.load` on a pickle executes code**, unlike SeedVR2's
-#: safetensors. The hash below makes it the SAME pickle on every build; it does not make it an
-#: inert one. Recorded rather than mitigated (CF, 2026-08-23), so nobody reads "hash-asserted"
-#: as "safe to load from anywhere".
 RIFE_REPO = "hzwer/RIFE"
 RIFE_REVISION = "01fdc7e97404120c243c3ea7b427046e5dc7643e"
 RIFE_ARCHIVE = "RIFEv4.26_0921.zip"
@@ -90,35 +76,6 @@ RIFE_MEMBERS = {
         3510, "0c5698b4a05b9f6ab551740575c1c35e248e5b1829bab6445186081ebe15f032"),
 }
 
-#: **The weights are pinned by commit, not by branch.** Without this the build took whatever
-#: `main` held on the day, and an upstream content change would have been invisible: same
-#: filename, same size class, same green build, different numbers out of every coefficient in
-#: the calibration. A commit sha cannot be force-pushed to different contents, so this is the
-#: strong half of the pin; the hashes below are what make it checkable from inside the build.
-REVISION = "09ced71023636e9bc8cdf9cdecfb2625d1e691e8"
-
-#: filename -> (bytes, sha256).
-#:
-#: **This is a COPY, and its home is `registry-v1.json`'s `calibration_key` in the private
-#: project repository** — that is where the calibration records which weights it measured. The
-#: copy exists because the build cannot read that file: the docker context is `./handler` in
-#: THIS repository (see the workflow's `context:`), and the project repository is not checked
-#: out on the runner at all. Anything that changes there has to be brought here by hand until
-#: something generates this block.
-#:
-#: The pair sums to 15.81 GiB, which is what `deployment.md` records as the baked weight size —
-#: so these identify the files in the live image rather than an intention.
-EXPECTED = {
-    "seedvr2_ema_7b_fp16.safetensors": (
-        16479334424,
-        "7b8241aa957606ab6cfb66edabc96d43234f9819c5392b44d2492d9f0b0bbe4a",
-    ),
-    "ema_vae_fp16.safetensors": (
-        501324814,
-        "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1",
-    ),
-}
-
 
 def sha256_of(path):
     """Streamed, because the DiT is 15.3 GiB and the runner has no room to hold it twice."""
@@ -128,8 +85,6 @@ def sha256_of(path):
             digest.update(block)
     return digest.hexdigest()
 
-#: Shared across every DiT variant, so it is baked whichever checkpoint is selected.
-VAE_FILE = "ema_vae_fp16.safetensors"
 
 def verify(path, label, want_size, want_sha):
     """Size then sha256, exiting on either. Size first because it is free and a truncated
@@ -144,48 +99,6 @@ def verify(path, label, want_size, want_sha):
                  "different content than the calibration measured.".format(
                      label, want_sha, got_sha))
     print("verified {} {} bytes sha256 {}".format(label, size, got_sha), flush=True)
-
-
-def bake_seedvr2():
-    """The SeedVR2 checkpoint and the shared VAE. **Skipped on the route-C image.**"""
-    model_dir = os.environ["SEEDVR2_MODEL_DIR"]
-    dit_file = os.environ.get("SEEDVR2_MODEL", "seedvr2_ema_7b_fp16.safetensors")
-    os.makedirs(model_dir, exist_ok=True)
-
-    total = 0.0
-    for filename in (dit_file, VAE_FILE):
-        from huggingface_hub import hf_hub_download  # noqa: PLC0415 — build-time only
-
-        path = hf_hub_download(repo_id=REPO, filename=filename, local_dir=model_dir,
-                               revision=REVISION)
-        size = os.path.getsize(path)
-        size_gb = size / (1024 ** 3)
-        total += size_gb
-
-        # **The assertion is what gives the recorded hash a job.** A number written down and
-        # never compared against is the shape of a fact that rots unnoticed; this is the
-        # comparison. Size first because it is free and a truncated download is the common
-        # failure, then the hash.
-        expected = EXPECTED.get(filename)
-        if expected is None:
-            print("WARNING: {} has no recorded size or hash — baked UNVERIFIED. The calibration "
-                  "key names the 7B model and the shared VAE; a different --build-arg "
-                  "SEEDVR2_MODEL is a different checkpoint and nothing here can vouch for it."
-                  .format(filename), flush=True)
-        else:
-            verify(path, filename, *expected)
-
-        print("baked {} -> {} ({:.2f} GB)".format(filename, path, size_gb), flush=True)
-
-    # Reported because image size is a cold-start cost and a container-disk cost, and CF is
-    # waiting on both figures (handoff §9). A number printed by the build is one nobody has to
-    # estimate.
-    print("baked {:.2f} GB into {} -> {}".format(total, model_dir, sorted(os.listdir(model_dir))),
-          flush=True)
-
-    if not os.path.isfile(os.path.join(model_dir, dit_file)):
-        print("the requested checkpoint is not present after the download", file=sys.stderr)
-        raise SystemExit(1)
 
 
 def _fetch(url, destination, attempts=5, pause=5):
@@ -210,9 +123,9 @@ def _fetch(url, destination, attempts=5, pause=5):
 def bake_rife():
     """Practical-RIFE's `train_log` — the model code and its weights, from one pinned archive.
 
-    **Baked on every variant, including the one with no SeedVR2.** Route C is the image without
-    an upscaler and it is exactly the image that has to interpolate, so this is not conditional
-    on `BAKE_WEIGHTS`.
+    **Unconditional, and it always was.** `BAKE_WEIGHTS` gated the SeedVR2 checkpoint and never
+    gated this one — the image without an upscaler is exactly the image that has to interpolate.
+    With SeedVR2 gone there is nothing left for the flag to decide and it went with it.
 
     The archive is verified whole before anything is extracted, and each extracted file is
     verified again after. Two checks rather than one because they answer different questions: the
@@ -287,24 +200,13 @@ def bake_rife():
         rife_dir, sorted(os.listdir(train_log)), sorted(os.listdir(model_pkg))), flush=True)
 
 
-# **RIFE always, SeedVR2 only when asked for.** `BAKE_WEIGHTS=0` builds the route-C image, which
-# has no upscaler by design and still needs its interpolator — so the flag gates one and not the
-# other. The Dockerfile invokes this unconditionally and the decision is made here, where the two
-# fetches and their assertions already live, rather than in shell.
-# **RIFE first, and the order is not cosmetic.** It is 23 MB and fails in seconds; SeedVR2 is
-# ~16 GiB and takes minutes. Baking the large one first meant a transient blip on the small one's
-# fetch discarded the whole download with the layer. Fail fast, then spend.
-# **GATED ON `__main__` SO THE PINS ARE READABLE WITHOUT BAKING ANYTHING.** The Dockerfile runs
-# this as a script (`python3 bake_weights.py`, Dockerfile:225), so the build is unchanged. But
-# `build_identity` now reads `RIFE_REVISION`, `RIFE_ARCHIVE_SHA256` and the weights filename from
-# here rather than restating them (§7.1: read, not restated), and an unguarded call would have
-# made `import handler` fetch 23 MB from HuggingFace. **One fact, one home** — the pins live where
-# the bake asserts them, and the identity reads them there.
+# **One bake, unconditional.** `BAKE_WEIGHTS` gated the SeedVR2 checkpoint and never gated this
+# one — RIFE was baked on every variant of the image including the weightless one — so with
+# SeedVR2 gone the flag has nothing left to decide and leaves with it. `build_identity` reports
+# `weights_baked` as a constant `true` for the same reason (excision plan §7.1).
+#
+# **The guard is not the flag.** `if __name__ == "__main__"` is here so `build_identity` can read
+# the pins above without this script fetching 23 MB at import time; the Dockerfile still runs it
+# as a script, so `bake_rife()` is as unconditional as it has always been.
 if __name__ == "__main__":
     bake_rife()
-
-    if os.environ.get("BAKE_WEIGHTS") == "0":
-        print("BAKE_WEIGHTS=0 — no SeedVR2 checkpoint; RIFE is baked regardless (contract 6b)",
-              flush=True)
-    else:
-        bake_seedvr2()
