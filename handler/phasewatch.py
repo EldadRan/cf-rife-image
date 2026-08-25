@@ -243,17 +243,22 @@ class LoadStrip:
                 and self._last_at is not None and now > self._last_at):
             cpu_pct = round(100.0 * (cpu_s - self._last_cpu_s) / (now - self._last_at), 1)
         allocated, reserved = cuda_memory_gb()
+        memory_gb, memory_source = _container_memory_gb()
         self.samples.append({
             "elapsed_s": round(now - self._started, 1),
             "cpu_pct": cpu_pct,
-            # **The cgroup's figure where there is one, this process's RSS where there is
-            # not.** §8f names the field `host_rss_gb` and `host_rss_gb()` above is literally
-            # that reading — but it is VmRSS, which cannot see ffmpeg, and a strip blind to
-            # the encoder is blind to the thing §8c says it exists to measure. The cgroup
-            # counts every task in the container, which is also what the OOM killer counts.
-            # Raised to the gate rather than resolved here; the fallback keeps the field
-            # populated off-cgroup and the sample says nothing it did not measure.
-            "host_rss_gb": _container_rss_gb(),
+            # **`host_mem_gb`, NOT `host_rss_gb`, and the rename is the ruling** (claim C-2,
+            # §8f). §8c says the strip exists to show whether the encoder is starved; ffmpeg is
+            # a CHILD, so `VmRSS` from `/proc/self` cannot see it and a field named after VmRSS
+            # and filled with VmRSS would report a near-idle container across exactly the
+            # stretch the strip was built to measure. The reading was right and the name was
+            # wrong.
+            #
+            # **`host_mem_source` says which reading answered**, because one that varies with the
+            # host must — the same thing `eta_basis` does for the ETA. Without it a corpus holds
+            # two rows meaning different things with nothing on the row saying so.
+            "host_mem_gb": memory_gb,
+            "host_mem_source": memory_source,
             "cuda_allocated_gb": allocated,
             "cuda_reserved_gb": reserved,
         })
@@ -285,17 +290,39 @@ def _cpu_usage_s():
         return None
 
 
-def _container_rss_gb():
+#: What `host_mem_source` may say, and each names the FILE the number came out of rather than a
+#: category. "cgroup" and "process" would be a taxonomy somebody has to hold in their head; a path
+#: is checkable by whoever finds the row.
+MEMORY_SOURCE_CGROUP = "cgroup.memory.current"
+MEMORY_SOURCE_VMRSS = "proc.self.VmRSS"
+MEMORY_SOURCE_NONE = "unavailable"
+
+
+def _container_memory_gb():
+    """`(gb, source)` — the container's memory charge and which reading answered.
+
+    **The cgroup first, because it is the only one that can see the encoder.** `memory.current` is
+    what the OOM killer counts and it charges every task in the container, ffmpeg included. VmRSS
+    is this process alone and is the fallback for a host with no cgroup — a laptop, mostly, where
+    §8c's question does not arise.
+
+    **Never a bare number.** `(None, "unavailable")` still SAYS something: the source is stated
+    even when the reading is not, so a sample with no memory figure is a sampler that failed
+    rather than a container that used none. §8f permits null only in `cpu_pct` on sample 0, so
+    that state is a red witness — correctly.
+    """
     try:
         import hardware  # noqa: PLC0415
 
         current = hardware.memory_current_gb()
         if current is not None:
-            return round(current, 3)
+            return round(current, 3), MEMORY_SOURCE_CGROUP
     except Exception:  # noqa: BLE001
         pass
     rss = host_rss_gb()
-    return None if rss is None else round(rss, 3)
+    if rss is None:
+        return None, MEMORY_SOURCE_NONE
+    return round(rss, 3), MEMORY_SOURCE_VMRSS
 
 
 #: The environment variable the image bakes its commit into. Named here rather than spelled into

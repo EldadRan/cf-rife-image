@@ -492,18 +492,17 @@ def _round(value):
     return None if value is None else round(value, 2)
 
 
-def usable_vram_gb(snapshot, reserve_gb=2.0):
-    """What the estimator may plan against — free VRAM minus a reserve, or None if unknown.
-
-    The reserve exists because free VRAM is a reading taken before the model loads, and
-    allocator fragmentation, CUDA context and cuDNN workspaces all take memory that no plan
-    accounts for. Planning to the last byte of a number measured at the wrong moment is how an
-    estimate that says 'fits' produces an OOM at 90%.
-
-    **Unknown is not treated as plentiful.** A `None` here sends the estimator to its floor
-    configuration, because the alternative — assuming a large card — spends the job to find out.
-    """
-    free = snapshot.get("vram_free_gb")
-    if free is None:
-        return None
-    return max(0.0, free - reserve_gb)
+# **`usable_vram_gb` LIVED HERE AND WAS DELETED** (builder claim C-1, ruled 2026-08-25). It priced
+# what an estimator may plan against off `vram_free_gb`, which `F-2026-08-25-6` is precisely about:
+# a warm worker reports a fraction of the memory it can actually use, because torch's caching
+# allocator holds its pool across jobs — 13.31 GiB reported free on a container holding roughly
+# 31 GiB of reusable pool — so pricing against free memory refuses work it could do, and refuses it
+# more often the busier the endpoint is.
+#
+# **It had zero callers, and that made it more dangerous rather than less.** `estimator.py` now
+# exports a function of the SAME NAME in the SAME PACKAGE pricing off `vram_total_gb` less a
+# reserve, so `from hardware import usable_vram_gb` and `from estimator import usable_vram_gb`
+# were one call returning opposite answers with nothing at either call site to tell them apart.
+# The right function's name was already taken by the wrong one. **ONE FACT, ONE HOME**: the fact is
+# "what may be planned against", its home is `estimator.usable_vram_gb`, and this note is here so
+# the deletion reads as a ruling rather than as something that went missing.

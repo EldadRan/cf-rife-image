@@ -113,8 +113,10 @@ def usable_vram_gb(hardware_snapshot, reserve_gb=VRAM_RESERVE_GB):
     against free memory refuses work it could do, and refuses it more often the busier the
     endpoint is, which is the worst possible direction for that error to run.
 
-    `hardware.usable_vram_gb` prices off the free figure and is the trap this function exists
-    beside; it has no callers and this one does not call it.
+    **There is no second function of this name to confuse this one with, and there was.**
+    `hardware.usable_vram_gb` priced off the free figure — the same name in the same package,
+    answering the opposite way, with nothing at a call site to distinguish them. It had no callers
+    and was deleted under claim C-1 rather than left as a trap wearing the right name.
     """
     total = (hardware_snapshot or {}).get("vram_total_gb")
     if total is None:
