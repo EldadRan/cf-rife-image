@@ -7,14 +7,12 @@ working set is one frame pair.
 
 The pieces are already built and this is the wiring between them:
 
-    pipeline.open_source   →   interpolate.Interpolator(rife.Rife)   →   encoder.MasterWriter
+    decode.open_source   →   interpolate.Interpolator(rife.Rife)   →   encoder.MasterWriter
 
-**cv2 arrives through the vendored CLI, deliberately** (CF, 2026-08-23). Importing
-`inference_cli` is not loading a model: at module scope it inserts a path, sets env, sets the
-spawn start method and imports torch, cv2 and numpy — the checkpoint load lives behind functions
-route C never calls. And its process-global effects already happen on every production job, so
-taking the vendored path inherits behaviour proven in the field, where importing cv2 directly
-would have been the novel one and would have cost the deliberate one-cv2-per-process property.
+**cv2 arrived through the vendored CLI and now does not** (excision Wave 1). The reason it
+did was the one-cv2-per-process property, which is a statement about a process that imported
+SeedVR2 — this one has no vendored tree to import and no second cv2 to be one of. `decode` owns
+the import and `open_source` no longer takes a CLI it never used for anything else.
 """
 import numpy as np
 
@@ -103,7 +101,7 @@ def _to_rgb24(tensor):
     return np.ascontiguousarray(array).tobytes()
 
 
-def frames_from(capture, cli, expect=None):
+def frames_from(capture, expect=None):
     """Decode the source into cv2 frames, in order, until it is exhausted.
 
     `expect` is the `(height, width)` the writer was told, checked once on the first frame.
@@ -129,7 +127,7 @@ def frames_from(capture, cli, expect=None):
         yield frame
 
 
-def retime(cli, source, source_path, master_path, interpolator, target_fps, identity,
+def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
@@ -142,9 +140,9 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
     import encoder  # noqa: PLC0415 — imported here so this module stays importable without one
     import variants  # noqa: PLC0415
 
-    from pipeline import open_source  # noqa: PLC0415
+    from decode import open_source  # noqa: PLC0415 — cv2 is a GPU-box import, like the rest
 
-    capture, shape = open_source(cli, source_path)
+    capture, shape = open_source(source_path)
     try:
         width, height = shape["width"], shape["height"]
         n_in = source_frame_count(source)
@@ -155,7 +153,7 @@ def retime(cli, source, source_path, master_path, interpolator, target_fps, iden
         peak_reset = _reset_peak()
         stream, stats = variants.run(
             variant, interpolator,
-            _tensors(frames_from(capture, cli, expect=(height, width))),
+            _tensors(frames_from(capture, expect=(height, width))),
             # **The declared cadence, from the same object `n_in` was derived from.** These two
             # lines used to disagree: `source_frame_count` reads `source["fps"]` — the container's
             # `r_frame_rate` — while this read cv2's `CAP_PROP_FPS`, which is `avg_frame_rate`. A
@@ -261,7 +259,7 @@ def _read_peak(was_reset):
 
 def _tensors(frames):
     """cv2 frames to tensors, lazily, one at a time — never a list, whatever the clip length."""
-    import torch  # noqa: PLC0415 — the vendored CLI has already imported it by the time we run
+    import torch  # noqa: PLC0415 — the interpolator has already imported it by the time we run
 
     for frame in frames:
         yield _to_tensor(frame, torch)

@@ -300,7 +300,7 @@ def _retime(request, machine, warnings, workdir, progress, started):
     master_path = os.path.join(workdir, master)
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
-        pipeline.load_cli(), source, source_path, master_path, interpolator,
+        source, source_path, master_path, interpolator,
         target_fps=config["target_fps"], identity=identity_tags(
             request, source["width"], source["height"]),
         snap_tolerance=config["snap_tolerance"],
