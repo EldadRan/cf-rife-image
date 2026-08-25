@@ -330,11 +330,38 @@ def _runpod_identity(job):
 #: request carries `output`, and `output` carries a credential. A bundle that took the request
 #: entire would write a temporary key into a different bucket that outlives the incident — which
 #: is the one thing `CF_storage` states as a rule for this destination.
-_REQUEST_FIELDS = (
-    "target_short_edge_px", "output_size", "color_correction",
-    "keep_audio", "allow_oom_retry", "execution_timeout_ms", "force_rung", "force_batch_size",
-    "force_chunk_size", "force_temporal_overlap", "keep_alpha_in_model", "debug",
-)
+#:
+#: **THIS LIST WAS TWELVE UPSCALE-ERA NAMES AND NOT ONE OF ROUTE C'S.** A refused run's bundle
+#: summarised the request as `{"debug": false, "keep_alpha_in_model": false, "keep_audio": true}`
+#: — three fields, two of them among the thirteen this worker now refuses by name, no target rate
+#: and no source. Every row of the corpus this instrumentation exists to build would have
+#: described a request nobody sent.
+#:
+#: Now route C's scalars: the things that change what the worker computes.
+_REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale")
+
+#: Read out of `release_3["interpolate"]` rather than off the top level, because that is where
+#: the envelope puts them.
+_INTERPOLATE_FIELDS = ("target_fps", "snap_tolerance")
+
+
+def _source_reference(request):
+    """The source named WITHOUT its query, because the query is a credential.
+
+    **`source_url` does not go into a bundle whole.** It is very plausibly a presigned GET, and a
+    presigned URL is a live, transferable read grant until it expires — so a summary echoing it
+    would write that grant into every bundle and every run record. That is the leak the client's
+    own redaction exists to prevent, arriving from the WORKER's side, where no rule the client
+    writes can reach it.
+
+    The path identifies the clip, which is what a reader needs; the signature identifies nobody
+    and authorises everybody. **The previous list was safe only by accident** — it named scalars,
+    so it never had to think about a credential.
+    """
+    url = request.get("source_url")
+    if not isinstance(url, str) or not url:
+        return None
+    return url.split("?", 1)[0]
 
 
 def _request_summary(request):
@@ -342,8 +369,13 @@ def _request_summary(request):
         return None
     summary = {field: request.get(field) for field in _REQUEST_FIELDS
                if request.get(field) is not None}
-    if request.get("derive"):
-        summary["derive"] = [entry.get("role") for entry in request["derive"]]
+    interpolate = ((request.get("release_3") or {}).get("interpolate")) or {}
+    for field in _INTERPOLATE_FIELDS:
+        if interpolate.get(field) is not None:
+            summary[field] = interpolate[field]
+    source = _source_reference(request)
+    if source:
+        summary["source"] = source
     return summary
 
 

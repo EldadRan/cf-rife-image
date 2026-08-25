@@ -233,7 +233,7 @@ def handle(job_input, job=None):
             # `_run` left with the upscale path and `validation` now refuses anything that
             # resolves to an upscale, so the else arm was both unreachable and a call to a name
             # that no longer exists — a latent NameError preserved in the shape of a step.
-            response = _retime(request, machine, warnings, workdir, progress, started)
+            response = _retime(request, machine, warnings, workdir, progress, started, trace)
             outcome["status"] = "refused" if response.get("cf_error") else "ok"
             outcome["error"] = response.get("cf_error")
             return response
@@ -266,7 +266,7 @@ def handle(job_input, job=None):
             shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _retime(request, machine, warnings, workdir, progress, started):
+def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     """Route C end to end: fetch, decode, interpolate, encode, upload. **No model of ours.**
 
     **The only route.** It was written deliberately not as a second `_run` and not as a copy of
@@ -283,6 +283,14 @@ def _retime(request, machine, warnings, workdir, progress, started):
     extension = probe.detect_extension(download)
     source_path = probe.named_with_extension(download, extension)
     source = probe.probe_source(source_path)
+    # **Into `trace`, so the `finally` can file it.** `trace` is the shared dict `handle` creates
+    # for exactly this — a crashed run's most diagnostic numbers are the ones it learned before
+    # it died — and `_retime` never wrote to it, so EVERY route-C run record filed `source`,
+    # `output` and `load_strip` as null, on success as much as on failure. The numbers were in
+    # hand both times.
+    if trace is not None:
+        trace["source"] = {"width": source["width"], "height": source["height"],
+                           "fps": source["fps"], "duration_s": source["duration_s"]}
 
     config = request["release_3"]["interpolate"]
     progress.phase("load", pct=3, force=True, note="interpolator")
@@ -340,6 +348,15 @@ def _retime(request, machine, warnings, workdir, progress, started):
     # **The stats and what they were measured on, and nothing shaped like a plan.** A
     # `configuration` block here would look, to anything reading the envelope, exactly like a
     # planned upscale — and there is no plan, because there is no model to plan for.
+    if trace is not None:
+        trace["output"] = output_entry
+        # **The retime stats have NO honest slot in `runrecord.build`.** `plan` and `rationale`
+        # are the estimator's fields and route C has no estimator, so putting them there would
+        # make a record borrow a slot that means something else — and a record that borrows a slot
+        # is worse than one with a gap, because the gap is visible. Filed to the gate rather than
+        # forced; `load_strip` is the nearest thing and it is not that either.
+        trace["retime"] = dict(stats)
+
     return _decorate({
         "status": "DELIVERED",
         "route": "C",
