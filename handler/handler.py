@@ -130,33 +130,20 @@ def identity_tags(request, width, height):
 #: to skip.
 _SAID_BOOT = []
 
-#: Every `[host]` reading this job took, in order. **It has a writer at last**
-#: (`docs/instrumentation.md` §8b): `handle` appends `phasewatch.boot_banner()`'s lines where it
-#: prints them. Until this wave the only thing that had ever appended was `phasewatch.observe`,
-#: every caller of which was on the upscale path and left with it — so the list was empty on
-#: every route-C run ever written, and the record filed `"host": []` while the banner was
-#: computed, printed and discarded three lines away.
-#:
-#: **It is a local list, not `phasewatch.BANNERS`.** That aliasing was ruled when two writers
-#: banked into one corpus and two lists would have meant two orders. One writer now, and it is
-#: here rather than in `phasewatch` because the LIFETIME is a job's and `phasewatch` does not
-#: know what a job is. Route C's finer host readings — the load strip — are a different mechanism
-#: with a different cadence and live in `trace`, not here.
-_HOST_BANNERS = []
+#: **There is no module-level banner list any more, and its removal is the point.**
+#: `_HOST_BANNERS` was a job's readings held at module scope, cleared at the top of `handle`. That
+#: was harmless while nothing ever appended to it — it was empty on every route-C run ever
+#: written. **Giving it a writer (§8b) made it per-job state in a process-wide place**, and a
+#: worker run with a concurrency modifier above 1 would then have job B's clear wipe job A's
+#: banner: a machine description filed against the wrong run, which is the exact defect the clear
+#: was there to prevent. The banner now lives in `trace`, which is created per call and cannot be
+#: reached by another job. Nothing was gained by the global and one failure mode was closed by
+#: dropping it.
 
 
 def handle(job_input, job=None):
     started = time.time()
     machine = hardware.read()
-
-    # **Per job, not per worker.** A worker serves many jobs and this list is module-level, so a
-    # record carrying the previous job's host readings would be a measurement attributed to the
-    # wrong run — the exact defect class the build identity exists to prevent.
-    #
-    # **It clears BEFORE the banner is taken, and that ordering is the whole of §8b's fix.** The
-    # clear used to sit below the print, so an append at the print site would have been wiped by
-    # the next line and every record would still file `"host": []`.
-    del _HOST_BANNERS[:]
 
     # **How many cores this container may actually use, said out loud before anything else.**
     # The phase-4 tail runs at one core's worth while thirty sit idle, and the first question
@@ -172,11 +159,10 @@ def handle(job_input, job=None):
     # every job is a line people learn to skip; the READING is per job, because a run record is
     # per run. **Stored as lines**, which is what §8f's `host` names and what a reader of the log
     # sees.
-    banner = phasewatch.boot_banner()
+    banner_lines = phasewatch.boot_banner().splitlines()
     if not _SAID_BOOT:
         _SAID_BOOT.append(True)
-        print(banner)
-    _HOST_BANNERS.extend(banner.splitlines())
+        print("\n".join(banner_lines))
 
     # **Kept before the request is validated**, and read straight off the raw input rather than
     # off `request`. A request that fails validation never produces a `request`, and a job that
@@ -201,13 +187,13 @@ def handle(job_input, job=None):
 
     warnings = []
     attempts = []
-    # **What the diagnostics bundle needs, filled in as the run learns it — AND NOTHING FILLS IT
-    # IN NOW.** Its three writers were inside `_run`; `_retime` never wrote it and does not. So
-    # every run record files `rationale`, `source`, `output` and `load_strip` as null while
-    # `_retime` demonstrably has those numbers and returns them in the envelope. **Left as it is
-    # deliberately**: what the worker records is contract §1's entry condition, and an excision
-    # that started filling in a record shape would be answering a question nobody has ruled.
-    # Filed to the gate; the empty dict is the honest state until it is.
+    # **What the record needs, filled in as the run learns it.** Its three writers were inside
+    # `_run`; `_retime` wrote none of it, so every run record filed `rationale`, `source`,
+    # `output` and `load_strip` as null while `_retime` demonstrably had those numbers and
+    # returned them in the envelope. `source`, `output` and `retime` were wired with the excision;
+    # `load_strip`, the transfer split, the host banner and the ETA are this wave's, ruled by
+    # `docs/instrumentation.md` §8. `rationale` stays null and is honest: route C has no planner
+    # to have reasoned.
     trace = {}
     workdir = tempfile.mkdtemp(prefix="cf-upscale-")
     # **The host-load series, sampled on the cadence `progress` already publishes at**
@@ -217,8 +203,11 @@ def handle(job_input, job=None):
     # `finally` is what the record files — including on a run that died mid-encode, which is the
     # run whose load history is worth the most.
     load_strip = phasewatch.LoadStrip(started)
-    trace["load_strip"] = load_strip.samples
     progress = progress_module.Progress(job=job, sampler=load_strip.sample)
+    # **Per call, which is what makes the concurrency question go away.** `trace` is created here
+    # and reaches nothing outside this invocation, so two jobs in one process cannot write each
+    # other's host readings — the reason the module-level banner list was retired above.
+    trace["host"] = banner_lines
 
     # **The outcome, recorded where all three exits that REACH IT can be reached.** The run-record
     # is written in the `finally` below because that is the only point every run that enters this
@@ -287,7 +276,7 @@ def handle(job_input, job=None):
             return _decorate(payload, machine, attempts, warnings, progress, started)
         finally:
             _write_run_record(outcome, request, machine, attempts, warnings, progress,
-                              trace, job, started)
+                              trace, job, started, load_strip)
             shutil.rmtree(workdir, ignore_errors=True)
 
 
@@ -324,9 +313,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     source = probe.probe_source(source_path)
     # **Into `trace`, so the `finally` can file it.** `trace` is the shared dict `handle` creates
     # for exactly this — a crashed run's most diagnostic numbers are the ones it learned before
-    # it died — and `_retime` never wrote to it, so EVERY route-C run record filed `source`,
-    # `output` and `load_strip` as null, on success as much as on failure. The numbers were in
-    # hand both times.
+    # it died — and `_retime` never wrote to it, so EVERY route-C run record filed `source` and
+    # `output` as null, on success as much as on failure. The numbers were in hand both times.
     if trace is not None:
         trace["source"] = {"width": source["width"], "height": source["height"],
                            "fps": source["fps"], "duration_s": source["duration_s"]}
@@ -354,6 +342,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     # `LARGER_GPU` with a shortfall, never `NONE`: RIFE holds one frame pair whatever the clip
     # length, so there is no rung to step down to and a bigger card is the entire remedy.
     ok, fit = estimator.fits(source["width"], source["height"], machine, scale=scale)
+    # **Banked whether it fits or not, and that is what makes the fit falsifiable.** §9a claims
+    # residuals under half a percent; the residual is `peak_vram_gb` measured against
+    # `needed_gb` predicted, and `peak_vram_gb` only exists on a run that RAN. Recording the
+    # prediction only when the job is refused would keep it off every record that carries the
+    # measurement to compare it against — an instrument read on the one path where nothing can
+    # check it.
+    _note(trace, "estimate", "fit", fit)
     if ok is False:
         raise WorkerError(
             errors.CAPACITY_EXCEEDED,
@@ -433,6 +428,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     # **The stats and what they were measured on, and nothing shaped like a plan.** A
     # `configuration` block here would look, to anything reading the envelope, exactly like a
     # planned upscale — and there is no plan, because there is no model to plan for.
+    _note(trace, "estimate", "time", stats.get("estimate"))
     if trace is not None:
         trace["output"] = output_entry
         # **The retime stats have NO honest slot in `runrecord.build`.** `plan` and `rationale`
@@ -440,7 +436,11 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
         # make a record borrow a slot that means something else — and a record that borrows a slot
         # is worse than one with a gap, because the gap is visible. Filed to the gate rather than
         # forced; `load_strip` is the nearest thing and it is not that either.
-        trace["retime"] = dict(stats)
+        # **Without `estimate`, which has one home and it is the `estimate` block.** The time
+        # answer travels out of `routec` inside the stats because that is the only channel it
+        # has, and filing it here as well would put one fact in two places in one document — the
+        # duplication that makes a stale copy indistinguishable from a live one.
+        trace["retime"] = {k: v for k, v in stats.items() if k != "estimate"}
 
     return _decorate({
         "status": "DELIVERED",
@@ -514,6 +514,22 @@ def _transfer(trace):
             "upload_bytes": int(measured.get("upload_bytes") or 0)}
 
 
+def _add(trace, block, field, value):
+    """Accumulate into a `trace` measurement rather than replacing it. **Never raises.**
+
+    `_note` is for a quantity measured once. This is for one measured in pieces — the upload
+    seconds and bytes, which a failed run pays twice: once for the master it did not write, and
+    once for the bundle explaining why.
+    """
+    if trace is None:
+        return
+    try:
+        block_dict = trace.setdefault(block, {})
+        block_dict[field] = (block_dict.get(field) or 0) + value
+    except Exception:  # noqa: BLE001 — a measurement must never displace a real failure
+        pass
+
+
 def _note(trace, block, field, value):
     """Bank one measurement into `trace`, creating the block. **Never raises.**
 
@@ -532,7 +548,7 @@ def _note(trace, block, field, value):
 
 
 def _write_run_record(outcome, request, machine, attempts, warnings, progress, trace, job,
-                      started):
+                      started, load_strip=None):
     """Assemble and file the run-record. **Never raises** — see `runrecord`'s own posture.
 
     Wrapped even though `runrecord.write` cannot raise, because *assembling* the body reads a
@@ -551,10 +567,17 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             attempts=attempts,
             output=(trace or {}).get("output"),
             retime=(trace or {}).get("retime"),
-            load_strip=(trace or {}).get("load_strip") or None,
-            host_banners=list(_HOST_BANNERS),
+            # **A snapshot, not the live list.** The sampler stops when the job does and not
+            # when the record is assembled, so handing `json.dumps` a list something may still be
+            # appending to is handing it a list that can reallocate underneath the walk.
+            load_strip=(load_strip.snapshot() if load_strip is not None else None) or None,
+            host_banners=(trace or {}).get("host") or [],
             timings=_timings(trace, started),
             transfer=_transfer(trace),
+            # **What was predicted, beside what happened.** Both halves of contract §9 in one
+            # block: `fit` on every run that got as far as probing a source, `time` on every run
+            # that got a plan. Null halves are the honest shape of a run that died earlier.
+            estimate=(trace or {}).get("estimate"),
             # **As published, read off `progress` rather than recomputed** (§8f). Recomputing at
             # exit would report the ETA the run deserved instead of the one the caller got.
             eta=progress.first_eta() if progress is not None else None,
@@ -588,8 +611,26 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
         # the per-job URL is what CF correlates with the request, and the reserve exists for the
         # case where there is no per-job URL to use — a request that never carried one, or one
         # whose `diagnostics` could not be minted at submit.
-        storage.put_diagnostics(
-            request.get("diagnostics") or diagnostics.reserve(), body)
+        # **Clocked and counted, because otherwise its seconds hide in `compute_s`.** This runs
+        # inside `handle`'s except block, before the `finally` stamps `wall_s` — so a bundle PUT
+        # on a failed run was time the record attributed to computing while `transfer.upload_bytes`
+        # said zero bytes moved. The three-way identity held arithmetically and lied semantically,
+        # which is the harder failure to notice.
+        #
+        # **Added to `upload_s`, not given a fourth term**, because §8g's close condition is that
+        # three parts account for the wall and a fourth would break the check that makes the split
+        # worth having. So `upload_*` means every byte this worker pushed out — the master and the
+        # bundle both — and on a failed run there is no master, so it is exactly the bundle.
+        # **The run record's own PUT can never be in here**: it is written after this figure is
+        # taken, and a record cannot time its own write.
+        bundle_started = time.time()
+        try:
+            storage.put_diagnostics(
+                request.get("diagnostics") or diagnostics.reserve(), body)
+        finally:
+            _add(trace, "timings", "upload_s", round(time.time() - bundle_started, 3))
+            _add(trace, "transfer", "upload_bytes", len(body.encode("utf-8", "replace"))
+                 if isinstance(body, str) else len(body or b""))
     except Exception:  # noqa: BLE001 — see the docstring
         pass
 

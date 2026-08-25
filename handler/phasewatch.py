@@ -134,6 +134,13 @@ def cpu_configuration():
             "cpu_quota": int(quota) if quota else None}
 
 
+#: **The smallest series that satisfies §8g, banked regardless of the floor below.** The floor
+#: governs the RATE and must not govern the MINIMUM: a run whose frame work finishes inside one
+#: interval would otherwise bank the constructor's sample alone and fail the close condition for
+#: a reason that is not a defect. Two readings a few hundred milliseconds apart are a thin series
+#: and an honest one; a red witness on a healthy short run is neither.
+MIN_SAMPLES = 2
+
 #: **How often the strip is allowed to record, in seconds.** Not a clock and not a schedule: it
 #: is a floor on the same rate limiter `progress._emit` already applies to itself, and it fires
 #: only when `progress` was going to emit anyway. Route C calls `progress.frames()` once per
@@ -185,6 +192,7 @@ class LoadStrip:
     """
 
     def __init__(self, started, interval_s=LOAD_SAMPLE_INTERVAL_S):
+        import threading as _threading  # noqa: PLC0415
         import time as _time  # noqa: PLC0415
 
         self._time = _time
@@ -192,6 +200,18 @@ class LoadStrip:
         self._interval_s = interval_s
         self._last_at = None
         self._last_cpu_s = None
+        #: **One sampler, two possible threads.** `progress._emit` is reached from the main loop
+        #: and, once `Progress.keeping_the_promise` has a caller on this route, from its heartbeat
+        #: daemon as well. Two threads past the floor together would both read the stale
+        #: `_last_at`, and the second would divide a CPU-second delta by a sub-millisecond wall
+        #: gap — banking a `cpu_pct` in the thousands, indistinguishable from a real spike, in the
+        #: one series whose whole purpose is to say whether the encode was starved. **A
+        #: fabricated number carrying a unit is what this project refuses by name.**
+        #:
+        #: `keeping_the_promise` has no caller on route C today, so the race is latent rather than
+        #: live. It is closed now because the lock costs nothing and the defect it prevents is
+        #: invisible in the data it corrupts.
+        self._lock = _threading.Lock()
         #: The list the run record files. Handed to `handler`'s `trace` by reference, so whatever
         #: has accumulated by the `finally` is what lands — including on a run that died.
         self.samples = []
@@ -200,35 +220,60 @@ class LoadStrip:
     def sample(self, force=False):
         """Bank one reading, or decline because the floor has not passed. **Never raises.**"""
         try:
-            now = self._time.time()
-            if not force and self._last_at is not None and (
-                    now - self._last_at) < self._interval_s:
-                return False
-            cpu_s = _cpu_usage_s()
-            cpu_pct = None
-            if (cpu_s is not None and self._last_cpu_s is not None
-                    and self._last_at is not None and now > self._last_at):
-                cpu_pct = round(100.0 * (cpu_s - self._last_cpu_s) / (now - self._last_at), 1)
-            allocated, reserved = cuda_memory_gb()
-            self.samples.append({
-                "elapsed_s": round(now - self._started, 1),
-                "cpu_pct": cpu_pct,
-                # **The cgroup's figure where there is one, this process's RSS where there is
-                # not.** §8f names the field `host_rss_gb` and `host_rss_gb()` above is literally
-                # that reading — but it is VmRSS, which cannot see ffmpeg, and a strip blind to
-                # the encoder is blind to the thing §8c says it exists to measure. The cgroup
-                # counts every task in the container, which is also what the OOM killer counts.
-                # Raised to the gate rather than resolved here; the fallback keeps the field
-                # populated off-cgroup and the sample says nothing it did not measure.
-                "host_rss_gb": _container_rss_gb(),
-                "cuda_allocated_gb": allocated,
-                "cuda_reserved_gb": reserved,
-            })
-            self._last_at = now
-            self._last_cpu_s = cpu_s
-            return True
+            with self._lock:
+                return self._sample_locked(force)
         except Exception:  # noqa: BLE001 — see the class docstring
             return False
+
+    def _sample_locked(self, force):
+        """The body of `sample`, with `_last_at`/`_last_cpu_s` read and written under the lock.
+
+        **Read and write are one critical section, not two.** The floor check, the delta and the
+        two writes all key off `_last_at`; splitting them would leave exactly the window the lock
+        exists to close.
+        """
+        now = self._time.time()
+        if (not force and len(self.samples) >= MIN_SAMPLES
+                and self._last_at is not None
+                and (now - self._last_at) < self._interval_s):
+            return False
+        cpu_s = _cpu_usage_s()
+        cpu_pct = None
+        if (cpu_s is not None and self._last_cpu_s is not None
+                and self._last_at is not None and now > self._last_at):
+            cpu_pct = round(100.0 * (cpu_s - self._last_cpu_s) / (now - self._last_at), 1)
+        allocated, reserved = cuda_memory_gb()
+        self.samples.append({
+            "elapsed_s": round(now - self._started, 1),
+            "cpu_pct": cpu_pct,
+            # **The cgroup's figure where there is one, this process's RSS where there is
+            # not.** §8f names the field `host_rss_gb` and `host_rss_gb()` above is literally
+            # that reading — but it is VmRSS, which cannot see ffmpeg, and a strip blind to
+            # the encoder is blind to the thing §8c says it exists to measure. The cgroup
+            # counts every task in the container, which is also what the OOM killer counts.
+            # Raised to the gate rather than resolved here; the fallback keeps the field
+            # populated off-cgroup and the sample says nothing it did not measure.
+            "host_rss_gb": _container_rss_gb(),
+            "cuda_allocated_gb": allocated,
+            "cuda_reserved_gb": reserved,
+        })
+        self._last_at = now
+        self._last_cpu_s = cpu_s
+        return True
+
+    def snapshot(self):
+        """A copy of the series, taken under the lock. **What the record files.**
+
+        The run record is `json.dumps`ed while this strip is still armed — the sampler stops when
+        the job does, not when the record is assembled — and a list being appended to while an
+        encoder walks it is a list that can reallocate underneath the walk. The record gets a
+        copy; nothing else may.
+        """
+        try:
+            with self._lock:
+                return list(self.samples)
+        except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
+            return list(self.samples)
 
 
 def _cpu_usage_s():

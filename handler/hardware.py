@@ -384,10 +384,18 @@ def cpu_usage_s(root="/"):
     except (OSError, ValueError, IndexError):
         pass
     nanoseconds = _read_int(root, CGROUP_V1_CPUACCT)
-    if nanoseconds:
+    # **`is not None`, because a container that has burned no CPU has burned no CPU.** A truthiness
+    # test reads a genuine zero as an absent file and falls through to a reading of something else
+    # entirely — which on this path is the difference between "the cgroup says nothing yet" and
+    # "there is no cgroup".
+    if nanoseconds is not None:
         return nanoseconds / 1_000_000_000.0
     try:
-        with open("/proc/self/stat") as handle:
+        # **`root` is honoured here too.** Every other reader in this module joins it, and the one
+        # that did not would answer a fixture-rooted call from the live process — a number about
+        # something else, returned by the function under test, which is precisely the class of
+        # defect this project keeps finding.
+        with open(os.path.join(root, "proc/self/stat")) as handle:
             fields = handle.read().rsplit(")", 1)[1].split()
         ticks = os.sysconf("SC_CLK_TCK")
         # utime and stime, which are fields 14 and 15 counting from 1 — indices 11 and 12 here,

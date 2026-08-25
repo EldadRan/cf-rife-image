@@ -126,7 +126,7 @@ def build_stub(build_identity, machine, request=None, rationale=None, source=Non
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
-          retime=None, transfer=None, eta=None):
+          retime=None, transfer=None, eta=None, estimate=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -181,6 +181,12 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # quantity in seconds beside one in bytes under a name that says seconds. §8f names two
         # blocks and this is the second.
         "transfer": transfer,
+        # **What the worker PREDICTED, beside what it then did** (contract §9). `fit` is the
+        # certified VRAM predicate's answer and sits beside the measured `retime.peak_vram_gb` a
+        # reader can subtract it from; `time` is §9b's point-and-spread with the corpus it came
+        # from. **A prediction recorded only when it refuses can never be graded**, so both are
+        # filed on every run that got far enough to make them.
+        "estimate": estimate,
         # **The ETA AS FIRST PUBLISHED**, which is the only version of it worth grading. §8g
         # checks this against the outturn, and the failure it was written for was a first ETA of
         # 11,553 s on a 1,733 s job — a figure that existed, was sent, and was recorded nowhere.

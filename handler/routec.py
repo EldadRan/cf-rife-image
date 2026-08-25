@@ -191,20 +191,26 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             audio_limit_s=source.get("video_duration_s"),
             crf=crf if crf is not None else encoder.DEFAULT_CRF,
             x264_params=FRUGAL_X264)
+        # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
+        # `Progress` was constructed — before the fetch, before the probe, before the model
+        # load — so the first measured seconds-per-frame amortised all of that into the per-frame
+        # figure and flattered the ETA. `begin_phase` has had zero callers since the day it was
+        # written and its own docstring says exactly this.
+        #
+        # **It cannot exclude ffmpeg's start-up and does not claim to.** `MasterWriter.__enter__`
+        # is `return self` (`encoder.py:238-240`) and the process is spawned lazily inside the
+        # first `write` (`encoder.py:262-263`), so ffmpeg's start-up is inside frame 1 wherever
+        # this line goes. That is one more reason the FIRST ETA is the estimator's and not this
+        # clock's: `_seconds_per_frame` is a cumulative average and amortises the warm-up away
+        # over a few dozen frames, but the first reading is the warm-up.
+        if progress is not None:
+            progress.begin_phase()
         # **The peak is read on the FAILURE path too, and that is the path it exists for.** It
         # was read only after the `with` — so an encoder reaped by the kernel, which is the exact
         # event this instrumentation was added for, propagated past the read and took the sampled
         # maximum with it. A second fifty-minute run would have had its ceiling inferred from a
         # kill again, which is what the measurement was meant to end. The number now rides on the
         # refusal's own message, where the diagnostics bundle and the run-record both carry it.
-        # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
-        # `Progress` was constructed — before the fetch, before the probe, before the model
-        # load — so the first measured seconds-per-frame amortised all of that into the per-frame
-        # figure and flattered the ETA. `begin_phase` has had zero callers since the day it was
-        # written and its own docstring says exactly this. **After the writer is built and
-        # immediately before the loop**, because ffmpeg's own start-up is not frame work either.
-        if progress is not None:
-            progress.begin_phase()
         try:
             with writer_cm as writer:
                 for frame in stream:
@@ -258,11 +264,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
         return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
-                    # **The estimate, beside the outturn it was an estimate OF.** §9b requires
-                    # every time answer to carry its corpus, its reading count and its spread,
-                    # and a record that carried only the seconded per-frame figure would be the
-                    # bare point that requirement exists to refuse. Null where nothing could be
-                    # priced, which is the honest shape of an unquotable.
+                    # **The estimate rides out with the stats because this is its only channel**
+                    # — `retime` is handed no `trace` and should not be. `handler._retime` lifts
+                    # it into the record's `estimate` block and files the REST under `retime`, so
+                    # the document has one home for a prediction and one for an outturn. §9b
+                    # requires every time answer to carry its corpus, its reading count and its
+                    # spread, so what travels is the whole answer and not the per-frame figure.
+                    # Null where nothing could be priced, which is the honest shape of an
+                    # unquotable.
                     estimate=estimate,
                     # ffmpeg's own high-water mark, beside the GPU's. The 8K ceiling was in the
                     # encoder rather than the model, and neither number alone would have said so.
@@ -292,6 +301,21 @@ def _seed_estimate(progress, source, stats, scale):
         # planned estimate from a measured one — which is the whole reason `eta_basis` exists and
         # the reason §8g grades `eta.first_basis` as well as `eta.first_s`.
         progress.expect(per_frame, basis=estimator.BASIS)
+        # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
+        # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
+        # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's
+        # payload is built. So the first payload that could carry an ETA already had a measured
+        # one, taken from a single frame that also paid for ffmpeg's start-up and the model's
+        # first pass. The record would have filed `eta.first_basis: "measured"` on every run,
+        # with a first ETA of `(n_out - 1) x (the cost of frame 1)` — §8d's 11,553-second failure
+        # rebuilt exactly, wearing the label that says it was measured.
+        #
+        # The two `phase()` calls in `handler._retime` cannot do this job: both run before
+        # `plan_frames`, so `_estimated_frames` is None and `eta_s()` returns None with no key.
+        # **Forced past the rate limiter**, because §8f wants the ETA as PUBLISHED and a payload
+        # the limiter dropped was never published.
+        progress.phase("interpolate", pct=10, force=True,
+                       frames_expected=stats.get("n_out"))
         print("[eta] estimator {}: {:.0f}s for {} frame(s) ({:.0f}-{:.0f}s, {} readings, "
               "spread {:.0%})".format(
                   estimate["basis"], estimate["point_s"], stats.get("n_out"),
