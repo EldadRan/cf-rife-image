@@ -29,6 +29,14 @@ def open_source(source_path):
     Returns `(capture, {"fps", "width", "height"})`. **The caller owns the capture's lifetime**
     and must release it; `routec.retime` does so in a `finally`.
 
+    **That is true of the capture this RETURNS and not of the one it refuses on.** The dimension
+    check below raises after the capture is open, so nothing is bound and nothing releases it —
+    the demuxer, its FFmpeg context and its file descriptor live until the traceback is dropped.
+    Carried verbatim from `pipeline.open_source` rather than repaired here, because Wave 1 is an
+    extraction and a behaviour change inside one is a change nobody reviewed as one. **Filed to
+    the gate as a claim; the docstring says so rather than asserting a release that does not
+    happen.**
+
     **`fps` here is the MEASURED rate and must not be used to plan.** `CAP_PROP_FPS` is
     `avg_frame_rate` — frames divided by duration — while the container's declared cadence is
     `r_frame_rate`, which `probe` reads and which the plan is built from. The two agree on
