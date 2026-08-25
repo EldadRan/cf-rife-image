@@ -195,11 +195,20 @@ def handle(job_input, job=None):
     workdir = tempfile.mkdtemp(prefix="cf-upscale-")
     progress = progress_module.Progress(job=job)
 
-    # **The outcome, recorded where all three exits can reach it.** The run-record is written in
-    # the `finally` below because that is the only point every run passes through — delivered,
-    # refused and crashed alike — and "every run" is the whole content of F-2026-08-19-36. A
-    # record written on the success path only would rebuild, in a new place, exactly the sampling
-    # bias the finding exists to remove.
+    # **The outcome, recorded where all three exits that REACH IT can be reached.** The run-record
+    # is written in the `finally` below because that is the only point every run that enters this
+    # block passes through — delivered, refused and crashed alike — and "every run" is the whole
+    # content of F-2026-08-19-36: a record written on the success path only rebuilds, in a new
+    # place, the sampling bias the finding exists to remove.
+    #
+    # **AND A VALIDATION REFUSAL RETURNS ABOVE IT, so "every run" is not true of the job as a
+    # whole.** That was already so for the route-A/B and codec refusals; refusing an upscale by
+    # name moved the DEFAULT request shape into the same class, since a request that does not
+    # spell `upscale: false` is now refused in `validation` rather than reaching here. The
+    # evidence that this was not the intent is in `_write_run_record` itself, which guards
+    # `(request or {})` against a `request` that validation never produced — a defensive branch
+    # against a state this early return makes unreachable. **Filed as excision-plan §7.5**, beside
+    # §1's response-shape item; not repaired here, because what the worker records is §1's.
     outcome = {"status": "internal", "error": None}
     with diagnostics.LogCapture() as captured:
         try:
@@ -210,9 +219,11 @@ def handle(job_input, job=None):
             # same tag, same everything, wrong function, and nothing today would show it
             # because low is on the route-C image while medium and high are elsewhere.
             #
-            # **The production path is untouched rather than preserved under another name.**
-            # This is one `if` above it: an interpolate-only request goes to route C and
-            # returns; everything else falls through to exactly what was there before.
+            # **That reasoning outlived the branch it was about.** It was written when this was
+            # one `if` with the upscale path falling through below it; there is no `if` now and
+            # nothing to fall through to. What survives is the half that still binds: whatever
+            # this function is called, `handler()` below calls it by name, so the name is load
+            # bearing and does not move.
             #
             # **And it returns its retime stats, which is the whole response** (CF). Route C
             # is a test until the samples are seen, so it gets no `configuration`, no
