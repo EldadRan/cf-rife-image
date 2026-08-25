@@ -166,6 +166,15 @@ CGROUP_V1_MEMORY_MAX = "sys/fs/cgroup/memory/memory.limit_in_bytes"
 #: cgroup v2's CPU quota: "<quota> <period>", or "max <period>" when unlimited.
 CGROUP_V2_CPU_MAX = "sys/fs/cgroup/cpu.max"
 
+#: **CPU consumed by the whole container, encoder included**, for the load strip
+#: (`docs/instrumentation.md` §8c). `/proc/self/stat` counts this process; ffmpeg is a CHILD, and
+#: `cutime`/`cstime` only account for children that have already been REAPED — so a self-read
+#: reports near-idle for exactly the stretch the strip exists to measure. The cgroup counts every
+#: task in the container while it is still running, which is the reading that answers "is the
+#: encode starved or merely slow".
+CGROUP_V2_CPU_STAT = "sys/fs/cgroup/cpu.stat"
+CGROUP_V1_CPUACCT = "sys/fs/cgroup/cpuacct/cpuacct.usage"
+
 #: **What the OOM killer actually watches**, and what this worker has never recorded
 #: (F-2026-08-20-41, CF exemption 34b528d). Our `[host]` banners report VmRSS. The kernel decides
 #: on `memory.current`, which is anon *plus page cache plus kernel memory* — and on the F-41
@@ -355,6 +364,59 @@ def cpu_quota(root="/"):
     return allowed if allowed > 0 else None
 
 
+def cpu_usage_s(root="/"):
+    """CPU-seconds this container has burned, or None where nothing accounts for it.
+
+    **A cumulative counter, never a rate.** Whoever wants a percentage takes two readings and
+    divides by the wall between them; a function that tried to return a rate would need to hold
+    state, and state in a reader is how two callers come to disagree about the same quantity.
+
+    v2 first, then v1, then the process's own — in decreasing order of how much of the container
+    each can see. The last one cannot see the encoder and is a laptop's answer rather than a
+    worker's; it is here so the strip is not empty off-cgroup, and `docs/instrumentation.md` §8c
+    is about a container.
+    """
+    try:
+        with open(os.path.join(root, CGROUP_V2_CPU_STAT)) as handle:
+            for line in handle:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1]) / 1_000_000.0
+    except (OSError, ValueError, IndexError):
+        pass
+    nanoseconds = _read_int(root, CGROUP_V1_CPUACCT)
+    if nanoseconds:
+        return nanoseconds / 1_000_000_000.0
+    try:
+        with open("/proc/self/stat") as handle:
+            fields = handle.read().rsplit(")", 1)[1].split()
+        ticks = os.sysconf("SC_CLK_TCK")
+        # utime and stime, which are fields 14 and 15 counting from 1 — indices 11 and 12 here,
+        # because everything up to and including the parenthesised comm has been split away.
+        return (int(fields[11]) + int(fields[12])) / float(ticks)
+    except (OSError, ValueError, IndexError, ZeroDivisionError):
+        return None
+
+
+def _distribution_version(name):
+    """The version of an installed distribution **as resolved, not as declared** (§8e).
+
+    `requirements.txt` states a constraint and the question is always what the constraint
+    resolved to — recovering which OpenCV shipped in one image cost a day and ended in the CI log
+    of a build two builds back, because the shipping build reported `RUN pip install ... CACHED`
+    and named no version at all.
+
+    `importlib.metadata` rather than the module's own `__version__`: the DISTRIBUTION is what pip
+    resolved and what a requirement names, and for opencv the two are not even spelled the same
+    — `opencv-python` installs a module called `cv2`. Importing it would also cost seconds and
+    a GPU-box dependency on a path that runs on every job including a refusal.
+    """
+    try:
+        import importlib.metadata as metadata  # noqa: PLC0415 — stdlib, used once per job
+        return metadata.version(name)
+    except Exception:  # noqa: BLE001 — a version that cannot be read is a null, not a failure
+        return None
+
+
 def _host_ram_gb():
     """Kept as the name the snapshot reports, now answering with the effective ceiling."""
     return effective_ram_gb()
@@ -388,6 +450,13 @@ def read(workdir="/"):
         # since 2.1 and its replacement pair is version-gated, so a measurement taken on one
         # minor does not transfer without this line beside it.
         "torch_version": _torch_version(),
+        # **The other two resolved versions** (`docs/instrumentation.md` §8e). `hardware`
+        # describes what is INSTALLED in the image while `build` describes the image, and
+        # `torch_version` has always been in the first — so these belong beside it rather than
+        # in a new block. A 44% execution-time gap survived a day as an OpenCV hypothesis
+        # because no record could say which OpenCV either image had resolved.
+        "opencv_version": _distribution_version("opencv-python"),
+        "numpy_version": _distribution_version("numpy"),
         # What the card is, and what this build has kernels for. A card outside the list either
         # JITs from PTX or fails at the first launch — see _compute_arch.
         "compute_capability": capability,

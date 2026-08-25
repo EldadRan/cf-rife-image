@@ -134,6 +134,125 @@ def cpu_configuration():
             "cpu_quota": int(quota) if quota else None}
 
 
+#: **How often the strip is allowed to record, in seconds.** Not a clock and not a schedule: it
+#: is a floor on the same rate limiter `progress._emit` already applies to itself, and it fires
+#: only when `progress` was going to emit anyway. Route C calls `progress.frames()` once per
+#: written frame with `boundary=True`, which is FORCED past that limiter — so without a floor
+#: here a long clip would bank one sample per frame and the strip would grow with the job.
+LOAD_SAMPLE_INTERVAL_S = 15.0
+
+
+def cuda_memory_gb():
+    """`(allocated, reserved)` in GiB, or `(None, None)` where there is no CUDA to ask.
+
+    Both, because they answer different questions and the gap between them IS the caching
+    allocator's pool — the same pool that makes `vram_free_gb` a lie on a warm worker
+    (`F-2026-08-25-6`). Allocated alone would make a warm container look empty; reserved alone
+    would make it look full.
+    """
+    try:
+        import torch  # noqa: PLC0415 — a GPU-box import, like every other torch touch here
+
+        if not torch.cuda.is_available():
+            return None, None
+        gib = 1024.0 ** 3
+        return (round(torch.cuda.memory_allocated() / gib, 3),
+                round(torch.cuda.memory_reserved() / gib, 3))
+    except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
+        return None, None
+
+
+class LoadStrip:
+    """The host-load time series, sampled on the timer `progress` already owns.
+
+    **`docs/instrumentation.md` §8c, and the constraint is as binding as the measurement.** A
+    host-load series is what separates a starved encode from a slow one, and it is the only
+    quantity on §8f's list that no existing line already computes — but *"a measurement whose
+    cost is a new thread is a measurement that changes what it measures"*. So this class owns no
+    thread and no timer. It exposes `sample()`, `progress._emit` calls it when it publishes, and
+    the cadence is the cadence of the news the worker was already sending.
+
+    **Nothing here can raise.** It runs inside the emit path on every job including a refusal,
+    and a sampler that fails a delivered master over a diagnostic would be the worst trade in
+    this repository.
+
+    **`cpu_pct` is a DELTA and needs two readings**, so the first sample reports it as `None`
+    rather than as zero — a fabricated number carrying a unit is what this project refuses by
+    name, and `0.0` on the first row of a series is indistinguishable from an idle container.
+    Successive samples divide CPU-seconds burned by wall seconds elapsed and multiply by 100, so
+    the figure is a percentage of ONE core and reads above 100 on a busy container. That is the
+    convention `top` uses and the one the 96-core question is asked in.
+    """
+
+    def __init__(self, started, interval_s=LOAD_SAMPLE_INTERVAL_S):
+        import time as _time  # noqa: PLC0415
+
+        self._time = _time
+        self._started = started
+        self._interval_s = interval_s
+        self._last_at = None
+        self._last_cpu_s = None
+        #: The list the run record files. Handed to `handler`'s `trace` by reference, so whatever
+        #: has accumulated by the `finally` is what lands — including on a run that died.
+        self.samples = []
+        self.sample(force=True)
+
+    def sample(self, force=False):
+        """Bank one reading, or decline because the floor has not passed. **Never raises.**"""
+        try:
+            now = self._time.time()
+            if not force and self._last_at is not None and (
+                    now - self._last_at) < self._interval_s:
+                return False
+            cpu_s = _cpu_usage_s()
+            cpu_pct = None
+            if (cpu_s is not None and self._last_cpu_s is not None
+                    and self._last_at is not None and now > self._last_at):
+                cpu_pct = round(100.0 * (cpu_s - self._last_cpu_s) / (now - self._last_at), 1)
+            allocated, reserved = cuda_memory_gb()
+            self.samples.append({
+                "elapsed_s": round(now - self._started, 1),
+                "cpu_pct": cpu_pct,
+                # **The cgroup's figure where there is one, this process's RSS where there is
+                # not.** §8f names the field `host_rss_gb` and `host_rss_gb()` above is literally
+                # that reading — but it is VmRSS, which cannot see ffmpeg, and a strip blind to
+                # the encoder is blind to the thing §8c says it exists to measure. The cgroup
+                # counts every task in the container, which is also what the OOM killer counts.
+                # Raised to the gate rather than resolved here; the fallback keeps the field
+                # populated off-cgroup and the sample says nothing it did not measure.
+                "host_rss_gb": _container_rss_gb(),
+                "cuda_allocated_gb": allocated,
+                "cuda_reserved_gb": reserved,
+            })
+            self._last_at = now
+            self._last_cpu_s = cpu_s
+            return True
+        except Exception:  # noqa: BLE001 — see the class docstring
+            return False
+
+
+def _cpu_usage_s():
+    try:
+        import hardware  # noqa: PLC0415 — stdlib-only, same choke point as everything else here
+
+        return hardware.cpu_usage_s()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _container_rss_gb():
+    try:
+        import hardware  # noqa: PLC0415
+
+        current = hardware.memory_current_gb()
+        if current is not None:
+            return round(current, 3)
+    except Exception:  # noqa: BLE001
+        pass
+    rss = host_rss_gb()
+    return None if rss is None else round(rss, 3)
+
+
 #: The environment variable the image bakes its commit into. Named here rather than spelled into
 #: the format string so this banner and `handler.build_identity` cannot come to read different
 #: names — the rung-1 witness asserts the two agree, and this constant is what makes that cheap.

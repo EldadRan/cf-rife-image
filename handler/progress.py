@@ -54,8 +54,20 @@ class Progress:
     payloads are still recorded, which is what lets rung 1 assert the shape without RunPod.
     """
 
-    def __init__(self, job=None, estimated_frames=None, enabled=True):
+    def __init__(self, job=None, estimated_frames=None, enabled=True, sampler=None):
         self._job = job
+        #: **Called once per PUBLISHED payload, and it is not a timer** (`instrumentation.md`
+        #: §8c). The load strip has to be sampled on a cadence and this class already owns one —
+        #: `_emit`'s rate limiter — so the strip rides it rather than starting a thread of its
+        #: own. Optional and never inspected: anything callable and cheap will do, and a caller
+        #: with no interest in load passes nothing.
+        self._sampler = sampler
+        #: **The first ETA this worker actually PUBLISHED**, kept as published. At 8K the first
+        #: one opened at 11,553 s against an outturn of 1,733 s, and §8g grades it — but nothing
+        #: recorded it, so the check had no evidence to read. Captured in `_emit` rather than
+        #: where the payload is built, because the rate limiter decides what was published and a
+        #: figure the caller never saw is not the figure the caller got.
+        self._first_eta = None
         # **RunPod's retry counter, read off the job rather than counted here.** A worker that is
         # restarting cannot count its own restarts — the count died with the previous container —
         # so the only honest source is the platform's, which arrives on the job envelope. Absent
@@ -476,6 +488,15 @@ class Progress:
     def elapsed_s(self):
         return time.time() - self._started
 
+    def first_eta(self):
+        """`{"first_s", "first_basis"}` for the run record, or None if none was ever published.
+
+        **§8f's `eta` block, as published and not recomputed.** Recomputing it at the end would
+        report the ETA the run deserved rather than the one the caller got, which is the opposite
+        of what §8g is asking.
+        """
+        return None if self._first_eta is None else dict(self._first_eta)
+
     def _emit(self, payload, force=False):
         # `last` is updated whichever way this goes: the rate limiter decides what is *sent*,
         # never what the worker knows.
@@ -485,6 +506,20 @@ class Progress:
             return
         self._last_emit = now
         self.emitted.append(payload)
+        # **Recorded here, past the limiter, because "as first published" is what §8f asks for.**
+        # A payload built with an ETA and then dropped inside MIN_INTERVAL_S was never a promise
+        # anybody could read.
+        if self._first_eta is None and payload.get("eta_s") is not None:
+            self._first_eta = {"first_s": payload["eta_s"],
+                               "first_basis": payload.get("eta_basis")}
+        # **Before the POST, not after it.** The emit below is best-effort and swallows its own
+        # failure; a sample taken after it would be skipped on exactly the jobs where the
+        # progress channel is unhealthy, which are the jobs a load strip is most wanted for.
+        if self._sampler is not None:
+            try:
+                self._sampler()
+            except Exception:  # noqa: BLE001 — a measurement must never fail a job
+                pass
         if not (self._enabled and self._job is not None):
             return
         try:

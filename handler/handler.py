@@ -30,6 +30,7 @@ import bake_weights
 import diagnostics
 import encoder
 import errors
+import estimator
 import hardware
 import interp_plan
 import keys
@@ -39,7 +40,7 @@ import progress as progress_module
 import runrecord
 import storage
 import validation
-from errors import WorkerError
+from errors import Remedy, WorkerError
 
 WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 
@@ -129,17 +130,18 @@ def identity_tags(request, width, height):
 #: to skip.
 _SAID_BOOT = []
 
-#: Every `[host]` reading this job took, in order. **It has no writer, and that is the current
-#: state rather than an oversight.** Every caller of `phasewatch.observe` — the only thing that
-#: ever appended — was on the upscale path and left with it, so this list was already empty on
-#: every route-C run before the excision touched it. **The key stays in the run record, empty**,
-#: for the reason §7.1 keeps `registry_version` present and null: a field that disappears and a
-#: field with nothing to say do not read alike to whoever finds the record later.
+#: Every `[host]` reading this job took, in order. **It has a writer at last**
+#: (`docs/instrumentation.md` §8b): `handle` appends `phasewatch.boot_banner()`'s lines where it
+#: prints them. Until this wave the only thing that had ever appended was `phasewatch.observe`,
+#: every caller of which was on the upscale path and left with it — so the list was empty on
+#: every route-C run ever written, and the record filed `"host": []` while the banner was
+#: computed, printed and discarded three lines away.
 #:
-#: **It is a local list now, not `phasewatch.BANNERS`.** That aliasing was ruled when two writers
-#: banked into one corpus and two lists would have meant two orders; at zero writers the reason is
-#: spent, and a module global nothing writes is the state §4a exists to refuse. Route C's own host
-#: readings arrive when §1's guard and heartbeat work lands, and they land here.
+#: **It is a local list, not `phasewatch.BANNERS`.** That aliasing was ruled when two writers
+#: banked into one corpus and two lists would have meant two orders. One writer now, and it is
+#: here rather than in `phasewatch` because the LIFETIME is a job's and `phasewatch` does not
+#: know what a job is. Route C's finer host readings — the load strip — are a different mechanism
+#: with a different cadence and live in `trace`, not here.
 _HOST_BANNERS = []
 
 
@@ -147,19 +149,34 @@ def handle(job_input, job=None):
     started = time.time()
     machine = hardware.read()
 
+    # **Per job, not per worker.** A worker serves many jobs and this list is module-level, so a
+    # record carrying the previous job's host readings would be a measurement attributed to the
+    # wrong run — the exact defect class the build identity exists to prevent.
+    #
+    # **It clears BEFORE the banner is taken, and that ordering is the whole of §8b's fix.** The
+    # clear used to sit below the print, so an append at the print site would have been wiped by
+    # the next line and every record would still file `"host": []`.
+    del _HOST_BANNERS[:]
+
     # **How many cores this container may actually use, said out loud before anything else.**
     # The phase-4 tail runs at one core's worth while thirty sit idle, and the first question
     # that investigation has to answer is how many cores there were to be idle — a number that
     # was, until now, only obtainable by someone thinking to run `nproc` on a live worker during
     # a tail. Now every log carries it.
+    #
+    # **TAKEN EVERY JOB, PRINTED ONCE** (`docs/instrumentation.md` §8b). The banner was computed
+    # inside the print-once guard, so wiring the append there would have banked a banner on a
+    # container's FIRST job and an empty list on every job after it — a record whose `host` field
+    # depends on how many jobs the worker happened to have served, which is worse than the empty
+    # list it replaces. The print stays once because it describes the machine and a line repeated
+    # every job is a line people learn to skip; the READING is per job, because a run record is
+    # per run. **Stored as lines**, which is what §8f's `host` names and what a reader of the log
+    # sees.
+    banner = phasewatch.boot_banner()
     if not _SAID_BOOT:
         _SAID_BOOT.append(True)
-        print(phasewatch.boot_banner())
-
-    # **Per job, not per worker.** A worker serves many jobs and this list is module-level, so a
-    # record carrying the previous job's host readings would be a measurement attributed to the
-    # wrong run — the exact defect class the build identity exists to prevent.
-    del _HOST_BANNERS[:]
+        print(banner)
+    _HOST_BANNERS.extend(banner.splitlines())
 
     # **Kept before the request is validated**, and read straight off the raw input rather than
     # off `request`. A request that fails validation never produces a `request`, and a job that
@@ -193,7 +210,15 @@ def handle(job_input, job=None):
     # Filed to the gate; the empty dict is the honest state until it is.
     trace = {}
     workdir = tempfile.mkdtemp(prefix="cf-upscale-")
-    progress = progress_module.Progress(job=job)
+    # **The host-load series, sampled on the cadence `progress` already publishes at**
+    # (`docs/instrumentation.md` §8c). It is handed in as `Progress`'s sampler rather than given
+    # a thread: *a measurement whose cost is a new thread is a measurement that changes what it
+    # measures*. `trace` holds the live list by reference, so whatever accumulated by the
+    # `finally` is what the record files — including on a run that died mid-encode, which is the
+    # run whose load history is worth the most.
+    load_strip = phasewatch.LoadStrip(started)
+    trace["load_strip"] = load_strip.samples
+    progress = progress_module.Progress(job=job, sampler=load_strip.sample)
 
     # **The outcome, recorded where all three exits that REACH IT can be reached.** The run-record
     # is written in the `finally` below because that is the only point every run that enters this
@@ -279,7 +304,21 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     import routec  # noqa: PLC0415
 
     download = os.path.join(workdir, "source")
-    storage.fetch_source(request["source_url"], download)
+    # **The download's own clock and its own byte count** (`docs/instrumentation.md` §8a). Both
+    # were inside `wall_s` with nothing separating them from decode, RIFE and encode: 580 MB in
+    # and 742 MB up sharing one figure with the work, on the run whose 44% gap could not be
+    # attributed to anything.
+    #
+    # **The seconds are banked in a `finally`, the bytes only on success.** A fetch that raised
+    # still spent the time and the record must account for it or `wall_s` stops adding up; how
+    # many bytes arrived before it failed is not something `fetch_source` can say, and 0 would be
+    # a number rather than an absence.
+    fetch_started = time.time()
+    try:
+        fetch_bytes = storage.fetch_source(request["source_url"], download)
+    finally:
+        _note(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))
+    _note(trace, "transfer", "fetch_bytes", fetch_bytes)
     extension = probe.detect_extension(download)
     source_path = probe.named_with_extension(download, extension)
     source = probe.probe_source(source_path)
@@ -293,12 +332,46 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
                            "fps": source["fps"], "duration_s": source["duration_s"]}
 
     config = request["release_3"]["interpolate"]
-    progress.phase("load", pct=3, force=True, note="interpolator")
     # **`scale` is RIFE's flow-pyramid resolution and it reaches two places.** The interpolator
     # pads to a multiple derived from it, and the model call runs motion estimation at it — so a
     # scale set in one and not the other would pad for a geometry the model never sees. One
     # value, both consumers.
+    #
+    # **Read before the fit predicate rather than after it**, because the padding rule is a
+    # function of it and the predicate is a function of the padded area.
     scale = request.get("force_scale") or rife.DEFAULT_SCALE
+
+    # **Contract §9c: a job the predicate rejects is refused with a code and a record**, not by
+    # loading a model that will OOM at 90% and not by timing out — *an estimator that refuses
+    # silently, or that refuses by timing out, is worse than no estimator*, because the caller
+    # cannot tell it from a broken worker.
+    #
+    # Here rather than before the fetch, and the reason is arithmetic rather than preference: the
+    # predicate is a function of the source's dimensions and nothing knows those until the source
+    # has been probed. The CLIENT-side use of the same function answers before a job is submitted
+    # at all, which is §9a's point; this is the worker's own last check.
+    #
+    # `LARGER_GPU` with a shortfall, never `NONE`: RIFE holds one frame pair whatever the clip
+    # length, so there is no rung to step down to and a bigger card is the entire remedy.
+    ok, fit = estimator.fits(source["width"], source["height"], machine, scale=scale)
+    if ok is False:
+        raise WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "{}x{} at scale {} needs about {} GiB at the peak and this card offers {} GiB "
+            "usable ({} total less a {} GiB reserve) — short by {}. RIFE holds one frame pair "
+            "whatever the clip length, so there is no smaller configuration to step down to: a "
+            "larger card is the only thing that changes this answer. {}".format(
+                source["width"], source["height"], scale, fit["needed_gb"], fit["usable_gb"],
+                fit["vram_total_gb"], fit["reserve_gb"], fit["shortfall_gb"], fit["basis"]),
+            remedy=Remedy.LARGER_GPU, shortfall=fit)
+    if ok is None:
+        # **Priced nothing, refused nothing.** A snapshot with no `vram_total_gb` is a machine
+        # this worker cannot read, and refusing on that would turn an unreadable card into an
+        # unservable one. Said out loud so the silence is not mistaken for a pass.
+        warnings.append("the fit predicate could not price this job: the hardware snapshot "
+                        "reports no vram_total_gb, so nothing was checked")
+
+    progress.phase("load", pct=3, force=True, note="interpolator")
     interpolator = interpolate_module.Interpolator(
         rife.Rife.load(scale=scale), scale=scale).prepare()
 
@@ -320,8 +393,18 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
         variant=request.get("force_variant") or "direct", scale=scale)
 
     client = storage.client_for(request["output"])
-    master_key = storage.upload(client, request["output"], master, master_path,
-                                keys.content_type(master))
+    # **The upload's own clock and byte count, same rule as the fetch** (§8a). The size is read
+    # before the PUT rather than after it: the object on the far side is what the byte count is
+    # ABOUT, and reading it from the local file is the only reading that cannot have been
+    # truncated by the very failure the number would be explaining.
+    upload_bytes = os.path.getsize(master_path)
+    upload_started = time.time()
+    try:
+        master_key = storage.upload(client, request["output"], master, master_path,
+                                    keys.content_type(master))
+    finally:
+        _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
+    _note(trace, "transfer", "upload_bytes", upload_bytes)
 
     # **The same `output` shape the upscale path returns, and that is a correction rather than a
     # choice.** Route C first returned `{"master": key}` — a shape nobody reads. `run_one` takes
@@ -336,7 +419,9 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     output_entry = dict(delivered)
     output_entry.update({
         "key": master_key,
-        "bytes": os.path.getsize(master_path),
+        # The same reading the transfer block banked, not a second one: two `getsize` calls on
+        # one file are two chances to report two numbers for one fact.
+        "bytes": upload_bytes,
         "content_type": keys.content_type(master),
         "faststart": probe.is_faststart(master_path),
         "channels": 3,
@@ -384,6 +469,68 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     }, machine, [], warnings, progress, started)
 
 
+def _timings(trace, started):
+    """§8f's `timings` block, with the wall split into the three activities that make it up.
+
+    **`compute_s` is computed HERE and not by whoever reads the file** (§8a). A subtraction a
+    reader performs is a subtraction a reader can perform differently, and the close condition
+    checks the three parts against the whole — so the parts have to be the worker's arithmetic or
+    the check is grading the reader.
+
+    **Each part is rounded BEFORE the remainder is taken**, which is what makes the identity
+    exact rather than exact-to-a-tolerance: `fetch + upload + (wall - fetch - upload)` is `wall`
+    whatever the rounding, while rounding the remainder afterwards can drift by half a tick in
+    each of three places.
+
+    A run that never reached the fetch reports zeros for both transfers, and `compute_s` is then
+    the whole wall — which is true of it: nothing was transferred.
+    """
+    measured = (trace or {}).get("timings") or {}
+    wall = round(time.time() - started, 1)
+    fetch_s = round(float(measured.get("fetch_s") or 0.0), 1)
+    upload_s = round(float(measured.get("upload_s") or 0.0), 1)
+    return {
+        "wall_s": wall,
+        # The worker's own clock, which is the only one that is not somebody else's view
+        # of this job — and the figure F-2026-08-19-35 showed a client cannot be trusted
+        # to reconstruct after the fact.
+        "started_utc": datetime.datetime.fromtimestamp(
+            started, datetime.timezone.utc).isoformat(),
+        "fetch_s": fetch_s,
+        "upload_s": upload_s,
+        "compute_s": round(wall - fetch_s - upload_s, 1),
+    }
+
+
+def _transfer(trace):
+    """§8f's `transfer` block. **Zero where nothing moved, never absent.**
+
+    A run that was refused before the fetch transferred nothing, and `0` says that. What it must
+    not do is say `0` about a transfer that happened and was not counted — which is why the byte
+    counts are banked on the success of each transfer and not in its `finally`.
+    """
+    measured = (trace or {}).get("transfer") or {}
+    return {"fetch_bytes": int(measured.get("fetch_bytes") or 0),
+            "upload_bytes": int(measured.get("upload_bytes") or 0)}
+
+
+def _note(trace, block, field, value):
+    """Bank one measurement into `trace`, creating the block. **Never raises.**
+
+    `trace` is the dict a crashed run's most diagnostic numbers survive in, and every writer of
+    it so far has been a guarded assignment at the call site. Four more of those would be four
+    more places to forget the guard — and these four run in `finally` blocks, where an
+    AttributeError would replace the exception the `finally` was unwinding with one about
+    bookkeeping.
+    """
+    if trace is None:
+        return
+    try:
+        trace.setdefault(block, {})[field] = value
+    except Exception:  # noqa: BLE001 — a measurement must never displace a real failure
+        pass
+
+
 def _write_run_record(outcome, request, machine, attempts, warnings, progress, trace, job,
                       started):
     """Assemble and file the run-record. **Never raises** — see `runrecord`'s own posture.
@@ -406,14 +553,11 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             retime=(trace or {}).get("retime"),
             load_strip=(trace or {}).get("load_strip") or None,
             host_banners=list(_HOST_BANNERS),
-            timings={
-                "wall_s": round(time.time() - started, 1),
-                # The worker's own clock, which is the only one that is not somebody else's view
-                # of this job — and the figure F-2026-08-19-35 showed a client cannot be trusted
-                # to reconstruct after the fact.
-                "started_utc": datetime.datetime.fromtimestamp(
-                    started, datetime.timezone.utc).isoformat(),
-            },
+            timings=_timings(trace, started),
+            transfer=_transfer(trace),
+            # **As published, read off `progress` rather than recomputed** (§8f). Recomputing at
+            # exit would report the ETA the run deserved instead of the one the caller got.
+            eta=progress.first_eta() if progress is not None else None,
             progress=progress,
             job=job,
             error=outcome.get("error"),

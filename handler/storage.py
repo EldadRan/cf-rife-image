@@ -49,7 +49,18 @@ CREDENTIAL_ERROR_CODES = {
 
 
 def fetch_source(source_url, destination):
-    """Stream the presigned GET to disk. No media ever arrives in the payload."""
+    """Stream the presigned GET to disk. No media ever arrives in the payload.
+
+    **Returns the byte count, which it has always had and always discarded**
+    (`docs/instrumentation.md` §8a). `received` below is measured to check the transfer against
+    its declared length and was then thrown away, so the 580 MB of an 8K source shared one wall
+    figure with decode, RIFE and encode and nothing could say which was which. The number is the
+    same one; only its fate changes.
+
+    **The destination is no longer returned and had no reader.** The caller passed the path in
+    and already holds it; handing it back made the byte count look like an addition to a return
+    value rather than what it is.
+    """
     try:
         response = requests.get(
             source_url, stream=True, timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S)
@@ -74,7 +85,7 @@ def fetch_source(source_url, destination):
             SOURCE_FETCH_FAILED,
             "source_url returned {} bytes of a declared {}".format(received, declared),
         )
-    return destination
+    return received
 
 
 def client_for(output):

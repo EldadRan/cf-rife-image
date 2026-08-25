@@ -168,8 +168,22 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # the whole chain — so "decode complete" is never true and the only quantity that is true
         # per frame is the frame count. Both halves were already in hand and neither was used:
         # `n_out` in the stats returned before the loop begins, and `frames_written` on the writer.
+        estimate = None
         if progress is not None:
             progress.plan_frames(stats.get("n_out"))
+            # **The ETA gets something to plan from at last** (`docs/instrumentation.md` §8d,
+            # contract §9b). `Progress.expect` has existed since it was written and route C had
+            # nothing to seed it with, so the first ETA came from `observed` — elapsed against a
+            # work fraction of nearly nothing — and at 8K opened at 11,553 s against an outturn
+            # of 1,733 s.
+            #
+            # **Seeded HERE, and not earlier, because the plan is what the estimate is a
+            # function of.** `n_synth` is what distinguishes a 20->60 retime from a 23.976->60
+            # one at the same output count, and it does not exist until `variants.run` has
+            # returned. Everything above this line is the fetch, the probe and the model load,
+            # which is what `begin_phase` below excludes from the rate rather than what the ETA
+            # is priced from.
+            estimate = _seed_estimate(progress, source, stats, scale)
 
         writer_cm = encoder.MasterWriter(
             master_path, width, height, float(target_fps), identity,
@@ -183,6 +197,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # maximum with it. A second fifty-minute run would have had its ceiling inferred from a
         # kill again, which is what the measurement was meant to end. The number now rides on the
         # refusal's own message, where the diagnostics bundle and the run-record both carry it.
+        # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
+        # `Progress` was constructed — before the fetch, before the probe, before the model
+        # load — so the first measured seconds-per-frame amortised all of that into the per-frame
+        # figure and flattered the ETA. `begin_phase` has had zero callers since the day it was
+        # written and its own docstring says exactly this. **After the writer is built and
+        # immediately before the loop**, because ffmpeg's own start-up is not frame work either.
+        if progress is not None:
+            progress.begin_phase()
         try:
             with writer_cm as writer:
                 for frame in stream:
@@ -236,6 +258,12 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
         return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
+                    # **The estimate, beside the outturn it was an estimate OF.** §9b requires
+                    # every time answer to carry its corpus, its reading count and its spread,
+                    # and a record that carried only the seconded per-frame figure would be the
+                    # bare point that requirement exists to refuse. Null where nothing could be
+                    # priced, which is the honest shape of an unquotable.
+                    estimate=estimate,
                     # ffmpeg's own high-water mark, beside the GPU's. The 8K ceiling was in the
                     # encoder rather than the model, and neither number alone would have said so.
                     encoder_peak_rss_gb=writer.encoder_peak_rss_gb,
@@ -243,6 +271,37 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
     finally:
         if capture is not None:
             capture.release()
+
+
+def _seed_estimate(progress, source, stats, scale):
+    """Price the job, seed the ETA with it, and hand the whole answer back. **Never raises.**
+
+    Returns the §9b estimate — point, band, basis and corpus — or None where it could not be
+    priced. **A refusal to quote is not a failure of the job**: the estimator exists to make the
+    ETA better than `observed`, and a run that cannot be priced falls back to exactly the
+    behaviour it had before this line existed.
+    """
+    import estimator  # noqa: PLC0415 — pure-python, imported here like everything else on this path
+
+    try:
+        n_in = source_frame_count(source)
+        per_frame, estimate = estimator.seconds_per_frame(
+            source["width"], source["height"], n_in,
+            stats.get("n_out"), stats.get("n_synth"), scale=scale or 1)
+        # **Labelled `predicted_<basis>` by `expect` itself**, so the payload distinguishes a
+        # planned estimate from a measured one — which is the whole reason `eta_basis` exists and
+        # the reason §8g grades `eta.first_basis` as well as `eta.first_s`.
+        progress.expect(per_frame, basis=estimator.BASIS)
+        print("[eta] estimator {}: {:.0f}s for {} frame(s) ({:.0f}-{:.0f}s, {} readings, "
+              "spread {:.0%})".format(
+                  estimate["basis"], estimate["point_s"], stats.get("n_out"),
+                  estimate["low_s"], estimate["high_s"], estimate["corpus"]["readings"],
+                  estimate["band_frac"]), flush=True)
+        return estimate
+    except Exception as exc:  # noqa: BLE001 — an estimate must never cost a delivered master
+        print("[eta] not priced ({}: {}); the ETA falls back to what this run measures".format(
+            type(exc).__name__, str(exc)[:200]), flush=True)
+        return None
 
 
 def _reset_peak():

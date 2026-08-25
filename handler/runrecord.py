@@ -126,7 +126,7 @@ def build_stub(build_identity, machine, request=None, rationale=None, source=Non
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
-          retime=None):
+          retime=None, transfer=None, eta=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -176,6 +176,15 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         "load_strip": load_strip,
         "host": host_banners,
         "timings": timings,
+        # **Bytes beside the clocks, in their own block** (`docs/instrumentation.md` §8f).
+        # Neither half is a rate on its own, and putting the counts in `timings` would file a
+        # quantity in seconds beside one in bytes under a name that says seconds. §8f names two
+        # blocks and this is the second.
+        "transfer": transfer,
+        # **The ETA AS FIRST PUBLISHED**, which is the only version of it worth grading. §8g
+        # checks this against the outturn, and the failure it was written for was a first ETA of
+        # 11,553 s on a 1,733 s job — a figure that existed, was sent, and was recorded nowhere.
+        "eta": eta,
         "attempts": attempts or [],
         "warnings": list(warnings or []),
     }
