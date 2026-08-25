@@ -168,17 +168,17 @@ ENV IMAGE_TAG=${IMAGE_REF} \
     WORKER_VERSION=${WORKER_VERSION}
 
 # ── this repo's code, last ──────────────────────────────────────────────────────────────────
-# **`*.py` is not everything the handler needs.** `calibration.json` is measured data the
-# estimator plans from, and when it was added to the repo but not to this line the image shipped
-# without it — silently. Nothing failed: `load_calibration` treats an absent file as a normal
-# state meaning "take the floor", which is correct behaviour and indistinguishable from having no
-# measurements at all. A video job planned to the floor at 15.7 s/frame with a shipped table that
-# said `resident` would do it in 3.4, and the only symptom was a rung nobody expected.
+# **`*.py` is currently everything the handler needs, and that has not always been true.**
+# `calibration.json` was named here too — measured VRAM data the estimator planned from — and it
+# leaves with the estimator. The finding that put it on this line is worth keeping even though the
+# file is gone: when it was added to the repo but NOT to this COPY, the image shipped without it
+# in silence. Nothing failed, because an absent table read as "take the floor" — a correct state,
+# indistinguishable from having no measurements. The only symptom was a rung nobody expected.
 #
-# Named explicitly rather than `COPY *`: a wildcard would also sweep in whatever lands in this
-# directory later. `tests/run_local.py` asserts every non-`.py` file here is covered by a line
-# below, so adding a data file and forgetting this is a red suite rather than a quiet floor.
-COPY *.py calibration.json ./
+# **So a non-`.py` file that the handler reads must be named here explicitly**, and the next one
+# added is the next chance to repeat that. `COPY *` is not the answer: a wildcard sweeps in
+# whatever lands in this directory later.
+COPY *.py ./
 
 # The handler must import with the heavy chain still lazy — if this ever pulls in torch, the
 # rung-1 suite stops running in CI and nobody finds out until a GPU-less runner fails.

@@ -260,10 +260,23 @@ OUTPUT_FIELDS_REQUIRED = ("endpoint", "bucket", "prefix", "access_key_id", "secr
 #: rule belongs because it is the module that owns what a name may be.
 OUTPUT_FIELDS_OPTIONAL = ("session_token", "name")
 
-# Every field name the contract defines, anywhere. A name in here, offered somewhere it is not
-# accepted, is refused; a name outside it is metadata at the top level and ignored.
+#: **Names this worker used to accept and now refuses, kept so that refusing them stays
+#: possible.** Removing a name from `PARAMS_FIELDS` refuses it inside `params` for free, because
+#: `_refuse_unknown` is strict there — but the SAME tuple feeds `KNOWN_FIELD_NAMES` below, and
+#: the top level is LENIENT: `_refuse_known_but_unaccepted` refuses only names in that set and
+#: ignores everything else. So a name dropped from the tuple stops being refused at the top level
+#: and starts being silently ignored, which is the exact defect refusing it was meant to close.
+#:
+#: **This is not hypothetical for these three.** The docstring above records that
+#: `allow_oom_retry` and `target_short_edge_px` SAT AT THE TOP LEVEL until CF's `params` split of
+#: 2026-08-12, so the legacy spelling is the one a stale client actually sends.
+RETIRED_FIELD_NAMES = ("tile_quality", "color_correction", "allow_oom_retry", "schedule")
+
+# Every field name the contract defines, anywhere, plus the ones it has retired. A name in here,
+# offered somewhere it is not accepted, is refused; a name outside it is metadata at the top
+# level and ignored.
 KNOWN_FIELD_NAMES = set(TOP_LEVEL_FIELDS) | set(PARAMS_FIELDS) | set(DERIVE_FIELDS) \
-    | set(OUTPUT_FIELDS_REQUIRED) | set(OUTPUT_FIELDS_OPTIONAL)
+    | set(OUTPUT_FIELDS_REQUIRED) | set(OUTPUT_FIELDS_OPTIONAL) | set(RETIRED_FIELD_NAMES)
 
 
 def _variant_name(value):
@@ -466,7 +479,11 @@ def _refused_upscale_field(name, value, because):
     `derive: []` or `plan_only: false` has requested nothing this worker cannot do, and refusing
     them would be refusing the default.
     """
-    if value is None or value is False or value == [] or value == {}:
+    # **Falsy, not a hand-written list of falsy things.** `plan_only` used to be normalised with
+    # `bool(job_input.get(...))`, so a client serialising booleans as 0/1 and sending
+    # `plan_only: 0` was asking for a NORMAL run. An identity check against `False` refuses that
+    # 0 and would refuse the default in the spelling half of JSON's users write.
+    if not value:
         return None
     raise WorkerError(
         FIELD_NOT_SUPPORTED,

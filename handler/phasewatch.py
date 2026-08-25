@@ -16,7 +16,6 @@ route-C run. `handler` keeps the run-record key, empty, rather than dropping it.
 host guard and heartbeat are written, route C gets host readings of its own and they land there.
 """
 
-import time
 
 
 def host_rss_gb():
