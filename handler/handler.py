@@ -39,7 +39,7 @@ import progress as progress_module
 import runrecord
 import storage
 import validation
-from errors import FIELD_NOT_SUPPORTED, WorkerError
+from errors import WorkerError
 
 WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 
