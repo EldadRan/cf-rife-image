@@ -1,8 +1,8 @@
 """Route C's decoder: a `cv2.VideoCapture` and the three properties the writer is sized from.
 
 **This is the module that ended the vendored dependency.** `open_source` lived in `pipeline.py`
-and took the vendored CLI as its first argument, because `cv2` arrived through
-`inference_cli`'s own import so that there was one `cv2` in the process. **That constraint was
+and took the vendored CLI as its first argument, because `cv2` arrived through that CLI's own
+import so that there was one `cv2` in the process. **That constraint was
 about a process that contained SeedVR2, and this one does not** — so the import is direct and
 the argument is gone.
 
