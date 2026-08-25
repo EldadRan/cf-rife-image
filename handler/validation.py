@@ -152,11 +152,13 @@ TOP_LEVEL_FIELDS = {
     # the leniency rule, so a worker that did not know this name would silently discard it and
     # keep failing at the wall. Support ships first; CF starts sending second.
     "execution_timeout_ms",
-    # **Price the job and return, without touching the GPU.** Here rather than in `params` for
-    # the same reason as the deadline: it does not change what the output looks like, it changes
-    # whether one is produced. The kit uses it to certify the deployed planner by calling it —
-    # acceptance stops needing paid runs to check the decision logic — and it goes through the
-    # *production* code path, so what it reports is what a real run would have done.
+    # **Listed so it can be REFUSED.** It priced a job and returned without touching the GPU, by
+    # calling the planner; there is no planner and no plan. **This is the sharpest instance of the
+    # silent-acceptance class in this file and it has a price attached**: until it was refused, a
+    # caller sending `plan_only: true` validated, fell through to the retime, and was billed for
+    # loading RIFE, interpolating, encoding and uploading the run they had explicitly asked not to
+    # have. The name stays because the top level is lenient and `KNOWN_FIELD_NAMES` is built from
+    # this tuple — deleting it would ignore the field rather than refuse it.
     "plan_only",
 }
 
@@ -181,8 +183,6 @@ PARAMS_FIELDS = {
     # `target_width` + `target_height`; that spelling never reached a caller and is gone rather
     # than aliased, because two names for one field is how a contract acquires a wrong one.
     "output_size",
-    "allow_oom_retry",
-    "color_correction",
     "keep_audio",
     # **The master's constant-rate factor** (CF, 2026-08-18, pulled forward from the parked
     # encoder track). Default 12, which is what `encoder.py` has silently baked since the first
@@ -191,13 +191,6 @@ PARAMS_FIELDS = {
     # the encoder track. Recorded in the manifest and the ledger, because a master's CRF is part
     # of what that master *is*.
     "crf",
-    # **The decode-seam lever** (CF, 2026-08-18). `default` takes the formula's own pick, the
-    # coarsest grid under the decode time knee; `high` waives the knee and buys the coarsest grid
-    # memory alone allows — 4K 2x1 at ~2.3x decode time, 8K 3x2 at ~3.7x. Nothing in between is
-    # offered until the E3 A/B shows seams are worth intermediate rungs, because an option nobody
-    # can choose between on evidence is a way of moving the decision to the caller rather than
-    # making it.
-    "tile_quality",
     # ── release 3 ────────────────────────────────────────────────────────────────────────────
     # **Validated in `envelope.py`, not here.** Release 2's surface is large and a release-3
     # block folded into it would be indistinguishable from the fields that have always been
@@ -243,23 +236,13 @@ DEFAULT_KEEP_AUDIO = True
 # it owes CF is what each value does observably on video, which is a measurement nobody has
 # taken. Until then this worker sends the upstream default rather than inheriting the image
 # worker's choice, because inheriting it would carry a decision nobody made for video.
-COLOR_CORRECTIONS = ("lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none")
-DEFAULT_COLOR_CORRECTION = "lab"
 
 #: x264's own range, and the whole of it. 0 is lossless and 51 is unwatchable; both are legal
 #: things to ask an encoder for, and a worker inventing a narrower band would refuse work that
 #: would have succeeded. The default is `encoder.DEFAULT_CRF`, imported rather than repeated.
 CRF_MIN, CRF_MAX = 0, 51
 
-#: The two decode-seam settings, and deliberately only two.
-TILE_QUALITIES = ("default", "high")
-DEFAULT_TILE_QUALITY = "default"
 
-DERIVE_ROLES = ("poster", "proxy", "crop")
-
-# Strict inside a derive entry: a field the *role* does not take is refused. So `at_fraction` on
-# a proxy and `max_duration_s` on a poster are both errors — each would otherwise be accepted
-# and silently ignored.
 DERIVE_FIELDS_BY_ROLE = {
     "poster": {"role", "at_fraction"},
     "proxy": {"role", "max_duration_s"},
@@ -268,9 +251,6 @@ DERIVE_FIELDS_BY_ROLE = {
     "crop": {"role", "count", "select", "at_fraction"},
 }
 
-CROP_SELECT_MODES = ("detail", "centre", "spread")
-CROP_COUNT_DEFAULT = 3
-CROP_COUNT_MAX = 8
 DERIVE_FIELDS = {f for fs in DERIVE_FIELDS_BY_ROLE.values() for f in fs}
 
 OUTPUT_FIELDS_REQUIRED = ("endpoint", "bucket", "prefix", "access_key_id", "secret_access_key")
@@ -406,12 +386,6 @@ def _as_bool(value, field):
     return value
 
 
-def _as_number(value, field):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise WorkerError(INVALID_FIELD_VALUE, "field '{}' must be a number".format(field))
-    return float(value)
-
-
 def _as_str(value, field):
     if not isinstance(value, str):
         raise WorkerError(INVALID_FIELD_VALUE, "field '{}' must be a string".format(field))
@@ -479,74 +453,26 @@ def _validate_output(output):
     return output
 
 
-def _validate_derive(derive):
-    if not isinstance(derive, list):
-        raise WorkerError(INVALID_FIELD_VALUE, "field 'derive' must be an array")
+def _refused_upscale_field(name, value, because):
+    """`None` if the field is absent or empty, REFUSED BY NAME otherwise.
 
-    seen = set()
-    validated = []
-    for entry in derive:
-        if not isinstance(entry, dict):
-            raise WorkerError(INVALID_FIELD_VALUE, "each 'derive' entry must be an object")
-        role = _as_str(_require(entry, "role", "in a 'derive' entry"), "derive.role")
-        if role not in DERIVE_ROLES:
-            raise WorkerError(
-                INVALID_FIELD_VALUE,
-                "derive role {!r} is not one of {}".format(role, ", ".join(DERIVE_ROLES)),
-            )
-        # A role may appear at most once. Each writes one deterministic key, so a repeat
-        # overwrites in silence and returns a manifest claiming two files where one exists.
-        if role in seen:
-            raise WorkerError(
-                INVALID_FIELD_VALUE, "derive role {!r} appears more than once".format(role)
-            )
-        seen.add(role)
+    **The shape `_rung_name` established, for every field whose consumer left with the upscale
+    path.** A field that validates and then does nothing is worse than one refused by name,
+    because the caller has evidence it was understood — and these are top-level fields, where
+    `_refuse_known_but_unaccepted` is lenient and a name dropped from `TOP_LEVEL_FIELDS` becomes
+    silently ignored rather than refused. So the names stay and this refuses their values.
 
-        _refuse_unknown(entry, DERIVE_FIELDS_BY_ROLE[role], "on a '{}' derive".format(role))
-
-        clean = {"role": role}
-        if role in ("poster", "crop"):
-            at_fraction = entry.get("at_fraction")
-            at_fraction = 0.25 if at_fraction is None else _as_number(
-                at_fraction, "derive.at_fraction")
-            if not 0.0 <= at_fraction <= 1.0:
-                raise WorkerError(
-                    INVALID_FIELD_VALUE,
-                    "field 'at_fraction' must be between 0 and 1, got {}".format(at_fraction),
-                )
-            clean["at_fraction"] = at_fraction
-
-        if role == "crop":
-            count = entry.get("count")
-            count = CROP_COUNT_DEFAULT if count is None else _as_int(count, "derive.count")
-            if not 1 <= count <= CROP_COUNT_MAX:
-                raise WorkerError(
-                    INVALID_FIELD_VALUE,
-                    "field 'count' must be between 1 and {}, got {}".format(
-                        CROP_COUNT_MAX, count),
-                )
-            clean["count"] = count
-            select = entry.get("select")
-            select = "detail" if select is None else _as_str(select, "derive.select")
-            if select not in CROP_SELECT_MODES:
-                raise WorkerError(
-                    INVALID_FIELD_VALUE,
-                    "select {!r} is not one of {}".format(
-                        select, ", ".join(CROP_SELECT_MODES)),
-                )
-            clean["select"] = select
-        elif role == "proxy":
-            max_duration_s = entry.get("max_duration_s")
-            if max_duration_s is not None:
-                max_duration_s = _as_number(max_duration_s, "derive.max_duration_s")
-                if max_duration_s <= 0:
-                    raise WorkerError(
-                        INVALID_FIELD_VALUE,
-                        "field 'max_duration_s' must be positive, got {}".format(max_duration_s),
-                    )
-                clean["max_duration_s"] = max_duration_s
-        validated.append(clean)
-    return validated
+    **Absent and empty are both accepted**, because neither asks for anything: a caller sending
+    `derive: []` or `plan_only: false` has requested nothing this worker cannot do, and refusing
+    them would be refusing the default.
+    """
+    if value is None or value is False or value == [] or value == {}:
+        return None
+    raise WorkerError(
+        FIELD_NOT_SUPPORTED,
+        "field {!r} is not accepted by this worker: {} Refused rather than accepted and "
+        "ignored, because a field that validates and does nothing reads as supported.".format(
+            name, because))
 
 
 def validate(job_input):
@@ -653,23 +579,9 @@ def validate(job_input):
                 "field 'target_short_edge_px' must be positive, got {}".format(target),
             )
 
-    allow_oom_retry = params.get("allow_oom_retry")
-    allow_oom_retry = True if allow_oom_retry is None else _as_bool(
-        allow_oom_retry, "allow_oom_retry")
-
     keep_audio = params.get("keep_audio")
     keep_audio = DEFAULT_KEEP_AUDIO if keep_audio is None else _as_bool(
         keep_audio, "keep_audio")
-
-    color_correction = params.get("color_correction")
-    color_correction = DEFAULT_COLOR_CORRECTION if color_correction is None else _as_str(
-        color_correction, "color_correction")
-    if color_correction not in COLOR_CORRECTIONS:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "color_correction {!r} is not one of {}".format(
-                color_correction, ", ".join(COLOR_CORRECTIONS)),
-        )
 
     crf = params.get("crf")
     if crf is None:
@@ -685,20 +597,15 @@ def validate(job_input):
                     CRF_MIN, CRF_MAX, crf, encoder.DEFAULT_CRF),
             )
 
-    tile_quality = params.get("tile_quality")
-    tile_quality = DEFAULT_TILE_QUALITY if tile_quality is None else _as_str(
-        tile_quality, "tile_quality")
-    if tile_quality not in TILE_QUALITIES:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "tile_quality {!r} is not one of {}. 'default' takes the coarsest decode grid under "
-            "the time knee; 'high' waives the knee for the coarsest grid memory allows, which "
-            "minimises seams and costs decode time the plan prices for you.".format(
-                tile_quality, ", ".join(TILE_QUALITIES)),
-        )
-
-    derive = job_input.get("derive")
-    derive = [] if derive is None else _validate_derive(derive)
+    # **Refused rather than validated-then-dropped**, and this one read as supported harder than
+    # any other: `_validate_derive` checked role uniqueness, per-role field strictness and
+    # `at_fraction` bounds, so a client probing the surface got a detailed acknowledgement of a
+    # feature that produced nothing. A caller asking for a poster and a proxy received
+    # `status: DELIVERED`, one file, and no word about the other two.
+    derive = _refused_upscale_field(
+        "derive", job_input.get("derive"),
+        "posters, proxies and crops were taken from an upscaled master by a module that left "
+        "with the upscale path; this worker delivers the retimed master and nothing beside it.")
 
     diagnostics = job_input.get("diagnostics")
     if diagnostics is not None:
@@ -722,11 +629,8 @@ def validate(job_input):
         # The normalised release-3 config, one object rather than four loose keys, so a caller
         # downstream cannot read `interpolate` without also having what decided it.
         "release_3": release_3,
-        "allow_oom_retry": allow_oom_retry,
         "keep_audio": keep_audio,
-        "color_correction": color_correction,
         "crf": crf,
-        "tile_quality": tile_quality,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,
@@ -794,5 +698,8 @@ def validate(job_input):
         # produce one. The source is still fetched and probed, because the plan is a function of
         # the real geometry and a plan computed from a caller's guess at the frame count would be
         # answering a different question from the one the run would ask.
-        "plan_only": bool(job_input.get("plan_only")),
+        "plan_only": _refused_upscale_field(
+            "plan_only", job_input.get("plan_only"),
+            "it priced a job through the planner and returned without touching the GPU; this "
+            "worker has no planner and nothing to price, and every request it accepts runs."),
     }
