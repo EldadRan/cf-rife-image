@@ -31,7 +31,6 @@ known or not.
 
 import encoder
 import envelope
-import planner
 from errors import (
     FIELD_NOT_SUPPORTED,
     INVALID_FIELD_VALUE,
@@ -77,11 +76,11 @@ TOP_LEVEL_FIELDS = {
     "derive",
     "params",
     "debug",
-    # **A calibration facility, not part of CF's contract.** The estimator chooses from measured
-    # peaks, and it can only measure the rung it ran — so with an empty table it runs the floor
-    # for ever and never learns that anything faster fits. Pinning the rung is how the table gets
-    # its first rows. CF never sends this; if it ever appears in a CF request that is a mistake
-    # worth catching, so it is validated rather than ignored.
+    # **Listed so it can be REFUSED, which is the only reason it is still here.** It pinned a rung
+    # on the upscaler's measured ladder; that ladder left with the estimator and this worker has
+    # no rungs. `KNOWN_FIELD_NAMES` is built from this tuple and the top level is lenient, so
+    # deleting the name would not refuse it — it would ignore it silently, and a field silently
+    # ignored reads as supported to every client. `_rung_name` refuses it by name instead.
     "force_rung",
     # **Route C's two test axes, top-level like every other testing switch.** §8b's variants and
     # the `--scale` reading are a benchmark's parameters, not the product's: the contract's
@@ -199,12 +198,6 @@ PARAMS_FIELDS = {
     # can choose between on evidence is a way of moving the decision to the caller rather than
     # making it.
     "tile_quality",
-    # **The tail lever** (CF, 2026-08-18, decision 8's switch). `max_window` keeps the window at
-    # the card's maximum and blends a short final pass in with 1-2 frames of overlap;
-    # `balanced` steps the window down the lattice until no pass falls below the floor, trading
-    # every window's quality for an even tail. Neither is imposed: the default favours the body,
-    # balanced the tail, and which matters more is per-job judgment only the caller has.
-    "schedule",
     # ── release 3 ────────────────────────────────────────────────────────────────────────────
     # **Validated in `envelope.py`, not here.** Release 2's surface is large and a release-3
     # block folded into it would be indistinguishable from the fields that have always been
@@ -261,12 +254,6 @@ CRF_MIN, CRF_MAX = 0, 51
 #: The two decode-seam settings, and deliberately only two.
 TILE_QUALITIES = ("default", "high")
 DEFAULT_TILE_QUALITY = "default"
-
-#: The two tail policies. `max_window` is the default because the body of a clip is almost
-#: always more of it than the tail — but "almost always" is not "always", which is why the other
-#: exists rather than a formula choosing between them.
-SCHEDULES = ("max_window", "balanced")
-DEFAULT_SCHEDULE = "max_window"
 
 DERIVE_ROLES = ("poster", "proxy", "crop")
 
@@ -326,22 +313,27 @@ def _positive_float_or_none(value, field):
 
 
 def _rung_name(value):
-    """`None`, or one of the estimator's rung names. Anything else is refused.
+    """`None`, or REFUSED BY NAME. This worker has no rung ladder to pin.
 
-    Validated against `estimator.RUNGS` rather than a list restated here, so a rung renamed in one
-    place cannot be silently unreachable from the other.
+    It used to validate against `estimator.RUNGS`, which was the right shape while a ladder
+    existed: a rung renamed in one place could not go silently unreachable from the other. The
+    estimator and its ladder leave with the upscale path, so there is nothing left to name.
+
+    **The field keeps its entry in `TOP_LEVEL_FIELDS`, and that is the whole point.**
+    `KNOWN_FIELD_NAMES` is built from that tuple, and the top level is policed by
+    `_refuse_known_but_unaccepted` — lenient, because an unknown name up there is metadata by
+    construction. Dropping `force_rung` from the tuple would therefore not refuse it; it would
+    make it **silently ignored**, which reads as supported to every client and is exactly the
+    failure a named refusal exists to prevent. A refusal by name is not a breach of that
+    leniency: the leniency is for names the contract does not define, and this one it does.
     """
     if value is None:
         return None
-    import estimator  # local: validation must stay importable without the estimator's deps
-
-    names = [rung["name"] for rung in estimator.RUNGS]
-    if value not in names:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "force_rung must be one of {}, got {!r}".format(", ".join(names), value),
-        )
-    return value
+    raise WorkerError(
+        FIELD_NOT_SUPPORTED,
+        "field 'force_rung' is not accepted by this worker: it pinned a rung on the upscaler's "
+        "measured ladder, and this worker has no ladder and no rungs. Send it unset.",
+    )
 
 
 def _positive_int_or_none(value, field, maximum, minimum=0):
@@ -686,18 +678,6 @@ def validate(job_input):
                 tile_quality, ", ".join(TILE_QUALITIES)),
         )
 
-    schedule = params.get("schedule")
-    schedule = DEFAULT_SCHEDULE if schedule is None else _as_str(schedule, "schedule")
-    if schedule not in SCHEDULES:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "schedule {!r} is not one of {}. 'max_window' keeps the temporal window at the "
-            "card's maximum and blends a short final pass into its predecessor; 'balanced' "
-            "narrows every window until no pass falls below the {}-frame floor, which costs the "
-            "whole clip a little quality to even out the tail.".format(
-                schedule, ", ".join(SCHEDULES), planner.MIN_WINDOW),
-        )
-
     derive = job_input.get("derive")
     derive = [] if derive is None else _validate_derive(derive)
 
@@ -728,7 +708,6 @@ def validate(job_input):
         "color_correction": color_correction,
         "crf": crf,
         "tile_quality": tile_quality,
-        "schedule": schedule,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,
