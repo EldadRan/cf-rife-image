@@ -108,7 +108,16 @@ def master_name(is_still, width=None, height=None, name=None):
     stem = sanitize_stem(name) or DEFAULT_STEM
     if not is_still:
         return stem + ".mp4"
-    from encoder import still_master_extension  # local: keeps `keys` importable without PIL
+    # **Local, and the reason is no longer the one that was written here.** It said "keeps `keys`
+    # importable without PIL" — true when `encoder` carried `StillWriter`, which imported PIL to
+    # write a lossless still. THAT CODE LEFT WITH THE EXCISION (Wave 2) and PIL is now imported
+    # nowhere in this worker, so the constraint the comment named does not exist.
+    #
+    # **The import stays local anyway**, on the reason that outlived the first: `encoder` pulls the
+    # media stack, and `keys` is a naming module that several paths reach before any of that is
+    # wanted. A stale justification is worse than none, though — this one caused a false finding
+    # on the first reviewer to reason from it, which is exactly what we ask reviewers to do.
+    from encoder import still_master_extension  # noqa: PLC0415
     return stem + still_master_extension(width, height)
 
 #: What the response envelope would have carried, in durable storage. Written on every
