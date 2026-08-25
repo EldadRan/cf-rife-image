@@ -163,6 +163,14 @@ def boot_banner():
     import hardware  # noqa: PLC0415 — stdlib-only module; imported here to keep the cycle absent
 
     cores, total = cpu_count(), host_total_gb()
+    # **Read ONCE and bound.** This was `host_rss_gb() or 0.0` guarded by a second, separate
+    # `host_rss_gb() is not None` — and the guard is evaluated before the value, so a read that
+    # succeeded for the condition and failed for the value printed `0.00 GiB resident`. **A
+    # fabricated number carrying a unit is the one thing this project refuses by name**: contract
+    # §1 on the guard that returns silently rather than inventing, and `interp_plan`'s own
+    # coefficients, absent because a placeholder is indistinguishable from a measurement. One
+    # call, one binding, and `unknown` when there is nothing to report.
+    rss = host_rss_gb()
     dc, source = hardware.datacenter()
     physical = hardware.physical_ram_gb()
     limit = hardware.memory_limit_gb()
@@ -173,7 +181,7 @@ def boot_banner():
     return "[host] boot: {} core(s) usable, {} host RAM, {} resident, dc {}".format(
         cores if cores is not None else "?",
         "{:.1f} GiB".format(total) if total else "unknown",
-        "{:.2f} GiB".format(host_rss_gb() or 0.0) if host_rss_gb() is not None else "unknown",
+        "{:.2f} GiB".format(rss) if rss is not None else "unknown",
         "{} (from {})".format(dc, source) if dc
         else "not exposed — tried {}".format(", ".join(hardware.DATACENTER_ENV))) + (
         "\n[host] boot: cgroup slice {:.1f} GiB of {:.1f} GiB physical — the slice is what "
