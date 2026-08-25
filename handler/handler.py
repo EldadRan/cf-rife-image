@@ -403,6 +403,7 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             source=source,
             attempts=attempts,
             output=(trace or {}).get("output"),
+            retime=(trace or {}).get("retime"),
             load_strip=(trace or {}).get("load_strip") or None,
             host_banners=list(_HOST_BANNERS),
             timings={

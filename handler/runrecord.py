@@ -125,7 +125,8 @@ def build_stub(build_identity, machine, request=None, rationale=None, source=Non
 
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
-          progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL):
+          progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
+          retime=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -153,6 +154,19 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # pairing a rung's name with another rung's peak is a corruption this ledger has already
         # met once.
         "plan": _configuration_of(attempts),
+        # **Its own slot, not a borrowed one, and the reason is what survives WITHOUT the client.**
+        # The retime stats ride the envelope, so a harness that completes already holds them — but
+        # a harness that dies in the fetch does not, and that happened twice in one afternoon. When
+        # it does, THIS RECORD IS THE ONLY THING LEFT, and without this field it would say the job
+        # ran, on which machine and for how long, and NOTHING ABOUT WHAT WAS COMPUTED: no n_out, no
+        # peak VRAM, no padded_megapixels, no encode settings.
+        #
+        # **A record whose whole purpose is to outlive the client cannot be the one artefact that
+        # omits the work.** Beside `plan` and `rationale` rather than inside them: those are the
+        # estimator's fields and route C has no estimator, and a record that borrows a slot is
+        # worse than one with a gap because the gap is visible. Null on any path that produces no
+        # retime, which is every upscale path and every refusal before the loop.
+        "retime": retime,
         "rationale": rationale,
         "source": source,
         "output": output,
