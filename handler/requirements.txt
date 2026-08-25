@@ -1,17 +1,17 @@
-# Handler-only dependencies. torch, torchvision and the rest of the model chain come from the
-# base image plus the vendored SeedVR2 repo's own requirements.txt, installed alongside this file
-# in the Dockerfile. **opencv is no longer among them — it is declared below**, because route C
-# decodes with it and the vendored file that used to supply it is leaving.
+# Handler-only dependencies. **torch and torchvision are NOT here and must not be added** — the
+# base image ships the CUDA build, and a version constraint in this file would have pip replace it
+# with a PyPI default. The vendored SeedVR2 requirements used to be installed alongside this file
+# and left both unpinned for that reason; that file is gone and this one must not acquire the
+# constraint it was careful not to have.
 runpod
 boto3
 requests
-pillow          # the crop derive's lossless WebP write
 huggingface_hub # build-time weight bake only (bake_weights.py)
 
 # **The one dependency the excision ADDS, and it is not a new one** — it is a declaration of what
 # route C has always used. `cv2` reached the decoder through the vendored SeedVR2 requirements,
-# which the Dockerfile installs alongside this file and which leaves with the tree. Undeclared
-# here, the decoder would break at the moment that install line goes.
+# which the Dockerfile installed alongside this file and which is now gone. Undeclared here, the
+# decoder breaks.
 #
 # **Unpinned, and that is what the field ran rather than a choice made here.**
 # `cf-upscale-image@rife-seed:handler/vendor/SeedVR2/requirements.txt:12` reads `opencv-python`
@@ -19,14 +19,3 @@ huggingface_hub # build-time weight bake only (bake_weights.py)
 # would be a constant nobody measured** — the same objection this project raises to a placeholder
 # coefficient. Which version this worker should pin is unruled and wants a decision, not a guess.
 opencv-python
-
-# **No diffusers pin.** The image worker pins diffusers==0.33.1, and that pin is specific to
-# torch 2.4.0: newer diffusers ships an attention_dispatch custom op whose `X | None` type hints
-# are rejected by 2.4.0's infer_schema, which crashes the whole model import at runtime. This
-# image is on torch 2.8.0, so the constraint does not apply — and carrying a pin whose reason has
-# gone is how a workaround outlives the problem and starts causing its own.
-#
-# SeedVR2's own requirements ask for diffusers>=0.33.1, which is what resolves here. If the
-# build-time `import inference_cli` check ever fails on a diffusers release, this is the first
-# place to look — and the fix is a pin with today's reason written next to it, not this one
-# restored.

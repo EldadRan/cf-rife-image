@@ -1,4 +1,4 @@
-# CF SeedVR2 upscale worker.
+# CF frame-interpolation worker.
 #
 # **Ordered by how often each step changes**, which is what makes the build cache hit: base image,
 # system packages, pinned third-party source, Python dependencies, the dependency import check,
@@ -12,8 +12,7 @@
 # endpoint run wherever there is a free card. That is the reason; build speed is not.
 
 # Python 3.11, stated in the tag rather than deduced from an Ubuntu release (docs/decisions.md
-# 2.1). torch 2.8.0 rather than the image worker's 2.4.0: the diffusers==0.33.1 pin exists only
-# for 2.4.0's infer_schema and goes with it.
+# 2.1). torch 2.8.0 rather than the image worker's 2.4.0.
 #
 # **This used to claim CUDA 12.8.1 "widens the card pool this worker's headroom comes from". It
 # does the opposite**, and it was never measured — the base image's `cuda>=12.8` requirement is a
@@ -21,39 +20,6 @@
 # of the fleet refused to start the container while the sibling worker's `cuda12.4.1` build ran on
 # the same cards. The `NVIDIA_REQUIRE_CUDA` override below is what recovers the pool.
 FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
-
-# The pinned SeedVR2 commit. The handler drives this exact source's entry points, so a moving
-# checkout would move the worker's accepted values underneath it.
-ARG SEEDVR2_COMMIT=4490bd1f482e026674543386bb2a4d176da245b9
-
-# **One baked model per image, and which one is a build parameter.** The weights are too large to
-# bake two, so a different checkpoint is a different build of this repo rather than a runtime
-# choice — and `cf-upscale-worker` on a 3B variant is `--build-arg`, not a fork. CF records the
-# value as `routing.provider_model`, per endpoint.
-ARG SEEDVR2_MODEL=seedvr2_ema_7b_fp16.safetensors
-
-# **The route-C image is this image without the weights** (contract §6b). Route C never loads
-# SeedVR2, so a build that omits the checkpoint is not a stripped worker — it is the correct one
-# for that route, and it does not pay a cold start for ~15 GiB it will never read.
-#
-# **It gates SeedVR2 and NOT RIFE** (CF, 2026-08-23). Route C is the image with no upscaler and
-# it is precisely the image that must interpolate, so the interpolator is baked on every variant
-# and the flag decides only whether a checkpoint rides with it. The shell no longer branches: the
-# script is always invoked and reads this value itself, because the two fetches and their hash
-# assertions already live there and a second decision point in shell is a second place to be
-# wrong about which model is which.
-#
-# **`0` or `1`, and anything else fails the build.** An earlier draft baked on a mistyped value
-# — fail-safe in isolation, but two ENV flags below derive from this one arg, and a value that is
-# neither cannot set both honestly. A typo that stops a build costs minutes; a typo that ships an
-# image whose flags disagree about its own bytes costs a campaign. Default 1, and the default
-# path is the shell that ran before this arg existed: with the weights baked the RUN's contents
-# are what they were.
-# **The layer's DIGEST necessarily changes**
-# — the instruction text is part of a layer's identity, so `if` here is a new layer even when it
-# does exactly what the old one did. Contents identical, digest not; the two are different claims
-# and only the first was ever available.
-ARG BAKE_WEIGHTS=1
 
 # A pinned static ffmpeg, not the distribution's. Ubuntu 22.04 ships 4.4, this repo is developed
 # against 9.x, and the gap is not cosmetic: `-vsync` was removed in 9.x while `-fps_mode` arrived
@@ -109,10 +75,7 @@ ENV NVIDIA_REQUIRE_CUDA="cuda>=12.0"
 # The run that answers it is `fhd_source.mp4 --target 2160 --rung resident`, which OOMed here.
 ENV PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-ENV SEEDVR2_DIR=/app/SeedVR2 \
-    SEEDVR2_MODEL_DIR=/app/models/SEEDVR2 \
-    SEEDVR2_MODEL=${SEEDVR2_MODEL} \
-    RIFE_MODEL_DIR=/app/models/RIFE \
+ENV RIFE_MODEL_DIR=/app/models/RIFE \
     PYTHONUNBUFFERED=1
 
 # ── system packages ─────────────────────────────────────────────────────────────────────────
@@ -150,63 +113,15 @@ RUN set -eux; \
     echo "toolchain: $(python3 -V), $(head -1 /tmp/ffver.txt)"; \
     rm -f /tmp/encoders.txt /tmp/mp4muxer.txt /tmp/ffver.txt
 
-# ── pinned third-party source ───────────────────────────────────────────────────────────────
-# **Vendored, not cloned.** The tree is committed at `vendor/SeedVR2`, pristine at the commit
-# `SEEDVR2_COMMIT` names, so this build reaches no third-party host for its source. It used to
-# `git clone` upstream and check that commit out, which made every build — including a rollback
-# rebuild of an image that already shipped — depend on a repository nobody here controls staying
-# up, keeping its history, and keeping that commit reachable.
-#
-# `SEEDVR2_COMMIT` is no longer a checkout instruction. It is the provenance stamp naming which
-# upstream commit this copy was taken from, reported in every run record, and the string
-# `vendor_patch.py` fails against if the tree under it is not the one it expects.
-COPY vendor/SeedVR2 $SEEDVR2_DIR
-
-# **The one edit to the pinned source, and the only one.** Everything else this worker changes
-# about SeedVR2 is a runtime rebinding of a module-level name (`build_args`, `phasewatch`,
-# `_read_frames_from_cap`, `wavelet_reconstruction`) — none of which touch the tree. The bfloat16
-# handoff at the end of `_process_frames_core` is three lines inside a function body with no name
-# to rebind, and it doubles the largest host allocation in the process; see `vendor_patch.py` for
-# what and why.
-#
-# Above the dependency install rather than beside the code copy, because the import check below
-# must exercise the patched source — an image whose patch silently failed would pass every test
-# that does not send it 8K. `vendor_patch.py` raises if the pinned commit has moved under it, so
-# a stale patch stops the build instead of shipping.
-#
-# Absolute paths: `WORKDIR /app` is not set until the dependency block below, and a relative
-# `COPY` here would land the script wherever the base image left the working directory.
-COPY vendor_patch.py /app/vendor_patch.py
-RUN python3 /app/vendor_patch.py "$SEEDVR2_DIR"
-
 # ── Python dependencies ─────────────────────────────────────────────────────────────────────
-# SeedVR2's own requirements list `torch` and `torchvision` unpinned, which the base image
-# already satisfies — so pip leaves the CUDA build in place rather than replacing it with a
-# PyPI default. That is load-bearing and worth knowing before adding a version constraint here.
+# **Nothing here pins `torch` or `torchvision`, and that is load-bearing rather than an omission.**
+# The base image ships the CUDA build; a version constraint added to `requirements.txt` would have
+# pip replace it with a PyPI default. The vendored requirements used to be installed alongside
+# ours and listed both unpinned for the same reason — that file is gone, and this one must not
+# acquire the constraint it was careful not to have.
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r "$SEEDVR2_DIR/requirements.txt" -r requirements.txt
-
-# **The dependency import check, above the bake.** `import inference_cli` pulls the real model
-# chain — torch, diffusers, the attention backends — so a bad combination breaks the build in
-# seconds rather than after a multi-GB download. This is the fail-loud-early rule in its most
-# concrete form, and it is the check that makes moving to torch 2.8.0 cheap to try.
-RUN cd "$SEEDVR2_DIR" && python3 -c "import inference_cli; print('inference_cli import OK')"
-
-# **The two seams the release rides on, asserted where a failure is free.** Both are runtime
-# rebindings of vendored names, and a vendored bump that renamed either would leave the worker
-# installing nothing — the first symptom being a phase-4 crash on an 8K job with three phases of
-# GPU already spent, or a host OOM that reads as a hardware problem. Checked here, a bump that
-# moves them costs ten minutes of CI instead.
-RUN cd "$SEEDVR2_DIR" && python3 -c "\
-import inference_cli, src.utils.color_fix as cf, src.core.generation_phases as gp; \
-assert callable(getattr(cf, 'wavelet_reconstruction', None)), 'color_fix.wavelet_reconstruction is gone'; \
-assert getattr(gp, 'wavelet_reconstruction', None) is cf.wavelet_reconstruction, 'generation_phases no longer imports it'; \
-assert 'cf-upscale-worker (release item 3)' in open('inference_cli.py').read(), 'vendor_patch did not take'; \
-assert 'cf-upscale-worker (F-2026-08-19-31)' in open('src/utils/downloads.py').read(), 'vendor_patch skip-validation did not take'; \
-assert 'cf-upscale-worker (F-2026-08-21-54)' in open('src/core/generation_phases.py').read(), 'vendor_patch dit-less phase entry did not take'; \
-assert open('src/optimization/memory_manager.py').read().count('cf-upscale-worker (F-2026-08-21-54)') == 2, 'vendor_patch dit-less/vae-less cleanup did not take twice'; \
-print('release seams OK: colour pyramid patchable, bfloat16 handoff removed, weight re-hash skipped, dit-less entry reloads, dit-less cleanup survives')"
+RUN pip install --no-cache-dir -r requirements.txt
 
 # ── weights ─────────────────────────────────────────────────────────────────────────────────
 # Their own layer, so editing the handler below does not re-download them. Nothing may be
@@ -217,37 +132,12 @@ print('release seams OK: colour pyramid patchable, bfloat16 handoff removed, wei
 # projections there were written.
 COPY bake_weights.py RIFE-LICENSES.txt ./
 RUN set -eux; \
-    case "$BAKE_WEIGHTS" in 0|1) ;; \
-      *) echo "BAKE_WEIGHTS must be 0 or 1, got '$BAKE_WEIGHTS'" >&2; exit 2 ;; \
-    esac; \
     echo "--- disk before the bake ---"; df -h /; \
-    mkdir -p "$SEEDVR2_MODEL_DIR" "$RIFE_MODEL_DIR"; \
-    BAKE_WEIGHTS="$BAKE_WEIGHTS" python3 bake_weights.py; \
+    mkdir -p "$RIFE_MODEL_DIR"; \
+    python3 bake_weights.py; \
     install -m644 RIFE-LICENSES.txt "$RIFE_MODEL_DIR/LICENSE.txt"; \
     echo "--- disk after the bake ---"; df -h /; \
-    du -sh "$SEEDVR2_MODEL_DIR" "$RIFE_MODEL_DIR"
-
-# **The weights are in the image, so nothing re-proves it at runtime** (F-2026-08-19-31). The
-# vendored `download_weight()` validates an existing model file against a size+mtime cache and,
-# on a miss, reads all 16.4 GiB of it through SHA256 — and our cache is never seeded, because the
-# bake above goes through `hf_hub_download` on purpose. Every fresh worker therefore paid that
-# read on its first job: seconds on a materialized NVMe host, **6m06s and 12m29s measured** on
-# hosts that stream layers lazily, in silence, before any frame was touched. `vendor_patch.py`
-# teaches the vendored gate to honour this flag; see its docstring for why the obvious fix —
-# seeding the mtime cache — is the wrong one on exactly the filesystems where this bug lives.
-#
-# **Set here, not above.** This line is a statement of fact about the layer beneath it. If the
-# bake is ever made conditional, this must move with it: an image that claims baked weights it
-# does not have would skip the validation of a file that really is missing — which the patch's
-# surviving `os.path.exists` guard then catches, but the honest place to be right is here.
-#
-# **Made conditional 2026-08-22 with the bake itself, exactly as the paragraph above required.**
-# `CF_WEIGHTS_BAKED` rides here rather than in the ENV block near the top of the file for two
-# reasons: this is where the fact becomes true, and an ENV up there would put `BAKE_WEIGHTS` above
-# the system packages, the ffmpeg fetch, the vendor copy and the pip install — so building the
-# route-C variant would invalidate all of them and pay a cold build for a one-byte difference.
-ENV SEEDVR2_WEIGHTS_BAKED=${BAKE_WEIGHTS} \
-    CF_WEIGHTS_BAKED=${BAKE_WEIGHTS}
+    du -sh "$RIFE_MODEL_DIR"
 
 # ── build identity ──────────────────────────────────────────────────────────────────────────
 # **An image that cannot say what it is makes every measurement taken on it an assertion.** The
@@ -275,8 +165,7 @@ ARG WORKER_VERSION="0.2.0"
 ENV IMAGE_TAG=${IMAGE_REF} \
     BUILD_COMMIT=${BUILD_COMMIT} \
     BUILD_UTC=${BUILD_UTC} \
-    WORKER_VERSION=${WORKER_VERSION} \
-    SEEDVR2_COMMIT=${SEEDVR2_COMMIT}
+    WORKER_VERSION=${WORKER_VERSION}
 
 # ── this repo's code, last ──────────────────────────────────────────────────────────────────
 # **`*.py` is not everything the handler needs.** `calibration.json` is measured data the
