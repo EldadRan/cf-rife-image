@@ -39,50 +39,71 @@ FIT_VRAM_INTERCEPT_GB = 0.016
 #: and cuDNN's workspaces are all real and none of them is in the fit.
 VRAM_RESERVE_GB = 2.0
 
-#: **`seconds = TIME_FIXED_S + TIME_PER_IN x n_in x mp^TIME_EXPONENT
-#:            + TIME_PER_SYNTH x n_synth x mp^TIME_EXPONENT`**, `mp` being padded megapixels.
+#: **`compute_s = (TIME_PER_IN x n_in + TIME_PER_SYNTH x n_synth) x mp^TIME_EXPONENT`**
+#: **`transfer_s = TIME_TRANSFER_PER_MP x mp`**, and the answer is their sum, because the ETA is
+#: a promise to a caller who waits through the transfer too.
 #:
-#: Three terms because the corpus has three behaviours in it: a fixed per-job cost that a
-#: 30-second 1080p run is mostly made of; a streaming cost every SOURCE frame pays whether it is
-#: copied, held or thrown away — which is what a decimation is, and the 24->12 reading is the only
-#: one that separates it; and the model pass, which only a synthesised frame pays.
+#: **REFITTED 2026-08-26 from six instrumented runs on `sha-9672d42`** — the first corpus in this
+#: project's history where `compute_s` is separable from transfer, which is exactly what §9b was
+#: waiting for and what `docs/instrumentation.md` §8a was built to produce.
 #:
-#: **Superlinear in area, and that is a reading rather than a theory** — 8K is 4x 4K's pixels and
-#: cost 7.3x its time on the same card at the same frame counts. Nothing here explains why; the
-#: exponent is fitted, and the explanation is what §8a's split exists to make findable.
-TIME_FIXED_S = 16.6
-TIME_PER_IN = 0.0268
-TIME_PER_SYNTH = 0.0132
-TIME_EXPONENT = 1.47
+#: **The shape changed as well as the numbers, and §9b's requirement is what made that visible
+#: rather than what it violated.** The old model had a `TIME_FIXED_S` term and no transfer term,
+#: because the corpus it was fitted from could not tell the two apart — every wall figure had the
+#: download and the upload inside it, so a fixed cost and a transfer cost were one unknown. §8a
+#: split them. The fixed term is not separable from THIS corpus either (see `resolutions` below)
+#: and has been dropped rather than carried at a value nothing measures.
+TIME_PER_IN = 0.05525
+TIME_PER_SYNTH = 0.02721
+TIME_EXPONENT = 1.1053
+
+#: **Transfer is linear in padded area because the BYTES are.** 73 MB in and 193 MB out at 4K
+#: against 580 and 743 at 8K, over one link: 2.15 s/MP implied by the 4K runs and 2.02 by the 8K
+#: ones, which is as close to one constant as a six-reading corpus can show. **This is a property
+#: of this link and these sources, not of the worker** — a caller on a slower connection has a
+#: different constant and nothing here would know.
+TIME_TRANSFER_PER_MP = 2.0849
 
 #: **§9b's first requirement, as data rather than as prose.** Every time answer carries this, so
 #: a number that cannot say where it came from cannot leave this module.
-#:
-#: `spread_frac` is the measured repeatability floor and NOT a residual: two runs of the same 4K
-#: job on the same worker sixteen minutes apart came back 220.9 s and 262.5 s. **No fit can be
-#: better than that**, and a model reporting a tighter band than the noise it was fitted through
-#: would be misrepresenting its own quality — which is the second requirement.
-#:
-#: `max_residual_frac` is this fit's own worst reading, and the published band is the larger of
-#: the two.
 CORPUS = {
-    "name": "cf-rife-project records/, delivered runs, 2026-08-19 .. 2026-08-25",
-    "readings": 7,
-    "resolutions": ("1920x1080", "3840x2160", "7680x4320"),
+    "name": "cf-rife-project records/, six instrumented runs on sha-9672d42, 2026-08-26",
+    "readings": 6,
+    # **TWO distinct padded areas and ONE frame plan across all six**, and this is the fit's
+    # binding limitation rather than a footnote. Every run was 192 source frames producing 382
+    # syntheses, so `n_in` and `n_synth` are perfectly collinear here and this corpus cannot
+    # separate them; the ratio between them is HELD from the previous corpus, whose 24->12
+    # decimation run is the only reading this project has ever taken that told them apart.
+    #
+    # **And with two distinct areas, two free parameters fit them exactly.** `TIME_EXPONENT` and
+    # the overall level are determined by the two cluster means, so the fit passes through both by
+    # construction — **its residual at those points is arithmetic, not evidence.** What the corpus
+    # does measure well is the SPREAD, three readings at each point, and that is what the
+    # published band is built from.
+    "resolutions": ("3840x2160", "7680x4320"),
+    "distinct_padded_areas": 2,
+    "frame_plans": 1,
     "gpu": "NVIDIA A40",
-    "fitted_against": "RunPod executionTime",
-    # **The caveat is part of the answer, not a footnote to it.** Every wall figure in this
-    # corpus includes the source download and the master upload (`docs/instrumentation.md` §8a),
-    # so these coefficients price transfer as if it were compute.
-    "caveat": "includes source download and master upload; refit is ordered once "
-              "instrumentation 8f's compute_s exists",
-    "spread_frac": 0.188,
-    "max_residual_frac": 0.29,
+    # **The compute half is fitted against `compute_s` and excludes transfer**, which the previous
+    # corpus could not do. Transfer is its own term, fitted separately against the same six runs.
+    "fitted_against": "timings.compute_s, with transfer fitted separately from timings.fetch_s "
+                      "+ timings.upload_s",
+    "held_from_previous_corpus": "the TIME_PER_IN : TIME_PER_SYNTH ratio, 2.03:1",
+    # **The band is the OBSERVED spread and not the fit's residual**, because the residual is
+    # exact-by-construction and the spread is real: 42% at 4K across three runs on one worker,
+    # one of which lost its cores mid-encode for 100 s. A model reporting a tighter band than the
+    # noise it was fitted through misrepresents its own quality, which §9b's second requirement
+    # forbids by name.
+    "spread_frac": 0.42,
+    "max_residual_frac": 0.216,
+    "caveat": "n_in and n_synth are collinear in this corpus and the exponent rests on two "
+              "cluster means; a third resolution is the cheapest thing that would falsify it",
 }
 
-#: What `eta_basis` carries into the progress payload and the run record. Short because it is a
-#: label on a wire; `CORPUS` is where the account lives, and `estimate_seconds` returns both.
-BASIS = "estimator_v1"
+#: What `eta_basis` carries into the progress payload and the run record. **Bumped with the
+#: refit**, so a record cannot say `estimator_v1` and mean either set of constants — a corpus in
+#: which one label covers two models is one nobody can sort.
+BASIS = "estimator_v2"
 
 
 class Unpriceable(Exception):
@@ -175,11 +196,19 @@ def estimate_seconds(width, height, n_in, n_synth, scale=1):
             "a time estimate needs the source frame count and the synthesis count and got "
             "n_in={!r} n_synth={!r}. Neither is guessed: a copied frame and a synthesised one "
             "cost differently and the corpus can tell them apart.".format(n_in, n_synth))
-    area = interp_plan.padded_megapixels(width, height, scale) ** TIME_EXPONENT
-    point = TIME_FIXED_S + TIME_PER_IN * n_in * area + TIME_PER_SYNTH * n_synth * area
+    megapixels = interp_plan.padded_megapixels(width, height, scale)
+    compute = (TIME_PER_IN * n_in + TIME_PER_SYNTH * n_synth) * megapixels ** TIME_EXPONENT
+    transfer = TIME_TRANSFER_PER_MP * megapixels
+    point = compute + transfer
     band = max(CORPUS["spread_frac"], CORPUS["max_residual_frac"])
     return {
         "point_s": round(point, 1),
+        # **Published apart as well as together**, because they are now separately fitted and a
+        # reader grading the estimate against a record can compare each against the field §8a
+        # created for it. The old model could not offer this: it had one term and the record had
+        # one number.
+        "compute_s": round(compute, 1),
+        "transfer_s": round(transfer, 1),
         "low_s": round(point * (1.0 - band), 1),
         "high_s": round(point * (1.0 + band), 1),
         "band_frac": band,
