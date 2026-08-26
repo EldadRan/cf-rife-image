@@ -160,10 +160,20 @@ def synchronise(tensor=None):
     A sync inserted into a pipeline that was genuinely overlapping would have bought a number by
     changing the thing measured; §10e is where that is checked rather than assumed.
 
-    **Device-wide, not stream- or tensor-scoped.** `tensor` selects whether to synchronise at all,
-    never what to wait for: `torch.cuda.synchronize()` waits on every stream on the device. That
-    is correct for both callers — each wants everything it enqueued to be done — but it means a
-    caller cannot use this to wait for its own work alone.
+    **Device-wide, not stream-scoped, and the DEVICE IS TAKEN FROM THE TENSOR.** `tensor` selects
+    both whether to synchronise and which device to wait on; `torch.cuda.synchronize(device)` then
+    waits on every stream on that one. Waiting on all of a device's streams is correct for both
+    callers — each wants everything it enqueued to be done — but it means a caller cannot use
+    this to wait for its own work alone.
+
+    **The device argument is not cosmetic.** Bare `torch.cuda.synchronize()` waits on torch's
+    CURRENT device, which is not necessarily the tensor's: `Interpolator` takes its device as a
+    constructor argument, and the guard below admits `cuda:1` as readily as `cuda:0`. An
+    interpolator on the second GPU would have passed the guard, synchronised the first, and left
+    `convert_dev_s` reading the enqueue while the pad drained into `model_s` — **§10b's defect
+    restored exactly, wearing the field name that says it was fixed.** Today `handler` builds the
+    interpolator with the bare `"cuda"` default so nothing reaches that state; a latent instrument
+    failure is still an instrument failure, and this one costs an argument to close.
 
     **CUDA events were considered and rejected**, and the reason is not cost. `Event.elapsed_time`
     measures GPU-BUSY time, and §9a asks the stages to account for `compute_s`, which is wall.
@@ -175,14 +185,18 @@ def synchronise(tensor=None):
     without touching the device. Never raises.
     """
     try:
-        if tensor is not None and not getattr(getattr(tensor, "device", None), "type",
-                                              "") == "cuda":
+        device = getattr(tensor, "device", None) if tensor is not None else None
+        if tensor is not None and getattr(device, "type", "") != "cuda":
             return False
         import torch  # noqa: PLC0415 — a GPU-box import, like every other torch touch
 
         if not torch.cuda.is_available():
             return False
-        torch.cuda.synchronize()
+        # `None` keeps the historical meaning — no tensor offered, so wait on the current device.
+        if device is None:
+            torch.cuda.synchronize()
+        else:
+            torch.cuda.synchronize(device)
         return True
     except Exception:  # noqa: BLE001 — a measurement must never cost a delivered master
         return False

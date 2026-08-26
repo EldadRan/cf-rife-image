@@ -296,8 +296,21 @@ class Interpolator:
             return frame.to(device=self._device, dtype=self._dtype)
         return frame.to(device=self._device)
 
-    def _load_pair(self, cache, index, frame_a, frame_b):
+    def _load_pair(self, cache, index, frame_a, frame_b, synchronise=False):
         """Pad the pair for source index `index` into `cache`, once per pair.
+
+        **`synchronise` ends the caller's clock HERE, below the cache-hit return** — §10b, and
+        the placement is the whole of it. The first cut put that call at the call site as a
+        sibling of this method, inside the `convert_dev_s` block. **The cache short-circuits THIS
+        METHOD, not that block**, so the sync fired once per SYNTHESIS while the comment beside
+        it claimed once per pair: 382 syncs against 191 misses at 24->60, 477 against 191 at
+        23.976->60, measured off `build_plan` itself. A cached hit did no conversion work and
+        then blocked device-wide anyway, charging `convert_dev_s` a wait for work it had not
+        enqueued. **Below the return, the cache genuinely bounds the price and the sync can only
+        ever wait on what this call put on the device.**
+
+        **Defaulted off so the unclocked path gains nothing.** An instrument that syncs on a run
+        nobody is measuring has changed the worker to buy a number it is not taking.
 
         **`cache` belongs to one `stream()` call and never to the instance.** It used to live on
         `self`, keyed only by the plan-local index `i` — and a plan index carries no stream
@@ -318,6 +331,11 @@ class Interpolator:
         a, geometry = self._pad(self._cast(frame_a))
         b, _ = self._pad(self._cast(frame_b))
         cache["index"], cache["padded"], cache["geometry"] = index, (a, b), geometry
+        if synchronise:
+            # **The pad is ENQUEUED work and nothing below it waits** — see the docstring. `b`
+            # rather than `a` for no reason beyond it being the later of the two; the call is
+            # device-wide and waits on both.
+            stages.synchronise(b)
 
     def _synthesise(self, cache, timestep, clock=None):
         """One synthesis. **Timed to an explicit synchronisation, never to the enqueue**
@@ -434,28 +452,24 @@ class Interpolator:
                 # **Cached, so it costs nothing on a repeated pair** — `_load_pair` returns
                 # immediately when the index is unchanged, and a timer around a no-op measures a
                 # no-op.
+                #
+                # **§10b's synchronisation is INSIDE `_load_pair`, below that return, and is
+                # asked for here rather than assumed** — this is §9b's trap one stage over: the
+                # method ends at an enqueued pad with nothing after it that waits, so an
+                # unsynchronised clock would time the ENQUEUE and the pad's real cost would drain
+                # into `model_s` at `_synthesise`'s own sync. It was invisible while one
+                # `convert_s` bucket also held `_to_rgb24`'s `.to("cpu")`: the bucket total was
+                # honest even though its interior was not. **Unlike `_synthesise`'s sync this one
+                # is genuinely NEW and may raise `compute_s` rather than merely move a wait** —
+                # `stages.synchronise` carries that difference and §10e checks it against the
+                # corpus. **The cache is what bounds its price, which is why it sits below the
+                # cache and not beside it**; that placement was the review finding on the first
+                # cut of this section and `_load_pair`'s docstring carries the measurement.
                 if clock is None:
                     self._load_pair(pair, i, held[i], held[i + 1])
                 else:
                     with clock.timing("convert_dev_s"):
-                        self._load_pair(pair, i, held[i], held[i + 1])
-                        # **§10b, and it is §9b's trap one stage over.** `_load_pair` ends at a
-                        # PAD — enqueued device work with nothing after it that waits. Timed as
-                        # it stands this clock measures the ENQUEUE, and the pad's real cost
-                        # drains into whichever field synchronises next, which is `model_s` at
-                        # `_synthesise`'s own sync. That was invisible while one `convert_s`
-                        # bucket also held `_to_rgb24`'s `.to("cpu")`: the bucket total was
-                        # honest even though its interior was not. Split, it stops being honest.
-                        #
-                        # **Unlike `_synthesise`'s sync this one is genuinely NEW and may raise
-                        # `compute_s` rather than merely move a wait** — `stages.synchronise`
-                        # carries that difference and §10e checks it against the corpus. Charged
-                        # roughly once per PAIR because of the cache above, not once per frame.
-                        #
-                        # `.get` with a default rather than `pair["padded"]`: a measurement must
-                        # never be the thing that raises inside a delivered master, and this line
-                        # exists only to end a clock.
-                        stages.synchronise(pair.get("padded", (None, None))[0])
+                        self._load_pair(pair, i, held[i], held[i + 1], synchronise=True)
                 yield self._synthesise(pair, timestep, clock)
             else:
                 _, i = entry
