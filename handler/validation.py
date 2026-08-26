@@ -201,6 +201,17 @@ PARAMS_FIELDS = {
     # the encoder track. Recorded in the manifest and the ledger, because a master's CRF is part
     # of what that master *is*.
     "crf",
+    # **The other four of §6a's five encode settings** (CF, ruled 2026-08-25, built 2026-08-26).
+    # `crf` above set the pattern and these join it rather than inventing a second mechanism: a
+    # validated request field per setting, today's frozen value as the default, refused outside
+    # its range with a message naming that default. **There is deliberately no field carrying an
+    # x264 options string** — §6a rules that out and gives the reason: these settings exist to
+    # bound the encoder's memory on a path with no host guard, so a pass-through would hand that
+    # bound to the caller and let a request restore the configuration that killed the 8K run.
+    "preset",
+    "threads",
+    "sliced_threads",
+    "rc_lookahead",
     # ── release 3 ────────────────────────────────────────────────────────────────────────────
     # **Validated in `envelope.py`, not here.** Release 2's surface is large and a release-3
     # block folded into it would be indistinguishable from the fields that have always been
@@ -624,6 +635,58 @@ def validate(job_input):
                     CRF_MIN, CRF_MAX, crf, encoder.DEFAULT_CRF),
             )
 
+    preset = params.get("preset")
+    if preset is None:
+        preset = encoder.DEFAULT_PRESET
+    else:
+        preset = _as_str(preset, "preset")
+        if preset not in encoder.PRESETS:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "field 'preset' must be one of x264's presets ({}), got {!r}. {!r} is this "
+                "worker's default and what every measurement in its calibration was taken "
+                "at.".format(", ".join(encoder.PRESETS), preset, encoder.DEFAULT_PRESET),
+            )
+
+    threads = params.get("threads")
+    if threads is None:
+        threads = encoder.DEFAULT_THREADS
+    else:
+        threads = _as_int(threads, "threads")
+        if not encoder.THREADS_MIN <= threads <= encoder.THREADS_MAX:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                # **The floor is 1 and the message says why**, because `0` is a value a caller
+                # will try: it is x264's spelling of *auto*, and auto on this worker's 96-core
+                # host is 128 frame-threads — the configuration that filled 46 GiB and got the
+                # first 8K run reaped. Refusing it silently would look like an off-by-one.
+                "field 'threads' must be within {}-{}, got {}. x264 reads 0 as 'auto', which on "
+                "a large host means up to {} frame-threads and is the setting this worker exists "
+                "to bound — so auto is not reachable through this field. {} is the default and "
+                "what every measurement in its calibration was taken at.".format(
+                    encoder.THREADS_MIN, encoder.THREADS_MAX, threads,
+                    encoder.THREADS_MAX, encoder.DEFAULT_THREADS),
+            )
+
+    sliced_threads = params.get("sliced_threads")
+    sliced_threads = (encoder.DEFAULT_SLICED_THREADS if sliced_threads is None
+                      else _as_bool(sliced_threads, "sliced_threads"))
+
+    rc_lookahead = params.get("rc_lookahead")
+    if rc_lookahead is None:
+        rc_lookahead = encoder.DEFAULT_RC_LOOKAHEAD
+    else:
+        rc_lookahead = _as_int(rc_lookahead, "rc_lookahead")
+        if not encoder.RC_LOOKAHEAD_MIN <= rc_lookahead <= encoder.RC_LOOKAHEAD_MAX:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "field 'rc_lookahead' must be within x264's range {}-{}, got {}. 0 disables the "
+                "lookahead and is the cheapest setting; {} is this worker's default and what "
+                "every measurement in its calibration was taken at.".format(
+                    encoder.RC_LOOKAHEAD_MIN, encoder.RC_LOOKAHEAD_MAX, rc_lookahead,
+                    encoder.DEFAULT_RC_LOOKAHEAD),
+            )
+
     # **Refused rather than validated-then-dropped**, and this one read as supported harder than
     # any other: `_validate_derive` checked role uniqueness, per-role field strictness and
     # `at_fraction` bounds, so a client probing the surface got a detailed acknowledgement of a
@@ -658,6 +721,10 @@ def validate(job_input):
         "release_3": release_3,
         "keep_audio": keep_audio,
         "crf": crf,
+        "preset": preset,
+        "threads": threads,
+        "sliced_threads": sliced_threads,
+        "rc_lookahead": rc_lookahead,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,

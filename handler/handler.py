@@ -380,6 +380,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
             request, source["width"], source["height"]),
         snap_tolerance=config["snap_tolerance"],
         crf=request.get("crf"),
+        # **§6a's other four, each already defaulted by `validation`.** Passed by name rather than
+        # assembled here: the worker builds the encoder's parameter string from validated fields
+        # and never accepts one, which §6a rules and `encoder.x264_params` implements.
+        preset=request.get("preset"),
+        threads=request.get("threads"),
+        sliced_threads=request.get("sliced_threads"),
+        rc_lookahead=request.get("rc_lookahead"),
         # **Passed at last.** `retime` has declared this parameter since it was written and
         # `_retime` never supplied it, so the retime path published two payloads for a
         # 239-second job — `progress_emitted: 2`, the worker counting its own silence.
@@ -450,11 +457,14 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
         # encode settings changeable with today's values as defaults; the record carried three, so
         # a corpus could not attribute a difference between two runs to the settings that differed.
         # Read from the same place the encoder reads them, so a default cannot be restated wrongly.
-        "retime": dict(stats, target_fps=config["target_fps"],
-                       snap_tolerance=config["snap_tolerance"],
-                       crf=request.get("crf") if request.get("crf") is not None
-                       else encoder.DEFAULT_CRF,
-                       preset=encoder.DEFAULT_PRESET),
+        # **The stats, whole, with nothing restated here.** This block used to add `target_fps`,
+        # `snap_tolerance`, the request's `crf` and the module's `DEFAULT_PRESET` — to the
+        # ENVELOPE only. `trace["retime"]` is built from `stats`, so all four were null in every
+        # run record ever written while the envelope beside them carried values: the corpus could
+        # not attribute a difference to the settings that differed, which is exactly what §2 says
+        # recording three of five costs. `routec` now reads all five off the writer that ran and
+        # returns them, so both artefacts carry one set of numbers that cannot disagree.
+        "retime": dict(stats),
         # **`padded_megapixels` is the fit's independent variable and nothing computed it**
         # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
         # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
@@ -636,23 +646,24 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
 
 
 def _decorate(payload, machine, attempts, warnings, progress, started):
-    # **The three CPU numbers, into the block a reader looks for machine facts in**
-    # (instrumentation §3). `hardware.read` already carries `cpu_quota`; `usable_cores` and
-    # `affinity_cores` are the two that stopped reaching the envelope when Wave 2 removed
-    # `cpu_configuration`. All three, never collapsed: a container throttled by `cpu.max` and one
-    # pinned by an affinity mask are different machines that a single number reports identically
-    # (F-2026-08-19-37), and CPU power is an estimator input CF has named.
+    # **THE THREE CPU NUMBERS MOVED INTO `hardware.read`, WHERE THE RECORD CAN SEE THEM.**
+    # This block added `usable_cores` and `affinity_cores` to the RETURNED PAYLOAD, and the run
+    # record is built from `hardware.read()` alone — so for the same job the envelope reported
+    # `usable_cores: 96` and the record filed null, on every run ever written. `instrumentation.md`
+    # §3 asks a RUN to report all three, never collapsed (`F-2026-08-19-37`), and **the run record
+    # is the artefact that has to answer without a client having been watching** — a caller using
+    # their own front-end got one that could not answer §3 at all.
     #
-    # Here rather than in `hardware.read` so that module keeps its own shape, and here rather than
-    # on the success path so a FAILING run carries it too — a run that does not fit is the reading
-    # a fit predicate most needs, and it needs to know what machine it did not fit on.
-    cpu = phasewatch.cpu_configuration()
-    machine = dict(machine or {})
-    for name in ("usable_cores", "affinity_cores"):
-        machine[name] = cpu.get(name)
-    if machine.get("cpu_quota") is None:
-        machine["cpu_quota"] = cpu.get("cpu_quota")
-    payload["hardware"] = machine
+    # The old reasoning for putting them here was "so `hardware` keeps its own shape" and "so a
+    # FAILING run carries them too". The first was a preference; the second is satisfied better by
+    # the move, because `hardware.read()` is called once at the top of `handle` and reaches every
+    # exit including the ones that never get decorated.
+    #
+    # **Still copied, and the copy is the only thing left of this block.** `handle` hands one
+    # snapshot to both this and `_write_run_record`, so publishing the object itself would let
+    # anything that later touched the envelope's `hardware` edit the record's — two artefacts, one
+    # dict, and a mutation visible in the one nobody was looking at.
+    payload["hardware"] = dict(machine or {})
     payload["execution_ms"] = int((time.time() - started) * 1000)
     if attempts:
         payload.setdefault("attempts", attempts)

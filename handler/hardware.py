@@ -405,6 +405,62 @@ def cpu_usage_s(root="/"):
         return None
 
 
+def cpu_model(root="/"):
+    """The CPU's own name, from `/proc/cpuinfo`'s first `model name`, or None off Linux.
+
+    **We record how many cores we were given and have never recorded what they are**, on a
+    pipeline that runs pinned at four-to-five busy cores where the per-core figure is what decides
+    the encode. Same class as `F-2026-08-25-8`: a corpus that cannot say what hardware a row was
+    taken on cannot compare two rows.
+
+    **The first entry only.** Every core in a container reports the same model, and a list of 96
+    identical strings is a field nobody reads.
+    """
+    try:
+        with open(os.path.join(root, "proc/cpuinfo")) as handle:
+            for line in handle:
+                # **The guard is per LINE, not around the file.** Wrapping the loop meant one
+                # `model name` line without a colon abandoned the read and returned None — a null
+                # where a value was two lines further down. A malformed entry is a reason to keep
+                # looking, not a reason to stop.
+                if line.startswith("model name") and ":" in line:
+                    name = line.split(":", 1)[1].strip()
+                    if name:
+                        return name
+    except OSError:
+        return None
+    return None
+
+
+def _cpu_configuration():
+    """The three CPU numbers, from `phasewatch`, which owns the affinity and quota readings.
+
+    **Imported inside the call because `phasewatch` imports this module the same way.** Both
+    directions are lazy and neither is a cycle at import time; putting the readings here rather
+    than duplicating them is what stops the snapshot and the banner drifting apart.
+    """
+    try:
+        import phasewatch  # noqa: PLC0415 — stdlib-only, lazy on both sides of the pair
+
+        return phasewatch.cpu_configuration()
+    except Exception as exc:  # noqa: BLE001 — a snapshot must never fail a job
+        # **SAID OUT LOUD, because the alternative is the collapse this function is cited
+        # against.** Swallowing to `{}` files `usable_cores: None` and `affinity_cores: None`,
+        # which is byte-identical in the record to a host that genuinely has neither — so "no
+        # affinity data on this host", "phasewatch would not import" and "the read raised" all
+        # reach the corpus as one null, on the artefact §3 exists to make readable.
+        # `F-2026-08-19-37` is precisely about two states one number cannot tell apart.
+        #
+        # **A line rather than a raise**, and rather than a field: `read()` runs on every job
+        # including a refusal, so raising would cost a delivered master for a diagnostic, and the
+        # nulls beside this line already say the value is absent. What was missing was any way to
+        # know WHY, and a log line is the cheapest thing that survives.
+        print("[hardware] the CPU configuration could not be read ({}: {}); usable_cores and "
+              "affinity_cores will be null in this run's record".format(
+                  type(exc).__name__, str(exc)[:200]), flush=True)
+        return {}
+
+
 def _distribution_version(name):
     """The version of an installed distribution **as resolved, not as declared** (§8e).
 
@@ -445,6 +501,7 @@ def read(workdir="/"):
     estimate that was wrong is only useful beside the hardware it was wrong about.
     """
     name, total_vram, free_vram = _gpu()
+    _cpu = _cpu_configuration()
     driver_cuda, built_cuda = _cuda_versions()
     capability, arch_list = _compute_arch()
     return {
@@ -477,7 +534,25 @@ def read(workdir="/"):
         "host_ram_gb": _round(_host_ram_gb()),
         "host_ram_physical_gb": _round(physical_ram_gb()),
         "host_ram_limit_gb": _round(memory_limit_gb()),
-        "cpu_quota": _round(cpu_quota()),
+        # **ALL THREE CPU NUMBERS, IN THE SNAPSHOT THE RECORD IS BUILT FROM.**
+        # `instrumentation.md` §3 requires `usable_cores`, `cpu_quota` and `affinity_cores` on
+        # every run, never collapsed — a container throttled by `cpu.max` and one pinned by an
+        # affinity mask are different machines that a single number reports identically
+        # (`F-2026-08-19-37`). §3's restoration put two of them in `handler._decorate`, which
+        # decorates the RETURNED PAYLOAD — so the envelope carried `usable_cores: 96` while the
+        # run record filed null, on every run ever written.
+        #
+        # **The record is the artefact that has to survive without the client**, and a caller
+        # using their own front-end got one that could not answer §3 at all. Here rather than
+        # there, so both read the same snapshot.
+        "usable_cores": _cpu.get("usable_cores"),
+        "affinity_cores": _cpu.get("affinity_cores"),
+        # `phasewatch`'s reading first, this module's own as the fallback: they call the same
+        # function, and the `or` matters only if the import above failed.
+        "cpu_quota": _round(_cpu.get("cpu_quota") if _cpu.get("cpu_quota") is not None
+                            else cpu_quota()),
+        # What those cores actually ARE, which nothing has ever recorded.
+        "cpu_model": cpu_model(),
         # **What the OOM killer counts, at snapshot time.** A single reading rather than a series
         # — the banners carry the series — but it lands in the manifest and the response, so even
         # a job whose banners are lost says once what the platform thought it was using.

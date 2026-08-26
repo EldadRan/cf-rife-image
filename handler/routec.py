@@ -28,21 +28,19 @@ _CHANNELS = 3
 #: duration bound is +-2 output frames and this is its counterpart on the input side.
 SURPLUS_TOLERANCE_FRAMES = 2
 
-#: **Route C's own encode settings, passed as an override the production path never sends**
-#: (contract §8c). The 8K run was reaped in x264 at ~46 GiB while this side held one frame and a
-#: cached pair: the pipe is backpressure and it was working — what filled memory was the
-#: encoder's own working set, one frame in flight per encoding thread plus `medium`'s 40-frame
-#: lookahead plus references, dozens of 50 MiB frames at once on a 24-core host. At 4K the same
-#: arithmetic fits, which is why five 4K runs showed nothing.
+#: **The frozen encode settings are `encoder`'s now, as named fields** (contract §6a). This was
+#: `FRUGAL_X264`, one string chosen to make the 8K run fit: the run was reaped in x264 at ~46 GiB
+#: while this side held one frame and a cached pair — the pipe is backpressure and it was working,
+#: and what filled memory was the encoder's own working set, one frame in flight per encoding
+#: thread plus `medium`'s 40-frame lookahead plus references, dozens of 50 MiB frames at once. At
+#: 4K the same arithmetic fits, which is why five 4K runs showed nothing.
 #:
-#: `sliced-threads=1` is the large one: threads split ONE frame rather than each taking their
-#: own, which cuts frames-in-flight from dozens to one at a modest speed cost. `threads` caps the
-#: frame-level parallelism that multiplies the set. `rc-lookahead` shortens the window.
-#:
-#: **Every value here is an ordering hint and not a prediction.** The gate modelled x264 at ~4 GiB
-#: against an observed 40-plus, so nothing in this line is trustworthy until a run reports
-#: `encoder_peak_rss_gb` — which is why the writer now measures it.
-FRUGAL_X264 = "sliced-threads=1:threads=4:rc-lookahead=10"
+#: **The string is gone and the values are not.** `encoder.DEFAULT_THREADS`,
+#: `DEFAULT_SLICED_THREADS` and `DEFAULT_RC_LOOKAHEAD` hold exactly what it held, and
+#: `encoder.x264_params()` with no arguments reproduces it byte for byte — so the corpus taken
+#: under the constant and the corpus taken under the fields are one corpus. What changed is that
+#: a caller can now move them, which is what §6a's campaign needs and what a frozen string
+#: refused by construction.
 
 
 def source_frame_count(source):
@@ -129,7 +127,8 @@ def frames_from(capture, expect=None):
 
 def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
-           variant="direct", scale=None):
+           variant="direct", scale=None, preset=None, threads=None,
+           sliced_threads=None, rc_lookahead=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -190,7 +189,16 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             audio_source=audio_source, audio_codec=source.get("audio_codec"),
             audio_limit_s=source.get("video_duration_s"),
             crf=crf if crf is not None else encoder.DEFAULT_CRF,
-            x264_params=FRUGAL_X264)
+            # **`None` means "the caller did not choose", so the default is applied HERE and in
+            # one place.** `validation` already defaults every one of these, so nothing reaching
+            # this line through `handle` is None — these guards are for the direct callers a test
+            # makes, and they resolve to the same constants `validation` would have used.
+            preset=preset if preset is not None else encoder.DEFAULT_PRESET,
+            threads=threads if threads is not None else encoder.DEFAULT_THREADS,
+            sliced_threads=(sliced_threads if sliced_threads is not None
+                            else encoder.DEFAULT_SLICED_THREADS),
+            rc_lookahead=(rc_lookahead if rc_lookahead is not None
+                          else encoder.DEFAULT_RC_LOOKAHEAD))
         # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
         # `Progress` was constructed — before the fetch, before the probe, before the model
         # load — so the first measured seconds-per-frame amortised all of that into the per-frame
@@ -231,7 +239,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                 exc.code,
                 "{} — ffmpeg reached {} GiB RSS before it stopped, over {} frame(s) written "
                 "with x264-params {!r}".format(
-                    exc.message, peak, writer_cm.frames_written, FRUGAL_X264),
+                    exc.message, peak, writer_cm.frames_written, writer_cm.x264_params),
                 remedy=exc.remedy, shortfall=exc.shortfall) from exc
         finally:
             # Said out loud whichever way the encode ended, because a log line survives a bundle
@@ -276,7 +284,29 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # ffmpeg's own high-water mark, beside the GPU's. The 8K ceiling was in the
                     # encoder rather than the model, and neither number alone would have said so.
                     encoder_peak_rss_gb=writer.encoder_peak_rss_gb,
-                    x264_params=FRUGAL_X264)
+                    # **What RAN, read off the writer** (§6c). A campaign attributing a
+                    # difference between two arms to the settings that differed needs the settings
+                    # that were used and not the module's defaults — and now that they can move,
+                    # those are two different things.
+                    x264_params=writer.x264_params,
+                    # **ALL FIVE, `crf` INCLUDED, AND THE RECORD IS WHY.** `crf` and `preset` used
+                    # to be added to the ENVELOPE by `handler._retime` and never reached `stats` —
+                    # so `trace["retime"]`, which is built from `stats`, filed both as null on
+                    # every run ever written, while the envelope beside it said `crf: 12`.
+                    # `instrumentation.md` §2 names `crf, preset` as the two missing settings and
+                    # says why: *a corpus recording three of five cannot attribute a difference*.
+                    # The corpus is the RECORD. Reading all five off the writer that ran is what
+                    # puts them in both artefacts and makes them impossible to disagree.
+                    crf=writer.crf,
+                    preset=writer.preset,
+                    threads=writer.threads,
+                    sliced_threads=writer.sliced_threads,
+                    rc_lookahead=writer.rc_lookahead,
+                    # **Same defect, same fix, one line further.** §2 lists `snap_tolerance` among
+                    # the axes a run must carry and the record filed it null for the same reason.
+                    # `target_fps` is what the whole job was FOR. Both were envelope-only.
+                    target_fps=float(target_fps),
+                    snap_tolerance=snap_tolerance)
     finally:
         if capture is not None:
             capture.release()

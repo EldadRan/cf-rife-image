@@ -37,6 +37,61 @@ MP4_NATIVE_AUDIO = ("aac", "mp3", "alac", "ac3", "eac3")
 DEFAULT_CRF = 12
 DEFAULT_PRESET = "medium"
 
+#: **The three x264 settings that bound the encoder's MEMORY, as named fields with today's values
+#: as the defaults** (contract §6a). They were one frozen string — `routec.FRUGAL_X264` — chosen
+#: to make an 8K run fit on a 24-core host, and §6a rules all five settings changeable so the
+#: campaign can price them. `crf` and `preset` were already fields; these three join them rather
+#: than inventing a second mechanism.
+#:
+#: **`sliced_threads` is the large one.** Threads split ONE frame rather than each taking their
+#: own, which cuts frames-in-flight from dozens to one at a compression and speed cost. `threads`
+#: caps the frame-level parallelism that multiplies the working set. `rc_lookahead` shortens the
+#: window `medium` sets to 40.
+#:
+#: **Every value is an ordering hint and not a prediction** — the gate modelled x264 at ~4 GiB
+#: against an observed 40-plus — which is why §6c refuses to let an estimator throttle against
+#: them until a campaign has fitted host RSS to them.
+DEFAULT_THREADS = 4
+DEFAULT_SLICED_THREADS = True
+DEFAULT_RC_LOOKAHEAD = 10
+
+#: x264's own preset ladder, slowest-to-fastest presets being a speed/compression trade. **The
+#: enumeration IS the range** — a preset is a name x264 either knows or rejects, so nothing here
+#: is a bound this project had to justify.
+PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+           "slow", "slower", "veryslow", "placebo")
+
+#: **x264's documented maximum thread count, and the floor is 1 rather than 0 ON PURPOSE.** x264
+#: reads `threads=0` as *auto*, which is `1.5 x cores` capped at this number — on the 96-core host
+#: this worker runs, auto is 128 frame-threads and precisely the configuration that filled 46 GiB
+#: and got the first 8K run reaped. **§6a rules that the whole point of these settings is bounding
+#: the encoder's memory and a pass-through would hand that bound to the caller**; accepting `0`
+#: would hand it over in a different spelling, so `auto` is not reachable through this field.
+THREADS_MIN, THREADS_MAX = 1, 128
+
+#: x264's own range for `rc-lookahead`. 0 disables the lookahead entirely, which is a legitimate
+#: setting and the cheapest one; 250 is x264's ceiling.
+RC_LOOKAHEAD_MIN, RC_LOOKAHEAD_MAX = 0, 250
+
+
+def x264_params(threads=DEFAULT_THREADS, sliced_threads=DEFAULT_SLICED_THREADS,
+                rc_lookahead=DEFAULT_RC_LOOKAHEAD):
+    """Build the `-x264-params` string from validated fields. **Assembled, never accepted.**
+
+    **Contract §6a rules this shape and gives the reason.** The obvious implementation is a
+    request field carrying the options string straight through, and it is a hole: the arguments
+    are passed as a list rather than through a shell, so it is not a command-injection hazard —
+    it is a RESOURCE one, and sharper than it looks. These settings exist to bound the encoder's
+    memory, on a path §1 says has no host guard, so a pass-through would let a request restore
+    exactly the configuration that killed the 8K run.
+
+    **The default call reproduces the frozen string byte for byte**, key order included, so the
+    corpus taken at `sliced-threads=1:threads=4:rc-lookahead=10` and the corpus taken at these
+    defaults are the same corpus rather than two that have to be reconciled later.
+    """
+    return "sliced-threads={}:threads={}:rc-lookahead={}".format(
+        1 if sliced_threads else 0, int(threads), int(rc_lookahead))
+
 
 def _identity_tags(identity):
     """`-metadata` arguments. **Identity only** — this file is delivered.
@@ -124,7 +179,9 @@ class MasterWriter:
 
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
-                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, x264_params=None):
+                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET,
+                 threads=DEFAULT_THREADS, sliced_threads=DEFAULT_SLICED_THREADS,
+                 rc_lookahead=DEFAULT_RC_LOOKAHEAD):
         self.path = path
         self.width = width
         self.height = height
@@ -146,14 +203,27 @@ class MasterWriter:
         #: Frames the container reports once ffmpeg has exited, or None where it does not say.
         #: The only frame count this class holds that was measured after the encode.
         self.verified_frames = None
-        self._crf = crf
-        self._preset = preset
-        #: **An override, and the production path never passes it** (contract §8c). Route C is a
-        #: test path and says so at the call site rather than in a threshold: a resolution gate —
-        #: "frugal above 12 megapixels" — would leave the upscale path's bytes depending on a
-        #: number somebody has to keep right, and `codec_default_unmoved` would be protecting a
-        #: boundary rather than a behaviour. An argument nobody passes cannot move anything.
-        self._x264_params = x264_params
+        #: Public for the same reason the three below are: **the record has to carry what
+        #: actually ran**, and §6a made all five of these caller-settable on the same day.
+        self.crf = crf
+        self.preset = preset
+        #: **Assembled here from validated fields, and this class no longer accepts a string**
+        #: (contract §6a). It used to take `x264_params` as an override that "the production path
+        #: never passes" — reasoning about an upscale path that left with the excision, leaving
+        #: one caller that always passed it. A parameter with one caller and one value is not an
+        #: override; it was a frozen constant reached through an argument.
+        #:
+        #: **Public, because the record has to carry what actually ran.** §6c's campaign attributes
+        #: a difference between two arms to the settings that differed, and a corpus that recorded
+        #: the DEFAULTS while the run used something else would attribute it to the wrong thing.
+        self.x264_params = x264_params(threads=threads, sliced_threads=sliced_threads,
+                                       rc_lookahead=rc_lookahead)
+        #: Kept individually as well as in the assembled string, so the record can report a field
+        #: without anyone parsing the string back apart. **The string is what ran; these are what
+        #: was asked for**, and they cannot disagree because one is built from the other.
+        self.threads = int(threads)
+        self.sliced_threads = bool(sliced_threads)
+        self.rc_lookahead = int(rc_lookahead)
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -173,7 +243,7 @@ class MasterWriter:
         width, height, fps = self.width, self.height, self.fps
         identity = self._identity
         audio_source, audio_codec = self._audio_source, self._audio_codec
-        crf, preset = self._crf, self._preset
+        crf, preset = self.crf, self.preset
         path = self.path
 
         command = [
@@ -193,10 +263,11 @@ class MasterWriter:
 
         command += ["-map", "0:v:0", "-c:v", "libx264",
                     "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
-        if self._x264_params:
-            # `-x264-params` rather than more `-preset` flags: the preset stays the caller's and
-            # these are the specific knobs §8c names, so a reader can see which of the two moved.
-            command += ["-x264-params", self._x264_params]
+        # `-x264-params` rather than more `-preset` flags: the preset stays the caller's and
+        # these are the specific knobs §6a names, so a reader can see which of the two moved.
+        # **Unconditional now** — there is one route, it always bounds the encoder, and the branch
+        # that made the bound optional had no caller that took it.
+        command += ["-x264-params", self.x264_params]
 
         if carry_audio:
             # `?` makes the mapping optional, so a source whose audio stream vanished between the
