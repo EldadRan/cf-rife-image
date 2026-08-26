@@ -99,7 +99,7 @@ def _to_rgb24(tensor):
     return np.ascontiguousarray(array).tobytes()
 
 
-def frames_from(capture, expect=None):
+def frames_from(capture, expect=None, clock=None):
     """Decode the source into cv2 frames, in order, until it is exhausted.
 
     `expect` is the `(height, width)` the writer was told, checked once on the first frame.
@@ -111,7 +111,14 @@ def frames_from(capture, expect=None):
     """
     checked = False
     while True:
-        ok, frame = capture.read()
+        # **`decode_s` is the read and nothing else** (`docs/instrumentation.md` §9a). The shape
+        # check below is ours and costs nothing; charging it to the decoder would be charging
+        # cv2 for our own assertion.
+        if clock is None:
+            ok, frame = capture.read()
+        else:
+            with clock.timing("decode_s"):
+                ok, frame = capture.read()
         if not ok or frame is None:
             return
         if not checked and expect is not None:
@@ -128,7 +135,7 @@ def frames_from(capture, expect=None):
 def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None, preset=None, threads=None,
-           sliced_threads=None, rc_lookahead=None):
+           sliced_threads=None, rc_lookahead=None, clock=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -152,7 +159,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         peak_reset = _reset_peak()
         stream, stats = variants.run(
             variant, interpolator,
-            _tensors(frames_from(capture, expect=(height, width))),
+            _tensors(frames_from(capture, expect=(height, width), clock=clock), clock=clock),
             # **The declared cadence, from the same object `n_in` was derived from.** These two
             # lines used to disagree: `source_frame_count` reads `source["fps"]` — the container's
             # `r_frame_rate` — while this read cv2's `CAP_PROP_FPS`, which is `avg_frame_rate`. A
@@ -160,7 +167,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # source the plan came out 18/455/2 where the contract's arithmetic says 16/458/1, and
             # the response reported the rate the plan had not used.
             n_in=n_in, src_fps=source["fps"], dst_fps=target_fps,
-            tol=snap_tolerance or 0.0)
+            tol=snap_tolerance or 0.0, clock=clock)
 
         # **Frame-level, because decode, RIFE and encode are ONE streaming loop** (contract §1).
         # There are no phases to report the completion of — the writer pulls each frame through
@@ -222,7 +229,18 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         try:
             with writer_cm as writer:
                 for frame in stream:
-                    writer.write(_to_rgb24(frame))
+                    # **`convert_s` and `write_wait_s` split what used to be one expression**
+                    # (§9a). `write_wait_s` is the producer BLOCKED in `write` — the encoder's
+                    # share seen from the only side that can measure it without instrumenting
+                    # ffmpeg, because `write` returns when the pipe accepts the frame
+                    # (`encoder.py:270`).
+                    if clock is None:
+                        writer.write(_to_rgb24(frame))
+                    else:
+                        with clock.timing("convert_s"):
+                            payload = _to_rgb24(frame)
+                        with clock.timing("write_wait_s"):
+                            writer.write(payload)
                     # **Every frame, and the rate limiter decides what is SENT.** progress._emit
                     # drops anything inside MIN_INTERVAL_S, so calling per frame costs a
                     # comparison and publishes at the module's own cadence rather than at one this
@@ -386,9 +404,20 @@ def _read_peak(was_reset):
         return None
 
 
-def _tensors(frames):
-    """cv2 frames to tensors, lazily, one at a time — never a list, whatever the clip length."""
+def _tensors(frames, clock=None):
+    """cv2 frames to tensors, lazily, one at a time — never a list, whatever the clip length.
+
+    **Both halves of `convert_s` are here and in `_to_rgb24`** (§9a): BGR uint8 to RGB float on
+    the way in, and the reverse on the way out. One field rather than two because they are one
+    activity — the single-threaded float work between the decoder and the model — and §9's whole
+    complaint is fields whose boundary is fictional.
+    """
     import torch  # noqa: PLC0415 — the interpolator has already imported it by the time we run
 
     for frame in frames:
-        yield _to_tensor(frame, torch)
+        if clock is None:
+            yield _to_tensor(frame, torch)
+        else:
+            with clock.timing("convert_s"):
+                tensor = _to_tensor(frame, torch)
+            yield tensor

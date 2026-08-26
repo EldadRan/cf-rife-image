@@ -71,7 +71,7 @@ def _select_nearest(frames, n_in, src_fps, dst_fps):
         yield held[index]
 
 
-def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
+def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0, clock=None):
     """Return `(frames_out, stats)` for one variant. `stats` carries how the work was spent.
 
     `stats` is the shape `RetimeResult.stats` has, plus `variant` and — on the cascades — the
@@ -82,7 +82,7 @@ def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
         raise ValueError("unknown variant {!r}; §8b lists {}".format(variant, list(VARIANTS)))
 
     if variant == "direct":
-        result = interpolator.stream(frames, n_in, src_fps, dst_fps, tol=tol)
+        result = interpolator.stream(frames, n_in, src_fps, dst_fps, tol=tol, clock=clock)
         return result.frames, dict(result.stats, variant="direct", stages=("direct",),
                                    synth_total=result.stats["n_synth"])
 
@@ -116,7 +116,7 @@ def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
     # ratio 0.5: every even output is a copy and every odd one lands at exactly t=0.5, which is
     # where RIFE is strongest. The stats come back before the generator is touched, so the next
     # stage's `n_in` is known without consuming anything.
-    first = interpolator.stream(frames, n_in, src_fps, src_fps * 2, tol=0.0)
+    first = interpolator.stream(frames, n_in, src_fps, src_fps * 2, tol=0.0, clock=clock)
 
     if variant == "cas":
         # One arbitrary-timestep pass from the 48 fps stream to each 60 fps instant. Every
@@ -124,7 +124,7 @@ def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
         # across a 48 fps interval — half `direct`'s temporal distance, so the same fractional
         # error is half the displacement.
         second = interpolator.stream(first.frames, first.stats["n_out"], src_fps * 2, dst_fps,
-                                     tol=tol)
+                                     tol=tol, clock=clock)
         stats = dict(second.stats, variant="cas", stages=("midpoint", "arbitrary"),
                      stage_synth=(first.stats["n_synth"], second.stats["n_synth"]),
                      synth_total=first.stats["n_synth"] + second.stats["n_synth"])
@@ -138,7 +138,7 @@ def run(variant, interpolator, frames, n_in, src_fps, dst_fps, tol=0.0):
     # It costs more than `cas` for fewer exact frames, so if it does not visibly win it is
     # strictly worse — and that is a result.
     second = interpolator.stream(first.frames, first.stats["n_out"], src_fps * 2, src_fps * 4,
-                                 tol=0.0)
+                                 tol=0.0, clock=clock)
     stream = _select_nearest(second.frames, second.stats["n_out"], src_fps * 4, dst_fps)
     n_out = target_count(n_in, src_fps, dst_fps)
     synth = first.stats["n_synth"] + second.stats["n_synth"]

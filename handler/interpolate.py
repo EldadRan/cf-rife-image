@@ -309,7 +309,32 @@ class Interpolator:
         b, _ = self._pad(self._cast(frame_b))
         cache["index"], cache["padded"], cache["geometry"] = index, (a, b), geometry
 
-    def _synthesise(self, cache, timestep):
+    def _synthesise(self, cache, timestep, clock=None):
+        """One synthesis. **Timed to an explicit synchronisation, never to the enqueue**
+        (`docs/instrumentation.md` §9b).
+
+        Torch is asynchronous: a clock stopped at the `return` below measures how long it took to
+        HAND the work to the GPU, and the real cost then lands at the caller's first
+        synchronisation — `.to("cpu")` inside `routec._to_rgb24`, one line later. Instrumented
+        that way `model_s` reads near zero and `convert_s` absorbs the model, **which is worse
+        than no number because it looks like an answer.**
+
+        `stages.synchronise` carries the ruling and the reason it costs nothing here: this path
+        already synchronises once per synthesis at that copy, so the wait is moved rather than
+        added and the sum of the two fields is what it was before either was measured.
+        """
+        if clock is None:
+            return self._synthesise_now(cache, timestep)
+        with clock.timing("model_s"):
+            out = self._synthesise_now(cache, timestep)
+            # **Inside the timed block, which is the whole point.** The crop and the clone below
+            # are also enqueued work; synchronising here charges the model pass with everything
+            # it actually asked the device to do, and leaves `convert_s` the copy off it.
+            import stages  # noqa: PLC0415 — stdlib-plus-torch, imported like every torch touch
+            stages.synchronise(out)
+        return out
+
+    def _synthesise_now(self, cache, timestep):
         torch = self._torch()
         a, b = cache["padded"]
         with torch.inference_mode():
@@ -320,7 +345,7 @@ class Interpolator:
         # fail on some frames and not others, which is the worst shape a bug can have.
         return self._crop(out, cache["geometry"]).clone()
 
-    def stream(self, frames, n_in, src_fps, dst_fps, tol=0.0):
+    def stream(self, frames, n_in, src_fps, dst_fps, tol=0.0, clock=None):
         """Return a `RetimeResult` — `.frames` is the generator, `.stats` is the plan's stats.
 
         **The stats travel WITH the result and nothing is published on this object** (contract
@@ -349,10 +374,17 @@ class Interpolator:
         buffered beyond the pair in hand.
         """
         plan, stats = build_plan(n_in, src_fps, dst_fps, tol=tol)
-        return RetimeResult(self._emit(plan, frames, n_in), stats)
+        return RetimeResult(self._emit(plan, frames, n_in, clock), stats)
 
-    def _emit(self, plan, frames, n_in):
-        """The generator half of `stream`. Its state is per-call and none of it lives on self."""
+    def _emit(self, plan, frames, n_in, clock=None):
+        """The generator half of `stream`. Its state is per-call and none of it lives on self.
+
+        **`clock` is a PARAMETER and that is contract §4b rather than a style choice**
+        (`docs/instrumentation.md` §9). An accumulator on `self` would be shared by the two
+        `stream()` calls a cascade variant makes — a per-call result on an object that outlives
+        the call, which is the exact defect §4b was written about after finding it on this class.
+        `None` is a supported state: nothing is measured and nothing changes.
+        """
         pair = {}
         source = iter(frames)
 
@@ -381,7 +413,7 @@ class Interpolator:
                 _, i, timestep = entry
                 advance_to(i + 1)
                 self._load_pair(pair, i, held[i], held[i + 1])
-                yield self._synthesise(pair, timestep)
+                yield self._synthesise(pair, timestep, clock)
             else:
                 _, i = entry
                 advance_to(i)

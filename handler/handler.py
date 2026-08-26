@@ -38,6 +38,7 @@ import phasewatch
 import probe
 import progress as progress_module
 import runrecord
+import stages
 import storage
 import validation
 from errors import Remedy, WorkerError
@@ -367,8 +368,22 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
                         "reports no vram_total_gb, so nothing was checked")
 
     progress.phase("load", pct=3, force=True, note="interpolator")
-    interpolator = interpolate_module.Interpolator(
-        rife.Rife.load(scale=scale), scale=scale).prepare()
+    # **`load_s` is the one §9a stage that happens outside `routec`** — the checkpoint read and
+    # the cast, which `progress.begin_phase` deliberately excludes from the per-frame rate and
+    # which nothing has ever measured on its own. The clock is created here rather than in
+    # `retime` so it spans the load as well as the loop, and it is a local handed down as an
+    # argument: contract §4b, and `docs/instrumentation.md` §9 says why an attribute would have
+    # been wrong on this particular object.
+    clock = stages.StageClock()
+    # **Into `trace` the moment it exists, not when the retime returns.** `trace` is the dict a
+    # crashed run's numbers survive in, and banking the clock after `routec.retime` would lose
+    # every stage on exactly the runs the split was built for — the thrashing arm, the reap, the
+    # OOM. It is the live object, so whatever accumulated by the `finally` is what gets totalled.
+    if trace is not None:
+        trace["clock"] = clock
+    with clock.timing("load_s"):
+        interpolator = interpolate_module.Interpolator(
+            rife.Rife.load(scale=scale), scale=scale).prepare()
 
     master = keys.master_name(False, source["width"], source["height"],
                               name=request["output"].get("name"))
@@ -392,7 +407,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
         # 239-second job — `progress_emitted: 2`, the worker counting its own silence.
         progress=progress,
         audio_source=source_path if request["keep_audio"] else None,
-        variant=request.get("force_variant") or "direct", scale=scale)
+        variant=request.get("force_variant") or "direct", scale=scale, clock=clock)
 
     client = storage.client_for(request["output"])
     # **The upload's own clock and byte count, same rule as the fetch** (§8a). The size is read
@@ -499,7 +514,14 @@ def _timings(trace, started):
     wall = round(time.time() - started, 1)
     fetch_s = round(float(measured.get("fetch_s") or 0.0), 1)
     upload_s = round(float(measured.get("upload_s") or 0.0), 1)
-    return {
+    # **The five stages, and the residual computed against the `compute_s` on the line below**
+    # (§9a). Merged here rather than in `_retime` because that is where `compute_s` first exists:
+    # the residual is `compute_s` less the five, and a stage total banked before the wall was
+    # stamped could not have known it.
+    clock = (trace or {}).get("clock")
+    compute_s = round(wall - fetch_s - upload_s, 1)
+    stage_totals = clock.totals(compute_s=compute_s) if clock is not None else {}
+    return dict(stage_totals, **{
         "wall_s": wall,
         # The worker's own clock, which is the only one that is not somebody else's view
         # of this job — and the figure F-2026-08-19-35 showed a client cannot be trusted
@@ -508,8 +530,8 @@ def _timings(trace, started):
             started, datetime.timezone.utc).isoformat(),
         "fetch_s": fetch_s,
         "upload_s": upload_s,
-        "compute_s": round(wall - fetch_s - upload_s, 1),
-    }
+        "compute_s": compute_s,
+    })
 
 
 def _transfer(trace):
