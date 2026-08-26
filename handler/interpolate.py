@@ -332,9 +332,11 @@ class Interpolator:
         b, _ = self._pad(self._cast(frame_b))
         cache["index"], cache["padded"], cache["geometry"] = index, (a, b), geometry
         if synchronise:
-            # **The pad is ENQUEUED work and nothing below it waits** — see the docstring. `b`
-            # rather than `a` for no reason beyond it being the later of the two; the call is
-            # device-wide and waits on both.
+            # **The pad is ENQUEUED work and nothing in THIS method waits on it** — the caller
+            # does, at `_synthesise`'s own sync, which is where the pad's execution has been
+            # landing all along. This call moves that wall into `convert_dev_s` rather than
+            # adding it; `stages.synchronise` carries the arithmetic. `b` rather than `a` for no
+            # reason beyond it being the later of the two; the call is device-wide.
             stages.synchronise(b)
 
     def _synthesise(self, cache, timestep, clock=None):
@@ -456,15 +458,20 @@ class Interpolator:
                 # **§10b's synchronisation is INSIDE `_load_pair`, below that return, and is
                 # asked for here rather than assumed** — this is §9b's trap one stage over: the
                 # method ends at an enqueued pad with nothing after it that waits, so an
-                # unsynchronised clock would time the ENQUEUE and the pad's real cost would drain
-                # into `model_s` at `_synthesise`'s own sync. It was invisible while one
-                # `convert_s` bucket also held `_to_rgb24`'s `.to("cpu")`: the bucket total was
-                # honest even though its interior was not. **Unlike `_synthesise`'s sync this one
-                # is genuinely NEW and may raise `compute_s` rather than merely move a wait** —
-                # `stages.synchronise` carries that difference and §10e checks it against the
-                # corpus. **The cache is what bounds its price, which is why it sits below the
-                # cache and not beside it**; that placement was the review finding on the first
-                # cut of this section and `_load_pair`'s docstring carries the measurement.
+                # unsynchronised clock would time the ENQUEUE and the pad's real cost would stay
+                # in `model_s`, where `_synthesise`'s own sync has been collecting it all along.
+                # It was invisible while one `convert_s` bucket also held `_to_rgb24`'s
+                # `.to("cpu")`: the bucket total was honest even though its interior was not.
+                #
+                # **The wait is MOVED and not added** — the model consumes the very tensor this
+                # pads, so `_synthesise` was already waiting on it; what is new is the call. The
+                # one added term is the overlap lost between the pad executing and the enqueue of
+                # the model call, 191 times on a 480-frame job. `stages.synchronise` carries the
+                # arithmetic and §10e checks the separable half as a within-run sum-share.
+                #
+                # **The cache is what bounds its price, which is why it sits below the cache and
+                # not beside it**; that placement was the review finding on the first cut of this
+                # section and `_load_pair`'s docstring carries the measurement.
                 if clock is None:
                     self._load_pair(pair, i, held[i], held[i + 1])
                 else:

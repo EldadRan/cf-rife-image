@@ -141,24 +141,39 @@ def synchronise(tensor=None):
     swallows the model. §9b names that and forbids it.
 
     **Ruled: end the model clock at an explicit synchronisation.** §10b then ruled the same for
-    `_load_pair`'s clock, which ends at an enqueued pad. **THE TWO CALLERS HAVE DIFFERENT
-    ARITHMETIC AND THIS DOCSTRING IS THE ONLY PLACE THAT SAYS SO:**
+    `_load_pair`'s clock, which ends at an enqueued pad. **BOTH CALLERS MOVE A WAIT RATHER THAN
+    ADDING ONE, AND FOR THE SAME REASON: what this call waits on is already a dependency of
+    something the path synchronises on a moment later.**
 
-    - **`_synthesise` (§9b) — the sync is FREE.** Every synthesised frame goes through
-      `.to("cpu")` one line later in `_to_rgb24`, so this call does not ADD a wait, it moves one
-      that was going to happen microseconds afterwards. **The instrument does not move the total
-      it is splitting**, which is the property that makes that split worth trusting.
-    - **`_load_pair` (§10b) — the sync is genuinely NEW.** That path had none: the pad was
-      enqueued and nothing after it waited, so the pad's real cost used to drain into whichever
-      field synchronised next. **So this one MAY raise `compute_s` rather than merely moving a
-      wait**, and §10e makes that comparison against the corpus part of the close condition. The
-      price is bounded by `_load_pair`'s cache — roughly one call per PAIR, ~192 on a 480-frame
-      job rather than 480 — and the work waited on is a pad the model was about to consume
-      anyway. The alternative, leaving it async and saying so in the field name, is rejected by
-      §10b: a field that must be read with a footnote is the one that gets quoted without one.
+    - **`_synthesise` (§9b).** Every synthesised frame goes through `.to("cpu")` one line later
+      in `_to_rgb24`, so the wait was going to happen microseconds afterwards either way.
+    - **`_load_pair` (§10b).** The model consumes the very tensor this pads, so
+      `_synthesise`'s own `synchronise(out)` was ALREADY waiting on that pad — **the pad's
+      execution has been landing in `model_s` all along, and now lands in `convert_dev_s`.**
+      **What is new is the CALL, not the wait.**
 
-    A sync inserted into a pipeline that was genuinely overlapping would have bought a number by
-    changing the thing measured; §10e is where that is checked rather than assumed.
+    **The instrument does not move the total it is splitting**, which is the property that makes
+    both splits worth trusting.
+
+    **The one genuinely added term, and it is at `_load_pair` only:** the overlap lost between the
+    pad executing and the CPU enqueuing the model call — an enqueue window, **191 times on a
+    480-frame job** (191 pairs from 192 source frames), nothing between the two on this strictly
+    serial path but a `yield`. **Bounded by argument and not by measurement**, which §10b says out
+    loud rather than hiding: `F-2026-08-25-10` measures identical work varying 18.8-49% on one
+    worker, so a term that size cannot be resolved against a corpus at all and a close condition
+    asking for that comparison would have graded whichever host answered.
+
+    **§10e checks the separable half instead, and reads it INSIDE one run so host variance cannot
+    drive it:** the move shows up as `model_s` falling by roughly what `convert_dev_s` gains, so
+    the sum-share `(model_s + convert_dev_s) / compute_s` is compared against `sha-c8a2f63`'s
+    `model_s / compute_s`. **If that sum-share moves materially, the sync did something other
+    than move a wait.**
+
+    **`_load_pair`'s price is bounded by its cache** — one call per PAIR, not per frame — and
+    the first cut of §10b's code got that wrong by putting the call outside the cache rather
+    than under it (`F-2026-08-26-2`). The alternative, leaving it async and saying so in the field
+    name, is rejected by §10b: a field that must be read with a footnote is the one that gets
+    quoted without one.
 
     **Device-wide, not stream-scoped, and the DEVICE IS TAKEN FROM THE TENSOR.** `tensor` selects
     both whether to synchronise and which device to wait on; `torch.cuda.synchronize(device)` then
