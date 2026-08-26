@@ -269,9 +269,19 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # than it holds would otherwise deliver a silently truncated retime.
         # `grab()` rather than `read()`: this counts, it does not look. Decoding the remainder
         # of a long file to produce a number we immediately refuse on is work nobody asked for.
+        # **Charged to `decode_s`, because it is the decoder doing work** (§9a). It is `grab()`
+        # rather than `read()` deliberately — this counts, it does not look — but a sweep over
+        # whatever the source holds beyond the plan is decoder time that scales with the file,
+        # and leaving it in the residual made the residual grow with clip length while it was
+        # documented as fixed cost.
         surplus = 0
-        while capture.grab():
-            surplus += 1
+        if clock is None:
+            while capture.grab():
+                surplus += 1
+        else:
+            with clock.timing("decode_s"):
+                while capture.grab():
+                    surplus += 1
         # **Two frames of slack, not zero, and the docstring above says why it is needed.** A
         # count derived from a duration stored to the millisecond drifts by a frame over a long
         # clip, and an edit-list trim is exactly the case where a container's numbers and a

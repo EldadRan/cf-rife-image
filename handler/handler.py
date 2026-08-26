@@ -205,6 +205,16 @@ def handle(job_input, job=None):
     # run whose load history is worth the most.
     load_strip = phasewatch.LoadStrip(started)
     progress = progress_module.Progress(job=job, sampler=load_strip.sample)
+    # **Created HERE and not in `_retime`, so every run that files a record carries §9a's six
+    # fields.** It was created beside the model load — after the fetch, the probe and the fit
+    # predicate's refusal — so a job refused for not fitting, or one that died in the fetch,
+    # filed `wall_s`/`fetch_s`/`upload_s`/`compute_s` and NONE of the stages. That is the
+    # distinction `routec`'s `peak_vram_gb` comment already argues against: an absent key and a
+    # measured zero must not read alike, and `_transfer` states the same rule as *"zero where
+    # nothing moved, never absent"*. A refused run really did spend zero seconds in the model,
+    # and its whole `compute_s` really is residual — both are facts, and both are now filed.
+    clock = stages.StageClock()
+    trace["clock"] = clock
     # **Per call, which is what makes the concurrency question go away.** `trace` is created here
     # and reaches nothing outside this invocation, so two jobs in one process cannot write each
     # other's host readings — the reason the module-level banner list was retired above.
@@ -248,7 +258,8 @@ def handle(job_input, job=None):
             # `_run` left with the upscale path and `validation` now refuses anything that
             # resolves to an upscale, so the else arm was both unreachable and a call to a name
             # that no longer exists — a latent NameError preserved in the shape of a step.
-            response = _retime(request, machine, warnings, workdir, progress, started, trace)
+            response = _retime(request, machine, warnings, workdir, progress, started, trace,
+                               clock)
             outcome["status"] = "refused" if response.get("cf_error") else "ok"
             outcome["error"] = response.get("cf_error")
             return response
@@ -281,7 +292,7 @@ def handle(job_input, job=None):
             shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _retime(request, machine, warnings, workdir, progress, started, trace=None):
+def _retime(request, machine, warnings, workdir, progress, started, trace=None, clock=None):
     """Route C end to end: fetch, decode, interpolate, encode, upload. **No model of ours.**
 
     **The only route.** It was written deliberately not as a second `_run` and not as a copy of
@@ -374,13 +385,12 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None):
     # `retime` so it spans the load as well as the loop, and it is a local handed down as an
     # argument: contract §4b, and `docs/instrumentation.md` §9 says why an attribute would have
     # been wrong on this particular object.
-    clock = stages.StageClock()
-    # **Into `trace` the moment it exists, not when the retime returns.** `trace` is the dict a
-    # crashed run's numbers survive in, and banking the clock after `routec.retime` would lose
+    # **Handed in by `handle`, which banked it in `trace` before anything could fail.** `trace`
+    # is the dict a crashed run's numbers survive in, and a clock created down here would lose
     # every stage on exactly the runs the split was built for — the thrashing arm, the reap, the
-    # OOM. It is the live object, so whatever accumulated by the `finally` is what gets totalled.
-    if trace is not None:
-        trace["clock"] = clock
+    # OOM, the refusal. `None` is still supported for a direct caller.
+    if clock is None:
+        clock = stages.StageClock()
     with clock.timing("load_s"):
         interpolator = interpolate_module.Interpolator(
             rife.Rife.load(scale=scale), scale=scale).prepare()
@@ -520,7 +530,12 @@ def _timings(trace, started):
     # stamped could not have known it.
     clock = (trace or {}).get("clock")
     compute_s = round(wall - fetch_s - upload_s, 1)
-    stage_totals = clock.totals(compute_s=compute_s) if clock is not None else {}
+    # **A fresh empty clock rather than an empty dict when there is none.** `handle` always banks
+    # one, so this is the path a direct caller or a future entry point takes — and it must file
+    # the six as zeros with the residual carrying the whole of `compute_s`, not omit them. An
+    # absent key and a measured zero reaching a ledger row identically is the confusion this
+    # project has now paid for three times.
+    stage_totals = (clock or stages.StageClock()).totals(compute_s=compute_s)
     return dict(stage_totals, **{
         "wall_s": wall,
         # The worker's own clock, which is the only one that is not somebody else's view

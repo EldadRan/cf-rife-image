@@ -20,6 +20,16 @@ is where they run.
 """
 from fractions import Fraction
 
+# **Module scope, and it is the fix for a real hazard rather than tidiness.** `stages` was
+# imported INSIDE `_synthesise`'s timed block, where it is the only statement in the whole
+# measurement path that can raise: `stages.synchronise` swallows everything, the import above it
+# did not. A tree where `interpolate` is importable and `stages` is not would have raised
+# `ImportError` AFTER the model output was computed and killed the job — and only on the
+# instrumented path, so `clock=None` would pass while the measured one died. Here it fails at
+# import time, loudly, before any job exists. `stages` is stdlib-only and imports nothing from
+# this package, so there is no cycle to create.
+import stages
+
 #: Repairs binary floating point, and **is not the snap tolerance**. `k * src/dst` lands a hair
 #: either side of a whole number; EPS decides that such a position IS the whole number. `tol`
 #: changes policy — which frames are worth synthesising — and the two must never be conflated.
@@ -330,7 +340,6 @@ class Interpolator:
             # **Inside the timed block, which is the whole point.** The crop and the clone below
             # are also enqueued work; synchronising here charges the model pass with everything
             # it actually asked the device to do, and leaves `convert_s` the copy off it.
-            import stages  # noqa: PLC0415 — stdlib-plus-torch, imported like every torch touch
             stages.synchronise(out)
         return out
 
@@ -412,7 +421,22 @@ class Interpolator:
             if entry[0] == "synth":
                 _, i, timestep = entry
                 advance_to(i + 1)
-                self._load_pair(pair, i, held[i], held[i + 1])
+                # **`_load_pair` is the DEVICE-SIDE half of `convert_s` and was in no stage at
+                # all.** It casts the pair to the model's device and dtype and pads it — a
+                # host-to-device copy of roughly 200 MB per synthesis at 8K, from pageable
+                # memory, which blocks the caller. Charged to nothing, it grew the residual with
+                # frame count and resolution while `stages.RESIDUAL` described the residual as
+                # fixed costs. `convert_s` already owns the host-side half in `routec._to_tensor`
+                # and `_to_rgb24`; this is the same activity on the other side of the bus.
+                #
+                # **Cached, so it costs nothing on a repeated pair** — `_load_pair` returns
+                # immediately when the index is unchanged, and a timer around a no-op measures a
+                # no-op.
+                if clock is None:
+                    self._load_pair(pair, i, held[i], held[i + 1])
+                else:
+                    with clock.timing("convert_s"):
+                        self._load_pair(pair, i, held[i], held[i + 1])
                 yield self._synthesise(pair, timestep, clock)
             else:
                 _, i = entry
