@@ -229,15 +229,23 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         try:
             with writer_cm as writer:
                 for frame in stream:
-                    # **`convert_s` and `write_wait_s` split what used to be one expression**
-                    # (§9a). `write_wait_s` is the producer BLOCKED in `write` — the encoder's
-                    # share seen from the only side that can measure it without instrumenting
-                    # ffmpeg, because `write` returns when the pipe accepts the frame
-                    # (`encoder.py:270`).
+                    # **`convert_out_s` and `write_wait_s` split what used to be one
+                    # expression** (§9a). `write_wait_s` is the producer BLOCKED in `write` — the
+                    # encoder's share seen from the only side that can measure it without
+                    # instrumenting ffmpeg, because `write` returns when the pipe accepts the
+                    # frame (`encoder.py:270`).
+                    #
+                    # **`convert_out_s` is §10's whole subject.** It was `convert_s` until §10a
+                    # split that name three ways, and it is the OUTBOUND step: the device-to-host
+                    # copy as float32 inside `_to_rgb24`, then the single-threaded host
+                    # arithmetic after it. `docs/conversion-wave.md` is sized entirely against
+                    # this field's share and that share has never been measured — the 61-74% was
+                    # attributed here in a draft and the attribution was assumption. This is the
+                    # number that arms that wave or retires it.
                     if clock is None:
                         writer.write(_to_rgb24(frame))
                     else:
-                        with clock.timing("convert_s"):
+                        with clock.timing("convert_out_s"):
                             payload = _to_rgb24(frame)
                         with clock.timing("write_wait_s"):
                             writer.write(payload)
@@ -417,10 +425,12 @@ def _read_peak(was_reset):
 def _tensors(frames, clock=None):
     """cv2 frames to tensors, lazily, one at a time — never a list, whatever the clip length.
 
-    **Both halves of `convert_s` are here and in `_to_rgb24`** (§9a): BGR uint8 to RGB float on
-    the way in, and the reverse on the way out. One field rather than two because they are one
-    activity — the single-threaded float work between the decoder and the model — and §9's whole
-    complaint is fields whose boundary is fictional.
+    **This is `convert_in_s`, the INBOUND step** (§10a): the strided gather over the decoder's
+    negative-stride BGR view, on the host. §9a had it and `_to_rgb24` sharing one `convert_s` on
+    the grounds that they were one activity; **§10a overruled that**, because the two sit on
+    opposite sides of the model and only one of them is what
+    `docs/conversion-wave.md` proposes to change. One field covering both is the defect §9
+    complains about — a boundary nobody can read — wearing the opposite sign.
     """
     import torch  # noqa: PLC0415 — the interpolator has already imported it by the time we run
 
@@ -428,6 +438,6 @@ def _tensors(frames, clock=None):
         if clock is None:
             yield _to_tensor(frame, torch)
         else:
-            with clock.timing("convert_s"):
+            with clock.timing("convert_in_s"):
                 tensor = _to_tensor(frame, torch)
             yield tensor

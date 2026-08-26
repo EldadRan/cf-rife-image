@@ -326,7 +326,7 @@ class Interpolator:
         Torch is asynchronous: a clock stopped at the `return` below measures how long it took to
         HAND the work to the GPU, and the real cost then lands at the caller's first
         synchronisation — `.to("cpu")` inside `routec._to_rgb24`, one line later. Instrumented
-        that way `model_s` reads near zero and `convert_s` absorbs the model, **which is worse
+        that way `model_s` reads near zero and `convert_out_s` absorbs the model, **which is worse
         than no number because it looks like an answer.**
 
         `stages.synchronise` carries the ruling and the reason it costs nothing here: this path
@@ -339,7 +339,7 @@ class Interpolator:
             out = self._synthesise_now(cache, timestep)
             # **Inside the timed block, which is the whole point.** The crop and the clone below
             # are also enqueued work; synchronising here charges the model pass with everything
-            # it actually asked the device to do, and leaves `convert_s` the copy off it.
+            # it actually asked the device to do, and leaves `convert_out_s` the copy off it.
             stages.synchronise(out)
         return out
 
@@ -421,13 +421,15 @@ class Interpolator:
             if entry[0] == "synth":
                 _, i, timestep = entry
                 advance_to(i + 1)
-                # **`_load_pair` is the DEVICE-SIDE half of `convert_s` and was in no stage at
-                # all.** It casts the pair to the model's device and dtype and pads it — a
-                # host-to-device copy of roughly 200 MB per synthesis at 8K, from pageable
-                # memory, which blocks the caller. Charged to nothing, it grew the residual with
-                # frame count and resolution while `stages.RESIDUAL` described the residual as
-                # fixed costs. `convert_s` already owns the host-side half in `routec._to_tensor`
-                # and `_to_rgb24`; this is the same activity on the other side of the bus.
+                # **`_load_pair` is the DEVICE-SIDE conversion, `convert_dev_s`** (§10a). It
+                # casts the pair to the model's device and dtype and pads it — a host-to-device
+                # copy of roughly 200 MB per synthesis at 8K, from pageable memory, which blocks
+                # the caller. Charged to nothing it grew the residual with frame count and
+                # resolution while `stages.RESIDUAL` described the residual as fixed costs. It
+                # shared `convert_s` with the two host-side steps until §10a split that name; it
+                # is its own field now because it is the same activity on the OTHER SIDE of the
+                # bus, and folding it in with `convert_in_s` would leave one field covering two
+                # sides — §10's own defect surviving inside the fix for it.
                 #
                 # **Cached, so it costs nothing on a repeated pair** — `_load_pair` returns
                 # immediately when the index is unchanged, and a timer around a no-op measures a
@@ -435,8 +437,25 @@ class Interpolator:
                 if clock is None:
                     self._load_pair(pair, i, held[i], held[i + 1])
                 else:
-                    with clock.timing("convert_s"):
+                    with clock.timing("convert_dev_s"):
                         self._load_pair(pair, i, held[i], held[i + 1])
+                        # **§10b, and it is §9b's trap one stage over.** `_load_pair` ends at a
+                        # PAD — enqueued device work with nothing after it that waits. Timed as
+                        # it stands this clock measures the ENQUEUE, and the pad's real cost
+                        # drains into whichever field synchronises next, which is `model_s` at
+                        # `_synthesise`'s own sync. That was invisible while one `convert_s`
+                        # bucket also held `_to_rgb24`'s `.to("cpu")`: the bucket total was
+                        # honest even though its interior was not. Split, it stops being honest.
+                        #
+                        # **Unlike `_synthesise`'s sync this one is genuinely NEW and may raise
+                        # `compute_s` rather than merely move a wait** — `stages.synchronise`
+                        # carries that difference and §10e checks it against the corpus. Charged
+                        # roughly once per PAIR because of the cache above, not once per frame.
+                        #
+                        # `.get` with a default rather than `pair["padded"]`: a measurement must
+                        # never be the thing that raises inside a delivered master, and this line
+                        # exists only to end a clock.
+                        stages.synchronise(pair.get("padded", (None, None))[0])
                 yield self._synthesise(pair, timestep, clock)
             else:
                 _, i = entry

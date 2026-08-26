@@ -205,9 +205,10 @@ def handle(job_input, job=None):
     # run whose load history is worth the most.
     load_strip = phasewatch.LoadStrip(started)
     progress = progress_module.Progress(job=job, sampler=load_strip.sample)
-    # **Created HERE and not in `_retime`, so every run that files a record carries §9a's six
-    # fields.** It was created beside the model load — after the fetch, the probe and the fit
-    # predicate's refusal — so a job refused for not fitting, or one that died in the fetch,
+    # **Created HERE and not in `_retime`, so every run that files a record carries every
+    # field in `stages.STAGES`.** It was created beside the model load — after the fetch, the
+    # probe and the fit predicate's refusal — so a job refused for not fitting, or one that
+    # died in the fetch,
     # filed `wall_s`/`fetch_s`/`upload_s`/`compute_s` and NONE of the stages. That is the
     # distinction `routec`'s `peak_vram_gb` comment already argues against: an absent key and a
     # measured zero must not read alike, and `_transfer` states the same rule as *"zero where
@@ -524,15 +525,16 @@ def _timings(trace, started):
     wall = round(time.time() - started, 1)
     fetch_s = round(float(measured.get("fetch_s") or 0.0), 1)
     upload_s = round(float(measured.get("upload_s") or 0.0), 1)
-    # **The five stages, and the residual computed against the `compute_s` on the line below**
-    # (§9a). Merged here rather than in `_retime` because that is where `compute_s` first exists:
-    # the residual is `compute_s` less the five, and a stage total banked before the wall was
-    # stamped could not have known it.
+    # **The stages, and the residual computed against the `compute_s` on the line below**
+    # (§9a, §10a). Merged here rather than in `_retime` because that is where `compute_s` first
+    # exists: the residual is `compute_s` less the stages, and a stage total banked before the
+    # wall was stamped could not have known it. **Counted nowhere here on purpose** —
+    # `stages.STAGES` is the one list, and §10a is the second time its length has changed.
     clock = (trace or {}).get("clock")
     compute_s = round(wall - fetch_s - upload_s, 1)
     # **A fresh empty clock rather than an empty dict when there is none.** `handle` always banks
     # one, so this is the path a direct caller or a future entry point takes — and it must file
-    # the six as zeros with the residual carrying the whole of `compute_s`, not omit them. An
+    # them all as zeros with the residual carrying the whole of `compute_s`, not omit them. An
     # absent key and a measured zero reaching a ledger row identically is the confusion this
     # project has now paid for three times.
     stage_totals = (clock or stages.StageClock()).totals(compute_s=compute_s)
