@@ -248,6 +248,21 @@ class Interpolator:
     if it needs one device, and it is told here rather than left to discover it.
     """
 
+    @property
+    def device(self):
+        """Where the model lives. **Read-only, and it is configuration rather than state.**
+
+        `routec._tensors` needs it: §3b's inbound conversion uploads the decoder's `uint8` and
+        does the arithmetic on device, so the producer has to know which device before the
+        interpolator ever sees the tensor. **The alternative was reaching into `_device` from
+        another module**, which makes a private name load-bearing across a file boundary.
+
+        This does not breach §5d(a). The class publishes no PER-CALL state; `device` is a
+        constructor argument that cannot carry one stream's identity into another, which is the
+        same exemption the docstring already records for `_model`.
+        """
+        return self._device
+
     def __init__(self, model, device="cuda", dtype=None, scale=1):
         self._model = model
         self._device = device

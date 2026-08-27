@@ -20,8 +20,8 @@ against `torch.round`**, so a torch-CPU-against-torch-CUDA sweep would answer a 
 question with a billion samples of confidence. Filed as a builder claim, 2026-08-27.
 
     A   `routec._to_rgb24` itself                     numpy, host      the DEPLOYED chain
-    B   clamp/mul/round/to(uint8)                     torch, host      §3a's chain, CPU
-    C   the same                                      torch, device    §3a's chain, CUDA
+    B   `routec._to_rgb24_device`                     torch, host      the SHIPPED chain, CPU
+    C   the same                                      torch, device    the SHIPPED chain, CUDA
 
 **A vs C is the graded number** and is §5's question, which is whether the DELIVERED MASTER
 changes — a question that does not care which axis a difference came from. **B exists to name that
@@ -30,18 +30,18 @@ whether the library or the device owns it, and §2g-3 sends exactly that result 
 redesign — a decision that wants the cause and not just the count. Ruled by the gate, 2026-08-27,
 and §2g-2 amended with it.
 
-**ARM A IMPORTS THE DEPLOYED ARITHMETIC AND DOES NOT RESTATE IT** (§2g-2). The chunk is shaped
+**ALL THREE ARMS IMPORT, AND NONE RESTATES** (§2g-2). The chunk is shaped
 `1x3x1xW` and handed to `routec._to_rgb24` as a frame, so the transpose, the contiguity and the
 cast under test are the ones that ship; a later edit to that function changes this result instead
-of silently invalidating it. **Arms B and C cannot be anchored that way and this is said out loud
-rather than left to look stronger than it is:** §3a's chain does not exist in this tree, it exists
-as a snippet in a document, so B and C are written fresh here. The `retime_oracle` argument reaches
-arm A only.
+of silently invalidating it. **Arms B and C were written fresh when this was built** and said so —
+§3a's chain was a snippet in a document then. **The conversion wave landed it and §2g-2's
+obligation came due: they import `routec._to_rgb24_device` now.** The proof is about the code
+that ships.
 
-**UNSET, THIS MODULE IS NEVER IMPORTED.** `handler` reads the environment first and imports second,
-so a run nobody is asking about pays nothing — not a module read, not an allocation, not a line of
-cold start. `F-2026-08-26-3` is this project's standing lesson about an instrument that changed
-what it was measuring, and it was written about a wave the gate ordered a day before this one.
+**UNASKED, THIS MODULE IS NEVER IMPORTED.** `handler` reads the request field first and imports
+second, so a run nobody is asking about pays nothing — not a module read, not an allocation, not a
+line of cold start. `F-2026-08-26-3` is this project's standing lesson about an instrument that
+changed what it was measuring.
 """
 
 import os
@@ -55,10 +55,17 @@ import time
 DOMAIN_HI = 0x3F800000
 DOMAIN = DOMAIN_HI + 1
 
-#: **The env-var gate** (§2g-1), named for the convention this image already uses for
-#: `WORKER_VERSION`, `BUILD_COMMIT`, `MODEL_DIR` and `MULTIPART_THRESHOLD_BYTES`. Set on the
-#: template for one job and unset afterwards by the same mechanism that pins the image.
-ENV = "CF_RIFE_TIECHECK"
+#: **The chunk-size override, and it is ALL that is left in the environment** (§3b-0 item 4).
+#: `CF_RIFE_TIECHECK` used to ARM the sweep as well, and CF's rule retired that: **the flag was
+#: left set, taxed two jobs ~12.6 s each, and was invisible on the endpoint page** — found only
+#: because a record carried a block it should not have, and never traced to where it was set.
+#: **Arming is `params.tie_check` now**, refused by name when misspelled and echoed by the record
+#: that reports the result.
+#:
+#: This one survives as an environment variable because it is not arming: it is a
+#: deployment-scoped escape hatch for a card that ran out of memory, and a stale one costs a
+#: differently-chunked sweep rather than a sweep nobody asked for.
+ENV = "CF_RIFE_TIECHECK_CHUNK"
 
 #: Values per chunk. **A multiple of 3 because a chunk is shaped as an RGB frame** — arm A goes
 #: through `_to_rgb24`, which expects `1xCxHxW` — and sized so the host side stays small against
@@ -74,22 +81,18 @@ ENV = "CF_RIFE_TIECHECK"
 #: function. Device peak is ~650 MB. *This is the number an operator reasons from when picking an
 #: override after an OOM, which is the only reason it is worth counting to this precision.*
 #:
-#: **Overridable through the same env var** — `CF_RIFE_TIECHECK=8388608` — because the one thing
+#: **Overridable through `CF_RIFE_TIECHECK_CHUNK`** — because the one thing
 #: nobody can test from here is how this behaves on the card, and a sweep that dies on memory
 #: with no way to retry smaller would cost a whole job to learn one number.
 CHUNK_VALUES = 3 * 16_777_216
 
-#: **The floor under an overriding chunk size, and it exists because the variable has two jobs.**
-#: `CF_RIFE_TIECHECK=1` is what a person writes to mean *on*; read as a chunk size it is three
-#: values per pass and 355 million passes, which is a sweep that never returns and a job spent
-#: learning nothing. **A number below this floor is read as "on", not as an instruction** — the
-#: override is for a card that ran out of memory, and no such retry asks for a chunk this small.
+#: **The floor under an overriding chunk size**, kept from when one variable both armed the sweep
+#: and sized it: `CF_RIFE_TIECHECK=1` was what a person wrote to mean *on*, and read as a chunk
+#: size it was three values per pass and 355 million passes — a sweep that never returns and a
+#: job spent learning nothing. **Arming moved to the request and the ambiguity went with it**;
+#: the floor stays, because the override exists for a card that ran out of memory and no such
+#: retry asks for a chunk this small.
 MIN_CHUNK_VALUES = 3 * 65_536
-
-#: Spellings that mean OFF even though they are non-empty. **`CF_RIFE_TIECHECK=0` reading as ON
-#: is the failure this list exists to stop**: the variable is set on a template and unset by
-#: editing that template, and "set it to 0" is what a person reaches for first.
-OFF_VALUES = ("0", "false", "no", "off")
 
 #: §2g-2. Named here so the record, this module and the kit read one list.
 SENTINELS = ("nan", "pos_inf", "neg_inf", "negative", "above_one", "subnormal")
@@ -106,19 +109,9 @@ _SENTINEL_BITS = {
 }
 
 
-def requested():
-    """Is the sweep switched on?
-
-    **`handler` restates this predicate rather than calling it**, and `handler.TIECHECK_ENV` says
-    why: importing this module to ask whether to import this module is the cost §2g-1 forbids.
-    This copy is what a direct caller and the tests use, and the two must agree.
-    """
-    value = (os.environ.get(ENV) or "").strip()
-    return bool(value) and value.lower() not in OFF_VALUES
-
-
 def _chunk_size():
-    """Values per pass. **A number below `MIN_CHUNK_VALUES` means "on", not "use this".**"""
+    """Values per pass. **A number below `MIN_CHUNK_VALUES` is ignored, not honoured** — see
+    `MIN_CHUNK_VALUES`."""
     raw = (os.environ.get(ENV) or "").strip()
     try:
         asked = int(raw)
@@ -149,13 +142,25 @@ def _deployed(values, torch):
 
 
 def _proposed(values, torch):
-    """ARMS B and C — §3a's chain, on whichever device `values` already sits on.
+    """ARMS B and C — **`routec._to_rgb24_device` itself, imported, not restated.**
 
-    **Out-of-place, matching §3a's requirement rather than its convenience.** The in-place
-    refinement §2f holds back is not taken here either: this must be the chain the wave would
-    ship, and a sweep of a variant nobody is proposing is a sweep of nothing.
+    **§2g-2's OBLIGATION, DISCHARGED.** When this module was written the shipped chain did not
+    exist: §3a held it as a snippet in a document, so arms B and C were necessarily written fresh
+    and this file said so rather than letting the sweep look more self-validating than it was.
+    **The conversion wave landed it. So the copy goes**, and the sweep now proves something about
+    the code that ships instead of about a faithful transcription of it — which is `retime_oracle`'s
+    argument and the same one arm A has rested on from the start.
+
+    Shaped `1x3x1xW` and un-permuted exactly as `_deployed` does, because the two arms must be
+    compared at aligned indices and `_to_rgb24_device` emits `HxWx3` bytes like its host twin.
     """
-    return values.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8)
+    import numpy as np  # noqa: PLC0415
+    import routec  # noqa: PLC0415 — imported HERE so an unset run never reaches it
+
+    width = values.numel() // 3
+    frame = values.reshape(1, 3, 1, width)
+    out = np.frombuffer(routec._to_rgb24_device(frame), dtype=np.uint8)
+    return out.reshape(1, width, 3).transpose(2, 0, 1).reshape(-1)
 
 
 def _alignment_ok(torch, device, log):
@@ -193,7 +198,7 @@ def _alignment_ok(torch, device, log):
     values = torch.tensor([(k + 0.25) / 255.0 for k in expected], dtype=torch.float32)
     for name, got in (("deployed", list(_deployed(values, torch))),
                       ("torch-cpu", [int(v) for v in _proposed(values, torch)]),
-                      ("torch-cuda", [int(v) for v in _proposed(values.to(device), torch).cpu()])):
+                      ("torch-cuda", [int(v) for v in _proposed(values.to(device), torch)])):
         if len(got) != len(expected):
             log("[tiecheck] ALIGNMENT CONTROL FAILED on the {} arm: it returned {} values where "
                 "{} were expected. The sweep is NOT run.".format(name, len(got), len(expected)))
@@ -224,13 +229,13 @@ def _sentinels(torch, device):
             # Three of them, because `_to_rgb24` needs a whole pixel to exist.
             host = torch.tensor([value] * 3, dtype=torch.float32)
             entry["cpu"] = int(_deployed(host, torch)[0])
-            entry["cuda"] = int(_proposed(host.to(device), torch)[0].item())
+            entry["cuda"] = int(_proposed(host.to(device), torch)[0])
             # **Arm B, and the sweep would be inconsistent without it.** `mismatches_library` and
             # `mismatches_device` exist so a disagreement names its axis; the sentinels are the
             # results MOST likely to disagree — `clamp` propagating NaN, and the NaN-to-`uint8`
             # cast — and they are most likely to differ by LIBRARY rather than by device. Naming
             # the axis everywhere except where it is most needed is not a saving.
-            entry["torch_cpu"] = int(_proposed(host, torch)[0].item())
+            entry["torch_cpu"] = int(_proposed(host, torch)[0])
             entry["agree"] = entry["cpu"] == entry["cuda"]
         except Exception as exc:  # noqa: BLE001 — a sentinel that explodes is a reportable result
             entry["error"] = "{}: {}".format(type(exc).__name__, str(exc)[:120])
@@ -290,8 +295,8 @@ def run(log=print):
             values = torch.from_numpy(bits.view(np.float32).copy())
 
             got_a = _deployed(values, torch)[:count]
-            got_b = _proposed(values, torch)[:count].numpy()
-            got_c = _proposed(values.to(device), torch)[:count].cpu().numpy()
+            got_b = _proposed(values, torch)[:count]
+            got_c = _proposed(values.to(device), torch)[:count]
             # **Lengths asserted rather than assumed, and the reason is what silence costs
             # here.** On numpy before 1.25 a `!=` between two 1-D arrays of different lengths
             # returns the SCALAR `False`; `flatnonzero(False)` is empty and `count_nonzero(False)`

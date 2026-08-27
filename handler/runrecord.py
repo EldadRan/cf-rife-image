@@ -127,7 +127,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
-          convert_check=None):
+          convert_check=None, input_check=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -207,6 +207,9 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     # grades the absence so "did not run" stays distinguishable from "ran and found nothing".
     if convert_check:
         body["convert_check"] = convert_check
+    # §3b-1, omitted rather than nulled for the reason `tie_check` and `convert_check` are.
+    if input_check:
+        body["input_check"] = input_check
     if progress is not None:
         body["seconds_per_frame"] = progress.seconds_per_frame()
     if error:

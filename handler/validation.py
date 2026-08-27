@@ -235,6 +235,18 @@ PARAMS_FIELDS = {
     # Refused by name when misspelled, like everything else in `params`, which is the property
     # that makes a per-job control safe to add here.
     "convert_check",
+    # **§3b-0 item 4: the tie check moved out of the environment.** `CF_RIFE_TIECHECK` armed it
+    # until 2026-08-27, and the failure §2g-1's exception was warned about happened: the flag was
+    # left set, taxed two jobs ~12.6 s each, was invisible on the endpoint page, and was never
+    # traced to where it had been set. **A per-job control belongs in the request**, where it is
+    # refused by name when misspelled and echoed by the record that reports the result.
+    "tie_check",
+    # **§3b-1's gate. Its own field, not folded into `convert_check`.** They sit at different
+    # boundaries and prove different things — one compares bytes at the last step before the
+    # file, the other compares the float32 tensor the MODEL IS FED — and a single flag arming
+    # both would make a failed run ambiguous about which comparison failed, which is the
+    # attribution problem §3b split the two waves to avoid in the first place.
+    "input_check",
 }
 
 #: **Nothing is unconditionally required, and that is the point.** `target_short_edge_px` is
@@ -690,6 +702,15 @@ def validate(job_input):
     convert_check = (False if convert_check is None
                      else _as_bool(convert_check, "convert_check"))
 
+    # **§2g's fp32 sweep, and it costs minutes of GPU time**, so it is opt-in per job exactly as
+    # `convert_check` is and for the same reason.
+    tie_check = params.get("tie_check")
+    tie_check = False if tie_check is None else _as_bool(tie_check, "tie_check")
+
+    # §3b-1. Doubles the inbound conversion for every SOURCE frame, so opt-in per job.
+    input_check = params.get("input_check")
+    input_check = False if input_check is None else _as_bool(input_check, "input_check")
+
     rc_lookahead = params.get("rc_lookahead")
     if rc_lookahead is None:
         rc_lookahead = encoder.DEFAULT_RC_LOOKAHEAD
@@ -744,6 +765,8 @@ def validate(job_input):
         "sliced_threads": sliced_threads,
         "rc_lookahead": rc_lookahead,
         "convert_check": convert_check,
+        "tie_check": tie_check,
+        "input_check": input_check,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,

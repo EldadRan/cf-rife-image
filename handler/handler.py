@@ -45,40 +45,15 @@ from errors import Remedy, WorkerError
 
 WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 
-#: `docs/conversion-wave.md` §2g-1's gate. **THE AUTHORITY FOR THIS NAME IS `tiecheck.ENV` AND
-#: THIS IS A DELIBERATE RESTATEMENT OF IT**, which the shared law permits only when a pointer
-#: genuinely will not do — so here is why it will not. **The whole content of §2g-1's third
-#: constraint is that an unset run never imports the sweep**, and importing `tiecheck` to ask it
-#: what its own env var is called is the import being avoided. A read of `os.environ` cannot be
-#: done through a module you are refusing to load.
+#: **§3b-0 item 4 retired `TIECHECK_ENV` and the predicate that read it.** The sweep is armed by
+#: `params.tie_check` now, so the question *"is it on"* is answered by `validation` like every
+#: other request field, and this module has nothing left to restate. **The env var that armed it
+#: was left set, taxed two jobs, and was invisible on the endpoint page** — the failure §2g-1
+#: granted its exception in spite of, which is why the exception did not carry.
 #:
-#: **The NAME is all that is restated.** What counts as switched on — `0`, `false`, `off` and the
-#: rest — lives in `tiecheck.requested()` alone, because a second copy of a list is a list that
-#: rots in one place, and this one decides whether a billion-comparison sweep runs.
-TIECHECK_ENV = "CF_RIFE_TIECHECK"
-
-
-def tiecheck_requested():
-    """Is §2g's sweep switched on? **Two tests, and the split is the whole design.**
-
-    The first is a `str.strip()` on an environment variable and it is what every ordinary job
-    pays: unset means unset, and nothing is imported. **Only a job that actually set the variable
-    reaches the second**, which imports `tiecheck` and asks it — so the off-spellings have one
-    home and a run that wrote `CF_RIFE_TIECHECK=0` pays one module import to be told no.
-
-    **That is not a hole in §2g-1's third constraint.** The constraint is that the instrument is
-    absent from *the runs nobody is asking about*, and a run that set the variable by hand is not
-    one of those. `F-2026-08-26-3` is about instruments that ride along uninvited.
-    """
-    if not (os.environ.get(TIECHECK_ENV) or "").strip():
-        return False
-    try:
-        import tiecheck  # noqa: PLC0415 — reached only when the variable is set to something
-    except Exception as exc:  # noqa: BLE001 — an errand must never cost a delivered master
-        print("[tiecheck] {} is set but the module would not import ({}: {}); "
-              "the job is unaffected.".format(TIECHECK_ENV, type(exc).__name__, str(exc)[:120]))
-        return False
-    return tiecheck.requested()
+#: `tiecheck.ENV` still exists and now names the CHUNK-SIZE override alone, which is
+#: deployment-scoped by nature: a stale one costs a differently-sized sweep, never a sweep nobody
+#: asked for.
 
 
 def build_identity():
@@ -427,7 +402,10 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # this job, while the retime is what keeps the job from being spent purely on an errand
     # (§2g-1). It runs after the fit predicate has refused or passed, so it never allocates on a
     # card the job was about to be turned away from.
-    if tiecheck_requested():
+    # **The request field is read BEFORE the module is imported**, which is §2g-1's third
+    # constraint and the only part of it that survived: a job nobody asked pays not one module
+    # read. `request.get` is a dict lookup; the sweep behind it is a billion comparisons.
+    if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — see above; the import IS the cost being avoided
 
         progress.phase("load", pct=2, force=True, note="tie check")
@@ -478,6 +456,12 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     checker = routec.ConvertCheck() if request.get("convert_check") else None
     if trace is not None and checker is not None:
         trace["convert_check_live"] = checker
+    # §3b-1's gate, hoisted for the same reason: a run reaped mid-encode still files what it
+    # compared. `_tensors` is consumed lazily inside the stream, so this object outlives the
+    # decode as well as the encode.
+    input_checker = routec.InputCheck() if request.get("input_check") else None
+    if trace is not None and input_checker is not None:
+        trace["input_check_live"] = input_checker
 
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
@@ -493,6 +477,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         threads=request.get("threads"),
         sliced_threads=request.get("sliced_threads"),
         convert_check=checker,
+        input_check=input_checker,
         rc_lookahead=request.get("rc_lookahead"),
         # **Passed at last.** `retime` has declared this parameter since it was written and
         # `_retime` never supplied it, so the retime path published two payloads for a
@@ -559,7 +544,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # block it is checked against reads as part of that measurement rather than as the check
         # on it.
         trace["retime"] = {k: v for k, v in stats.items()
-                           if k not in ("estimate", "convert_check")}
+                           if k not in ("estimate", "convert_check", "input_check")}
 
     return _decorate({
         "status": "DELIVERED",
@@ -577,7 +562,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # recording three of five costs. `routec` now reads all five off the writer that ran and
         # returns them, so both artefacts carry one set of numbers that cannot disagree.
         "retime": {k: v for k, v in stats.items()
-                   if k not in ("estimate", "convert_check")},
+                   if k not in ("estimate", "convert_check", "input_check")},
         # **`padded_megapixels` is the fit's independent variable and nothing computed it**
         # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
         # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
@@ -666,14 +651,19 @@ def _add(trace, block, field, value):
         pass
 
 
-def _convert_check_block(trace):
-    """§5-0's block off the live checker. **Never raises** — this runs inside the record's
-    `finally`, on exactly the crashed runs the object was hoisted out of `retime` to serve."""
+def _live_block(trace, key):
+    """A gate's block off its live object. **Never raises** — this runs inside the record's
+    `finally`, on exactly the crashed runs those objects were hoisted out of `retime` to serve."""
     try:
-        checker = (trace or {}).get("convert_check_live")
+        checker = (trace or {}).get(key)
         return checker.block() if checker is not None else None
     except Exception:  # noqa: BLE001 — a record must never cost a delivered master
         return None
+
+
+def _convert_check_block(trace):
+    """§5-0's block off the live checker."""
+    return _live_block(trace, "convert_check_live")
 
 
 def _note(trace, block, field, value):
@@ -722,6 +712,8 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # mid-encode still files what it had compared. Absent on every run that did not arm
             # the gate, for the same reason `tie_check` is: `--convert-check` REQUIRES the block.
             convert_check=_convert_check_block(trace),
+            # §3b-1, read off its own live object for the same reason.
+            input_check=_live_block(trace, "input_check_live"),
             # **A snapshot, not the live list.** The sampler stops when the job does and not
             # when the record is assembled, so handing `json.dumps` a list something may still be
             # appending to is handing it a list that can reallocate underneath the walk.

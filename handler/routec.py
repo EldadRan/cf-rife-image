@@ -82,6 +82,128 @@ def _to_tensor(frame_bgr, torch):
     return torch.from_numpy(array).unsqueeze(0)
 
 
+def _to_tensor_device(frame_bgr, torch, device):
+    """§3b — the SAME contract as `_to_tensor`, with the arithmetic on `device`.
+
+    **`convert_in_s` is 21.37% of `compute_s` at 4K and it is the stage the ENCODER IS STARVING.**
+    `docs/test-plan.md` §14 is why this is worth more than its own seconds: `--threads 16
+    --no-sliced-threads` made the encoder faster — `write_wait_s` 50.2 -> 14.5 — and the whole job
+    four times slower, because `convert_in_s` went 32.7 -> 575.5 s. Not the neighbours; `model_s`
+    moved 0.7%. Not core starvation; 150-350% of one core against 96 usable. **x264's frame
+    threads and a single-threaded strided gather are both spending memory bandwidth and taking it
+    from each other**, so removing this stage is what makes the encoder lever pullable at all.
+
+    **The upload carries ONE byte per channel instead of four**, which is the same saving the
+    outbound change makes in the other direction: `uint8` goes up, and the channel swap, the
+    transpose, the widen and the divide all happen on the card in one pass.
+
+    **OUT-OF-PLACE, AND HERE THE HAZARD IS SHARPER THAN OUTBOUND'S** (§3b-1). `torch.from_numpy`
+    SHARES MEMORY with the decoder's array — no copy — so an in-place op on a tensor built that
+    way writes into a frame the decoder still owns, **and each source frame is consumed by TWO
+    pairs.** Every operation below allocates: `[..., [2, 1, 0]]` is an advanced index (a gather,
+    always a copy), `.permute` is a view of that copy, `.float()` materialises it contiguous, and
+    `.div` is the out-of-place spelling. Nothing writes back.
+
+    **`np.ascontiguousarray` before `from_numpy` is not optional.** `from_numpy` refuses a
+    negative-stride array outright, and cv2 hands back exactly that shape once anything has sliced
+    it; the copy is on the `uint8`, which is a quarter the bytes the old path copied as float32.
+    """
+    up = torch.from_numpy(np.ascontiguousarray(frame_bgr)).to(device)
+    return up[..., [2, 1, 0]].permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+
+
+class InputCheck:
+    """§3b-1's in-run dual-path comparison, on the MODEL'S INPUT. **Never raises.**
+
+    **THIS IS NOT `ConvertCheck` ONE STAGE OVER AND THE DIFFERENCE IS THE WHOLE REASON IT
+    EXISTS.** §5-0's byte comparison sits at the last step before the file, so a difference there
+    has one candidate cause. **Inbound changes what the MODEL IS FED, and 382 of 480 frames are
+    syntheses** — one differing LSB propagates through a network nonlinearly, so a byte gate at
+    the output would see the difference smeared across frames with no way to attribute it. The
+    comparison has to sit at the boundary the change is at: **the float32 model-input tensor,
+    old host path against new device path, per SOURCE frame.**
+
+    **`frames` IS GRADED AGAINST `retime.n_in`, NOT `n_out`.** The inbound conversion runs once
+    per source frame; grading it against the delivered count would pass a comparison covering 40%
+    of the work at 24->60.
+
+    **EXACT EQUALITY, NO TOLERANCE, AND `max_abs_delta` IS A FLOAT.** Both paths are `uint8` to
+    `float32` — exact — then one divide by 255.0, a single correctly-rounded IEEE operation. They
+    should be bit-identical. **§2g's sweep does not cover this**: that swept `clamp/mul/round/
+    uint8` and this is a DIVIDE, and a neighbouring proof is not this proof. The delta is a float
+    because a difference here is not bounded to +/-1 the way a `uint8` rounding difference is.
+    """
+
+    LIMIT = 16
+
+    def __init__(self):
+        self.frames = 0
+        self.mismatches = 0
+        self.max_abs_delta = 0.0
+        self.max_abs_delta_at = None
+        self.first = []
+        #: Frames the device path wrote through to. **Graded == 0**, and the hazard is not
+        #: symmetry with §5-0a: the snapshot here protects the DECODER'S OWN ARRAY, which
+        #: `torch.from_numpy` aliases and which two pairs still read.
+        self.mutated_frames = 0
+        self.errors = 0
+
+    def snapshot(self, frame_bgr):
+        """A copy of the decoder's array, taken BEFORE the device path runs. **Never raises.**
+
+        A numpy copy rather than a tensor clone, because the thing at risk is the numpy buffer:
+        `torch.from_numpy` does not copy, so the aliasing runs the other way here than it does
+        outbound.
+        """
+        try:
+            return np.array(frame_bgr, copy=True)
+        except Exception:  # noqa: BLE001 — a gate must never displace a delivered master
+            return None
+
+    def compare(self, index, before, frame_bgr, new_tensor, torch):
+        """One source frame, both ways. **Swallows everything, reference arm included.**"""
+        try:
+            if before is None:
+                raise ValueError("no snapshot was taken for source frame {}".format(index))
+            old_tensor = _to_tensor(before, torch)
+            mutated = not np.array_equal(before, frame_bgr)
+            new_host = new_tensor.detach().to("cpu")
+            entry = peak_entry = None
+            worst = 0.0
+            if not torch.equal(old_tensor, new_host):
+                old = old_tensor.reshape(-1).numpy()
+                new = new_host.reshape(-1).numpy()
+                delta = np.abs(old - new)
+                at = int((old != new).argmax())
+                peak = int(delta.argmax())
+                worst = float(delta[peak])
+                entry = {"frame": int(index), "index": at,
+                         "old": float(old[at]), "new": float(new[at])}
+                peak_entry = {"frame": int(index), "index": peak,
+                              "old": float(old[peak]), "new": float(new[peak])}
+        except Exception:  # noqa: BLE001 — a gate must never displace a delivered master
+            self.errors += 1
+            return
+        self.frames += 1
+        if mutated:
+            self.mutated_frames += 1
+        if entry is not None:
+            self.mismatches += 1
+            if len(self.first) < self.LIMIT:
+                self.first.append(entry)
+            if worst > self.max_abs_delta:
+                self.max_abs_delta = worst
+                self.max_abs_delta_at = peak_entry
+
+    def block(self):
+        """§3b-1's five fields, plus the two `ConvertCheck` also carries."""
+        return {"frames": self.frames, "mismatches": self.mismatches,
+                "first": self.first, "max_abs_delta": self.max_abs_delta,
+                "max_abs_delta_at": self.max_abs_delta_at,
+                "mutated_frames": self.mutated_frames,
+                "errors": self.errors}
+
+
 class ConvertCheck:
     """§5-0's in-run dual-path comparison. **Never raises; a gate must not cost a master.**
 
@@ -350,7 +472,8 @@ def frames_from(capture, expect=None, clock=None):
 def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None, preset=None, threads=None,
-           sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False):
+           sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False,
+           input_check=False):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -372,9 +495,18 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # `w_scaling: FLAT`, which IS this reading. Reset before and read after, so the number is
         # this job's high-water mark rather than the process's history.
         peak_reset = _reset_peak()
+        # **Created before the stream, because `_tensors` is consumed lazily inside it.** Handed
+        # in like `ConvertCheck` and for the same §4b reason: a per-call result published on an
+        # object that outlives the call is read by somebody with no way to know it is stale.
+        input_checker = input_check if isinstance(input_check, InputCheck) else (
+            InputCheck() if input_check else None)
         stream, stats = variants.run(
             variant, interpolator,
-            _tensors(frames_from(capture, expect=(height, width), clock=clock), clock=clock),
+            _tensors(frames_from(capture, expect=(height, width), clock=clock), clock=clock,
+                     # **The interpolator's device, read off the interpolator.** §3b does the
+                     # inbound arithmetic where the model lives, so the producer has to know
+                     # that before the interpolator ever sees a tensor.
+                     device=interpolator.device, checker=input_checker),
             # **The declared cadence, from the same object `n_in` was derived from.** These two
             # lines used to disagree: `source_frame_count` reads `source["fps"]` — the container's
             # `r_frame_rate` — while this read cv2's `CAP_PROP_FPS`, which is `avg_frame_rate`. A
@@ -555,6 +687,13 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
         return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
+                    # **`docs/conversion-wave.md` §3b-0 item 2.** The record carried `n_out`,
+                    # `n_copy`, `n_hold` and `n_synth` and never the count they were all derived
+                    # FROM. **A field this obviously missing was invisible until something needed
+                    # to be graded against it**: the inbound conversion runs once per SOURCE
+                    # frame, so `n_out` is the wrong reference and grading the inbound gate
+                    # against it would pass a comparison covering 40% of the work at 24->60.
+                    n_in=n_in,
                     # **§5-0, and it travels beside `estimate` for the same reason** — `retime`
                     # is handed no `trace`. `handler._retime` lifts it to the record's TOP level
                     # rather than filing it under `retime`, because the kit grades
@@ -562,6 +701,9 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # thing it is checked against reads as part of the measurement rather than as
                     # the check on it. Null when nobody asked for the gate.
                     convert_check=(checker.block() if checker is not None else None),
+                    # §3b-1, and it travels the same way for the same reason.
+                    input_check=(input_checker.block()
+                                 if input_checker is not None else None),
                     # **The estimate rides out with the stats because this is its only channel**
                     # — `retime` is handed no `trace` and should not be. `handler._retime` lifts
                     # it into the record's `estimate` block and files the REST under `retime`, so
@@ -676,7 +818,7 @@ def _read_peak(was_reset):
         return None
 
 
-def _tensors(frames, clock=None):
+def _tensors(frames, clock=None, device=None, checker=None):
     """cv2 frames to tensors, lazily, one at a time — never a list, whatever the clip length.
 
     **This is `convert_in_s`, the INBOUND step** (§10a): the strided gather over the decoder's
@@ -688,10 +830,20 @@ def _tensors(frames, clock=None):
     """
     import torch  # noqa: PLC0415 — the interpolator has already imported it by the time we run
 
-    for frame in frames:
+    for index, frame in enumerate(frames):
+        # **Taken BEFORE the shipped conversion and outside its clock** — §5-0a's ordering rule,
+        # and the first fix for that rule got the ordering wrong one wave ago by cloning after
+        # the shipped arm had already run. What is protected here is the DECODER'S array, which
+        # `torch.from_numpy` aliases without copying.
+        before = checker.snapshot(frame) if checker is not None else None
         if clock is None:
-            yield _to_tensor(frame, torch)
+            tensor = _to_tensor_device(frame, torch, device)
         else:
             with clock.timing("convert_in_s"):
-                tensor = _to_tensor(frame, torch)
-            yield tensor
+                tensor = _to_tensor_device(frame, torch, device)
+        # **Outside the timed block**, because the reference arm is the instrument and not the
+        # shipped conversion; charging it to `convert_in_s` would corrupt the one number this
+        # wave is judged by. It lands in `stage_residual_s`, reported and not absorbed.
+        if checker is not None:
+            checker.compare(index, before, frame, tensor, torch)
+        yield tensor
