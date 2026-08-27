@@ -247,6 +247,9 @@ PARAMS_FIELDS = {
     # both would make a failed run ambiguous about which comparison failed, which is the
     # attribution problem §3b split the two waves to avoid in the first place.
     "input_check",
+    # **`docs/instrumentation.md` §11's decode decomposition.** Re-decodes the source three
+    # times beside the retime, so it is opt-in per job like every other probe in this surface.
+    "decode_probe",
 }
 
 #: **Nothing is unconditionally required, and that is the point.** `target_short_edge_px` is
@@ -711,6 +714,10 @@ def validate(job_input):
     input_check = params.get("input_check")
     input_check = False if input_check is None else _as_bool(input_check, "input_check")
 
+    # §11. Three extra decodes of the whole source; a run carrying it must not bank a number.
+    decode_probe = params.get("decode_probe")
+    decode_probe = False if decode_probe is None else _as_bool(decode_probe, "decode_probe")
+
     rc_lookahead = params.get("rc_lookahead")
     if rc_lookahead is None:
         rc_lookahead = encoder.DEFAULT_RC_LOOKAHEAD
@@ -767,6 +774,7 @@ def validate(job_input):
         "convert_check": convert_check,
         "tie_check": tie_check,
         "input_check": input_check,
+        "decode_probe": decode_probe,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,

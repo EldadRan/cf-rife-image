@@ -43,8 +43,37 @@ import interp_plan
 
 #: `peak_vram_gb = FIT_VRAM_SLOPE x padded_megapixels + FIT_VRAM_INTERCEPT` — contract §9a,
 #: certified: three resolutions, a 15x span, residuals under half a percent.
-FIT_VRAM_SLOPE_GB_PER_MP = 0.805
-FIT_VRAM_INTERCEPT_GB = 0.016
+#:
+#: **RE-CERTIFIED 2026-08-27 AFTER THE CONVERSION WAVES, AND THE OLD PAIR WAS WRONG IN THE
+#: PERMISSIVE DIRECTION.** `0.805 / 0.016` was fitted when the outbound conversion ran on the
+#: host; moving it onto the card allocates full-resolution float32 intermediates there that were
+#: nowhere near CUDA before, and once the frame is big enough they raise
+#: `torch.cuda.max_memory_allocated()`:
+#:
+#:      2.21184 MP    measured 1.86    old fit 1.80    under by 0.063
+#:      8.35584 MP    measured 6.95    old fit 6.74    under by 0.208
+#:     33.42336 MP    measured 27.72   old fit 26.92   under by 0.798   <- 8K
+#:
+#: **The estimator REFUSES JOBS against this line**, so under-predicting is the one direction
+#: that fails silently — and it under-predicted worst at the resolution with the least headroom.
+#: `docs/conversion-wave.md` §2f required this re-certification in advance rather than leaving it
+#: to be noticed.
+#:
+#: **FITTED ON THE WORST DEVICE-ERA READING AT EACH AREA, NOT THE MEAN, AND THAT IS DELIBERATE.**
+#: The increment is not deterministic — 4K device runs read 6.75, 6.75, 6.84, 6.94 and 6.95,
+#: because whether a transient raises the peak depends on what torch's caching allocator has
+#: already reserved. **A refusal predicate fitted to the mean would be wrong half the time, in
+#: the permissive direction.** Residuals against the worst-case fit are within 0.0003 GiB across
+#: the 15x span, over 28 readings in `records/`, 8 of them device-era.
+#: **The exact line rounded UP at the last digit, and four decimals were not enough.** The first
+#: cut of this re-certification shipped `0.8285 / 0.0271`, which under-predicts all three worst
+#: readings — 0.0016 GiB at 8K — so **the constants did not have the property the section above
+#: asserts for them**, in the one direction that fails silently. The geometry was never the
+#: problem: the exact line through the 1080p and 8K worst readings already passes through-or-above
+#: the 4K one. **Truncation was.** A predicate is exactly as pessimistic as its evidence and no
+#: more, which is why this is the exact line nudged rather than a rounder, safer-looking pair.
+FIT_VRAM_SLOPE_GB_PER_MP = 0.82855
+FIT_VRAM_INTERCEPT_GB = 0.02741
 
 #: What the predicate holds back from `vram_total_gb`. Allocator fragmentation, the CUDA context
 #: and cuDNN's workspaces are all real and none of them is in the fit.

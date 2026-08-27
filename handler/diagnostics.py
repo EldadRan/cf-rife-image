@@ -348,7 +348,7 @@ def _runpod_identity(job):
 #: omission — which is the distinction this project keeps paying for: an absent key and a
 #: measured `false` must not read alike to whoever reads the corpus next.
 _REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale", "convert_check",
-                   "tie_check", "input_check")
+                   "tie_check", "input_check", "decode_probe")
 
 #: Read out of `release_3["interpolate"]` rather than off the top level, because that is where
 #: the envelope puts them.

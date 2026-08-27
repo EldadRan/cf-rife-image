@@ -494,6 +494,24 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         audio_source=source_path if request["keep_audio"] else None,
         variant=request.get("force_variant") or "direct", scale=scale, clock=clock)
 
+    # **`docs/instrumentation.md` §11, and it runs AFTER the retime for one reason: `frames`.**
+    # §11c grades the block against `retime.n_in`, which is the DECODER'S count and does not
+    # exist until the decode has happened. Running the probe first would mean either recounting
+    # the source here — a second answer to "how long is this clip" — or filing a block whose
+    # frame count came from the container rather than from what was decoded.
+    #
+    # **Banked in `trace` rather than returned**, so a run that dies in the upload still files
+    # what the probe measured. The import is inside the branch: an unasked run pays not one
+    # module read, which is §2g-1's surviving constraint and this project's standing lesson about
+    # instruments that ride along uninvited.
+    if request.get("decode_probe"):
+        import decodeprobe  # noqa: PLC0415 — the import IS the cost being avoided
+
+        progress.phase("interpolate", pct=97, force=True, note="decode probe")
+        probe_block = decodeprobe.run(source_path, stats.get("n_in"))
+        if trace is not None:
+            trace["decode_probe"] = probe_block
+
     client = storage.client_for(request["output"])
     # **The upload's own clock and byte count, same rule as the fetch** (§8a). The size is read
     # before the PUT rather than after it: the object on the far side is what the byte count is
@@ -722,6 +740,8 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             convert_check=_convert_check_block(trace),
             # §3b-1, read off its own live object for the same reason.
             input_check=_live_block(trace, INPUT_CHECK_LIVE),
+            # §11a. Already a plain dict when it exists, so no live object to read through.
+            decode_probe=(trace or {}).get("decode_probe"),
             # **A snapshot, not the live list.** The sampler stops when the job does and not
             # when the record is assembled, so handing `json.dumps` a list something may still be
             # appending to is handing it a list that can reallocate underneath the walk.

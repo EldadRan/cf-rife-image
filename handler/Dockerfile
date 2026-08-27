@@ -167,6 +167,27 @@ ENV IMAGE_TAG=${IMAGE_REF} \
     BUILD_UTC=${BUILD_UTC} \
     WORKER_VERSION=${WORKER_VERSION}
 
+# **`decode_s` IS 106.8 s AT 8K — 18.70% of `compute_s`, larger than the entire conversion
+# pipeline two waves were spent deleting** (`docs/instrumentation.md` §11). And the pointer that
+# says this is worth trying: **the worker decodes at 0.556 s/frame where a laptop's
+# SINGLE-THREADED ffmpeg does the same file at 0.285** — so the capture backend is very likely
+# not threading at all.
+#
+# **This is the whole of item 2 and it is deliberately zero code.** OpenCV's FFmpeg backend reads
+# this variable and passes the options straight to libavcodec; `threads;8` asks for frame
+# threading. **Expect roughly 3x, not linear** — h264 frame threading is bounded by the
+# dependency structure of the stream, not by core count.
+#
+# **A DOCKERFILE `ENV` AND NOT A REQUEST FIELD, and that is consistent with CF's rule rather than
+# an exception to it.** The rule is that a per-JOB control belongs in the request; this is a
+# property of how the image is built and would be identical on every job. It also cannot be a
+# request field even in principle: OpenCV reads it once, when the capture backend initialises.
+#
+# **NOTHING HERE PROVES IT WORKED.** `params.decode_probe` (§11) is what says whether the
+# backend honoured it and what is left — and `decode_s` being unchanged after this lands is
+# itself the answer, not a null result.
+ENV OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;8"
+
 # ── this repo's code, last ──────────────────────────────────────────────────────────────────
 # **`*.py` is currently everything the handler needs, and that has not always been true.**
 # `calibration.json` was named here too — measured VRAM data the estimator planned from — and it

@@ -400,7 +400,7 @@ class ConvertCheck:
                 "errors": self.errors}
 
 
-def _to_rgb24_device(tensor):
+def _to_rgb24_device(tensor, staging=None):
     """§3a — the SAME contract as `_to_rgb24`, with the arithmetic on whichever device the tensor
     is already on. **This is the conversion wave.**
 
@@ -437,7 +437,88 @@ def _to_rgb24_device(tensor):
     frame = (tensor.detach()[0].float()
              .clamp(0.0, 1.0).mul(255.0).round().to(_uint8())
              .permute(1, 2, 0).contiguous())
-    return frame.cpu().numpy().tobytes()
+    if staging is None:
+        return frame.cpu().numpy().tobytes()
+    return staging.fetch(frame)
+
+
+class PinnedStaging:
+    """A reused page-locked destination for the device-to-host copy — §3c-1. **Never raises.**
+
+    **A DEFECT, NOT AN OPTIMISATION.** `docs/test-plan.md` §22d: `convert_out_s` is **7.4x over
+    its physical floor at 8K** — 65.4 s against ~8.8 s from the measured 7.90 GB/s bus plus one
+    host memcpy — and 3.1x over at 4K. *The overshoot grows with frame size, so it is per-frame
+    cost rather than fixed inefficiency*, and the suspect is a fresh PAGEABLE destination
+    allocated for every frame. A copy into pageable memory cannot go straight from the device:
+    the driver stages it through its own pinned bounce buffer, in chunks. ~56 s of an 8K job.
+
+    **THIS IS NOT THE ASYNC CHANGE.** §3c deferred pinned buffers and `non_blocking=True`
+    together and **they are separable; only the first is taken.** The copy stays synchronous, so
+    `convert_out_s` still ends at a real synchronisation and §3c's second invariant — *the
+    conversion clock must not become an enqueue clock* — is untouched. That is §9b's trap, and
+    it would land on the very number this change is justified by.
+
+    **THE INVARIANT, AND IT IS THE WHOLE RISK OF THE WAVE:**
+
+        A REUSED BUFFER MAY ONLY BE REFILLED AFTER THE PREVIOUS FRAME'S `write` HAS RETURNED.
+
+    Today `.tobytes()` mints a fresh object per frame, so nothing can alias. **A reused staging
+    buffer removes that guarantee**, and what restores it is that `MasterWriter.write` blocks
+    until the pipe accepts the frame — so on this path the invariant holds by construction.
+    **Which is exactly what a future write-behind queue would break**, silently, on a buffer
+    whose previous contents are still in flight.
+
+    **So it is ASSERTED here rather than relied on.** `_armed` is set when a buffer is handed out
+    and cleared when the write returns; refilling while armed refuses. The check costs a boolean
+    per frame and it is the difference between an invariant and a comment about one.
+    """
+
+    def __init__(self):
+        self._buffer = None
+        self._shape = None
+        #: True between handing a buffer out and being told its write returned. **The invariant
+        #: in one flag** — see the class docstring.
+        self._armed = False
+
+    def fetch(self, frame):
+        """Copy `frame` to the host through the reused pinned buffer and return its bytes.
+
+        Falls back to the unpinned path on ANY failure, because a staging buffer is a
+        performance change and must never be the reason a master is not delivered.
+        """
+        import torch  # noqa: PLC0415 — a GPU-box import, like every other torch touch
+
+        try:
+            if self._armed:
+                raise RuntimeError(
+                    "the pinned staging buffer was refilled before the previous frame's write "
+                    "returned. §3c-1's invariant is violated and the previous frame's bytes may "
+                    "still be in flight to ffmpeg; this refuses rather than delivering a master "
+                    "whose frames are a copy of each other")
+            shape = tuple(frame.shape)
+            if self._buffer is None or self._shape != shape:
+                # **Allocated once per shape, which on this path means once.** A retime that
+                # changed frame size mid-clip is already refused upstream by `_load_pair`.
+                self._buffer = torch.empty(shape, dtype=frame.dtype,
+                                           device="cpu", pin_memory=True)
+                self._shape = shape
+            self._buffer.copy_(frame)
+            self._armed = True
+            # **`.tobytes()` STAYS** (§3a, unchanged). This buffer is the DESTINATION of the
+            # device-to-host copy, not a replacement for the bytes handed to the writer:
+            # `MasterWriter.write`'s guard is `len(frame_bytes)`, and `len()` of a 3-D ndarray is
+            # its first dimension. The copy `tobytes` makes is ~3.2 s of the 65.4 at 8K; the
+            # allocation and the un-pinned transfer are the rest, and they are what this removes.
+            return self._buffer.numpy().tobytes()
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001 — a speed-up must never cost a delivered master
+            self._armed = False
+            return frame.cpu().numpy().tobytes()
+
+    def released(self):
+        """The previous frame's `write` has returned; the buffer may be refilled."""
+        self._armed = False
 
 
 def _uint8():
@@ -554,6 +635,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # plan above is still sized from `source_frame_count`, because a plan has to exist before
         # anything is decoded; this is what the record reports afterwards.
         decoded = DecodeCount()
+        # **§3c-1. One buffer for the whole retime, handed down as an argument.** Contract §4b
+        # and the same reason `StageClock` is a parameter: an accumulator on an object that
+        # outlives the call is read by somebody with no way to know it is stale, and a cascade
+        # variant calls `stream()` twice.
+        staging = PinnedStaging()
         stream, stats = variants.run(
             variant, interpolator,
             # **The interpolator's device, read off the interpolator.** §3b does the inbound
@@ -663,10 +749,10 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # shipped arm and a silent near-white master; see `ConvertCheck.snapshot`.
                     before = checker.snapshot(frame) if checker is not None else None
                     if clock is None:
-                        payload = _to_rgb24_device(frame)
+                        payload = _to_rgb24_device(frame, staging)
                     else:
                         with clock.timing("convert_out_s"):
-                            payload = _to_rgb24_device(frame)
+                            payload = _to_rgb24_device(frame, staging)
                     # **Outside the timed block, on purpose.** The reference arm is the
                     # instrument, not the shipped conversion, and charging it to `convert_out_s`
                     # would corrupt the one number this wave is judged by. It lands in
@@ -683,6 +769,10 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     else:
                         with clock.timing("write_wait_s"):
                             writer.write(payload)
+                    # **§3c-1's invariant, released only after `write` RETURNED.** Not in a
+                    # `finally`: a write that raised is a run that is ending, and re-arming the
+                    # buffer on the way out would say the frame was accepted when it was not.
+                    staging.released()
                     # **Every frame, and the rate limiter decides what is SENT.** progress._emit
                     # drops anything inside MIN_INTERVAL_S, so calling per frame costs a
                     # comparison and publishes at the module's own cadence rather than at one this
