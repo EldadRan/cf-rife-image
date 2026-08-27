@@ -224,6 +224,17 @@ PARAMS_FIELDS = {
     # two objects, and the collision is the contract's spelling (§5c) rather than a choice made
     # here. Raised to the gate as a claim.
     "output",
+    # ── the conversion wave's gate ───────────────────────────────────────────────────────────
+    # **`docs/conversion-wave.md` §5-0, and A REQUEST FIELD RATHER THAN AN ENVIRONMENT VARIABLE
+    # BY CF'S RULING.** The tie check took an env var and §2g-1 granted that exception explicitly
+    # for one errand on a no-traffic endpoint; it does not carry. **An environment variable is
+    # deployment-scoped configuration, and one left set silently taxes every later job** — this
+    # gate runs the whole outbound conversion a SECOND time per frame, so a forgotten flag is a
+    # standing tax on every delivery rather than a stale field nobody reads.
+    #
+    # Refused by name when misspelled, like everything else in `params`, which is the property
+    # that makes a per-job control safe to add here.
+    "convert_check",
 }
 
 #: **Nothing is unconditionally required, and that is the point.** `target_short_edge_px` is
@@ -672,6 +683,13 @@ def validate(job_input):
     sliced_threads = (encoder.DEFAULT_SLICED_THREADS if sliced_threads is None
                       else _as_bool(sliced_threads, "sliced_threads"))
 
+    # **`docs/conversion-wave.md` §5-0. Default FALSE and there is no other reachable default.**
+    # The gate doubles the outbound conversion for every delivered frame, so it is opt-in per
+    # job, asked for by the run that wants the evidence and by nothing else.
+    convert_check = params.get("convert_check")
+    convert_check = (False if convert_check is None
+                     else _as_bool(convert_check, "convert_check"))
+
     rc_lookahead = params.get("rc_lookahead")
     if rc_lookahead is None:
         rc_lookahead = encoder.DEFAULT_RC_LOOKAHEAD
@@ -725,6 +743,7 @@ def validate(job_input):
         "threads": threads,
         "sliced_threads": sliced_threads,
         "rc_lookahead": rc_lookahead,
+        "convert_check": convert_check,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,

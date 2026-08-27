@@ -126,7 +126,8 @@ def build_stub(build_identity, machine, request=None, rationale=None, source=Non
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
-          retime=None, transfer=None, eta=None, estimate=None, tie_check=None):
+          retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
+          convert_check=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -201,6 +202,11 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     # from "the sweep found nothing" — the distinction `F-2026-08-25-2` is about.
     if tie_check:
         body["tie_check"] = tie_check
+    # **`docs/conversion-wave.md` §5-0, omitted rather than nulled**, exactly as `tie_check` is:
+    # every ordinary job is a job that did not run the gate, and the kit's `--convert-check`
+    # grades the absence so "did not run" stays distinguishable from "ran and found nothing".
+    if convert_check:
+        body["convert_check"] = convert_check
     if progress is not None:
         body["seconds_per_frame"] = progress.seconds_per_frame()
     if error:

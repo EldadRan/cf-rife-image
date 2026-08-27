@@ -82,6 +82,139 @@ def _to_tensor(frame_bgr, torch):
     return torch.from_numpy(array).unsqueeze(0)
 
 
+class _ConvertCheck:
+    """§5-0's in-run dual-path comparison. **Never raises; a gate must not cost a master.**
+
+    **THE CROSS-RUN GATE §5 ASKED FOR CANNOT WORK, and this exists because it was tried.**
+    `docs/gate-findings.md` `F-2026-08-27-4`: two runs on the SAME image deliver files 3,809 bytes
+    apart and every decoded frame differs, with x264 tested and exonerated. **So comparing an old
+    master against a new one measures the platform rather than the change** — and `rc_lookahead`
+    couples every frame's quantisation to its neighbours, which is why even frame 0, a COPIED
+    frame with no model anywhere in its path, differs.
+
+    **Both arms here see the same tensor in the same process, so a difference can only be the
+    conversion.** No model non-determinism, no host contention, no encoder state, no request
+    identity. It compares BEFORE the encoder, which §5 itself calls the stronger form, and it
+    covers every delivered frame rather than a hash of an aggregate.
+
+    **`frames` is graded against the plan's `n_out`** for the reason `tie_check.swept` is graded
+    against the domain: a comparison that ran on a tenth of the frames and found nothing reads
+    exactly like one that ran on all of them.
+
+    **The instrument's own cost is deliberately OUTSIDE `convert_out_s`.** The old arm is not the
+    shipped conversion, and timing it into the field whose share this wave exists to move would
+    corrupt the number the wave is judged by. It lands in `stage_residual_s`, which
+    `stages.RESIDUAL` reports rather than absorbs.
+    """
+
+    #: §5-0. Bounded for the reason `tie_check.first_mismatches` is: an unbounded list of every
+    #: differing pixel in a 4K clip is a record nobody can fetch, and the COUNT decides the
+    #: verdict.
+    LIMIT = 16
+
+    def __init__(self):
+        self.frames = 0
+        self.mismatches = 0
+        self.max_abs_delta = 0
+        self.first = []
+        #: Frames the comparison itself failed on. **Not in §5-0's field list and reported
+        #: anyway**, because the alternative is the failure this project keeps meeting: an
+        #: instrument that breaks and leaves a record indistinguishable from one that worked.
+        #: A frame counted here is NOT counted in `frames`, so `frames` falls short of `n_out`
+        #: and the kit fails the run on the honest ground — a comparison that did not compare.
+        self.errors = 0
+
+    def compare(self, index, old_bytes, new_bytes):
+        """One frame, both ways. **Swallows everything** — see the class docstring.
+
+        **NOTHING IS COMMITTED TO `self` UNTIL THE WORK THAT WOULD JUSTIFY IT HAS SUCCEEDED.**
+        The first draft incremented `frames` and `mismatches` at the top and then did the numpy
+        work — so an exception between them left `mismatches: 1, max_abs_delta: 0`, a shape the
+        kit reads as *"a difference beyond +/-1, so NOT a rounding difference"*. **A broken
+        instrument would have been graded as a broken conversion**, which is the class the tie
+        check's own alignment control exists for, met again one wave later.
+        """
+        try:
+            # **The equality test first, and it is what makes this affordable.** `bytes.__eq__` is
+            # a C memcmp; the numpy work below runs only on a frame that actually differed, which
+            # on a passing run is never.
+            if old_bytes == new_bytes:
+                self.frames += 1
+                return
+            old = np.frombuffer(old_bytes, dtype=np.uint8)
+            new = np.frombuffer(new_bytes, dtype=np.uint8)
+            # **int16 before subtracting.** uint8 arithmetic wraps, so a difference in the other
+            # direction reports 255 and `max_abs_delta` would say the change is not a rounding
+            # difference when it is exactly that. **§5's fallback turns entirely on this number
+            # being 1**, and CF's ruling is asked for on the strength of it.
+            delta = np.abs(old.astype(np.int16) - new.astype(np.int16))
+            worst = int(delta.max())
+            at = int(np.flatnonzero(old != new)[0])
+            entry = {"frame": int(index), "index": at,
+                     "old": int(old[at]), "new": int(new[at])}
+        except Exception:  # noqa: BLE001 — a gate must never displace a delivered master
+            self.errors += 1
+            return
+        self.frames += 1
+        self.mismatches += 1
+        self.max_abs_delta = max(self.max_abs_delta, worst)
+        if len(self.first) < self.LIMIT:
+            self.first.append(entry)
+
+    def block(self):
+        """§5-0's four fields, plus `errors` — see `__init__`."""
+        return {"frames": self.frames, "mismatches": self.mismatches,
+                "first": self.first, "max_abs_delta": self.max_abs_delta,
+                "errors": self.errors}
+
+
+def _to_rgb24_device(tensor):
+    """§3a — the SAME contract as `_to_rgb24`, with the arithmetic on whichever device the tensor
+    is already on. **This is the conversion wave.**
+
+    `convert_out_s` was 67.08% of `compute_s` at 4K (`docs/test-plan.md` §12) and it is one
+    single-threaded pass of host float work per frame. The operations are identical; only where
+    they run changes. **The `.to("cpu")` moves to the END and carries one byte per channel instead
+    of four**, which is the whole of the saving — the device-to-host copy shrinks by 4x and the
+    arithmetic stops being a host bottleneck.
+
+    **OUT-OF-PLACE, AND IT IS A REQUIREMENT RATHER THAN A STYLE NOTE** (`docs/conversion-wave.md`
+    §2f, §3a). `clamp_`, `mul_` or `round_` would write through to the caller's own tensor, and
+    `interpolate.stream` ends both its copy and its hold branch with `yield held[i]` — **the same
+    tensor object, emitted twice.** A held frame converted in place would be CLAMPED back into
+    [0, 1] on its second pass, saturating every pixel at or above 1, and the multiply would then
+    take it to 255: **a near-white frame**, passing every frame-count and cadence check there is.
+    The refinement that would remove two full-size intermediates is safe and is deliberately NOT
+    taken — §2f holds it, and a mechanically checkable rule beats a subtle one when the failure
+    mode is a delivered master that is garbage.
+
+    **`.float()` is here and §3a's snippet omits it.** It matches `_to_rgb24`'s own cast rather
+    than the document's shorthand: `Interpolator` takes `dtype` as a constructor argument and its
+    docstring states that *"the stream is not uniform in device or dtype, deliberately"*. Nothing
+    reaches it with a half-precision dtype today — `handler` constructs it without one — so this
+    changes no result now and stops the two arms diverging on dtype if it ever does. On an
+    already-float32 tensor it returns that same tensor, so it costs nothing and allocates nothing.
+
+    **`.tobytes()` STAYS, and removing it is not a free micro-optimisation** (§3a). The one guard
+    between a wrong-sized frame and a master that shears while ffmpeg exits 0 is
+    `encoder.MasterWriter.write`'s `len(frame_bytes) != width * height * 3` — and **`len()` of a
+    3-D ndarray is its FIRST DIMENSION, not its byte count.** Handing the array in directly would
+    defeat that check while appearing to work. Changing the guard is a change to the writer's
+    contract and is explicitly not in this wave.
+    """
+    frame = (tensor.detach()[0].float()
+             .clamp(0.0, 1.0).mul(255.0).round().to(_uint8())
+             .permute(1, 2, 0).contiguous())
+    return frame.cpu().numpy().tobytes()
+
+
+def _uint8():
+    """`torch.uint8`, fetched where it is used. **torch is a GPU-box import on this module.**"""
+    import torch  # noqa: PLC0415 — as everywhere else here; the CPU test tree imports this file
+
+    return torch.uint8
+
+
 def _to_rgb24(tensor):
     """Back to the writer's contract: `rgb24`, `width × height × 3` bytes.
 
@@ -135,7 +268,7 @@ def frames_from(capture, expect=None, clock=None):
 def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None, preset=None, threads=None,
-           sliced_threads=None, rc_lookahead=None, clock=None):
+           sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -226,6 +359,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # maximum with it. A second fifty-minute run would have had its ceiling inferred from a
         # kill again, which is what the measurement was meant to end. The number now rides on the
         # refusal's own message, where the diagnostics bundle and the run-record both carry it.
+        # **Created here and handed down, never an attribute.** Contract §4b and the same
+        # argument `stages.StageClock` carries: a per-call result published on an object that
+        # outlives the call is read by somebody with no way to know it is stale, and a cascade
+        # variant calls `stream()` twice.
+        checker = _ConvertCheck() if convert_check else None
         try:
             with writer_cm as writer:
                 for frame in stream:
@@ -242,11 +380,25 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # this field's share and that share has never been measured — the 61-74% was
                     # attributed here in a draft and the attribution was assumption. This is the
                     # number that arms that wave or retires it.
+                    #
+                    # **THE SHIPPED CONVERSION IS `_to_rgb24_device` FROM THIS WAVE ON.**
+                    # `_to_rgb24` survives as the reference arm of §5-0's gate and as the thing
+                    # that runs when nobody asked for the gate — it is not dead code and it is
+                    # not a fallback: it is the definition the new path is being held to.
                     if clock is None:
-                        writer.write(_to_rgb24(frame))
+                        payload = _to_rgb24_device(frame)
                     else:
                         with clock.timing("convert_out_s"):
-                            payload = _to_rgb24(frame)
+                            payload = _to_rgb24_device(frame)
+                    # **Outside the timed block, on purpose.** The reference arm is the
+                    # instrument, not the shipped conversion, and charging it to `convert_out_s`
+                    # would corrupt the one number this wave is judged by. It lands in
+                    # `stage_residual_s`, reported and not absorbed.
+                    if checker is not None:
+                        checker.compare(writer.frames_written, _to_rgb24(frame), payload)
+                    if clock is None:
+                        writer.write(payload)
+                    else:
                         with clock.timing("write_wait_s"):
                             writer.write(payload)
                     # **Every frame, and the rate limiter decides what is SENT.** progress._emit
@@ -308,6 +460,13 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
         return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
+                    # **§5-0, and it travels beside `estimate` for the same reason** — `retime`
+                    # is handed no `trace`. `handler._retime` lifts it to the record's TOP level
+                    # rather than filing it under `retime`, because the kit grades
+                    # `convert_check.frames` AGAINST `retime.n_out` and a block nested inside the
+                    # thing it is checked against reads as part of the measurement rather than as
+                    # the check on it. Null when nobody asked for the gate.
+                    convert_check=(checker.block() if checker is not None else None),
                     # **The estimate rides out with the stats because this is its only channel**
                     # — `retime` is handed no `trace` and should not be. `handler._retime` lifts
                     # it into the record's `estimate` block and files the REST under `retime`, so

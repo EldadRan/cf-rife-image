@@ -482,6 +482,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         preset=request.get("preset"),
         threads=request.get("threads"),
         sliced_threads=request.get("sliced_threads"),
+        # §5-0's in-run gate, opt-in per job. False everywhere it was not asked for.
+        convert_check=bool(request.get("convert_check")),
         rc_lookahead=request.get("rc_lookahead"),
         # **Passed at last.** `retime` has declared this parameter since it was written and
         # `_retime` never supplied it, so the retime path published two payloads for a
@@ -543,7 +545,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # answer travels out of `routec` inside the stats because that is the only channel it
         # has, and filing it here as well would put one fact in two places in one document — the
         # duplication that makes a stale copy indistinguishable from a live one.
-        trace["retime"] = {k: v for k, v in stats.items() if k != "estimate"}
+        # **`convert_check` is excluded alongside `estimate` and lifted to the top level.** The
+        # kit grades `convert_check.frames` AGAINST `retime.n_out`, and a check nested inside the
+        # block it is checked against reads as part of that measurement rather than as the check
+        # on it.
+        trace["retime"] = {k: v for k, v in stats.items()
+                           if k not in ("estimate", "convert_check")}
+        trace["convert_check"] = stats.get("convert_check")
 
     return _decorate({
         "status": "DELIVERED",
@@ -691,6 +699,9 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # null here would read as "swept and found nothing" to nobody and as a missing field
             # to the one caller that grades it.
             tie_check=(trace or {}).get("tie_check"),
+            # §5-0. Absent on every run that did not ask for the gate, for the same reason
+            # `tie_check` is: the kit's `--convert-check` REQUIRES the block.
+            convert_check=(trace or {}).get("convert_check"),
             # **A snapshot, not the live list.** The sampler stops when the job does and not
             # when the record is assembled, so handing `json.dumps` a list something may still be
             # appending to is handing it a list that can reallocate underneath the walk.
