@@ -469,6 +469,16 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     master = keys.master_name(False, source["width"], source["height"],
                               name=request["output"].get("name"))
     master_path = os.path.join(workdir, master)
+    # **§5-0's gate, and it is created HERE so its evidence outlives a run that dies.** It was
+    # built inside `routec.retime` and published only in that function's success return — so a
+    # reaped ffmpeg discarded every frame already compared and filed a record indistinguishable
+    # from a run that never armed it. Banked in `trace` before the call, which is the dict a
+    # crashed run's numbers survive in, and read by the `finally` that writes the record on every
+    # exit. **The same argument `stages.StageClock` carries**, one wave later and one object over.
+    checker = routec.ConvertCheck() if request.get("convert_check") else None
+    if trace is not None and checker is not None:
+        trace["convert_check_live"] = checker
+
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
         source, source_path, master_path, interpolator,
@@ -482,8 +492,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         preset=request.get("preset"),
         threads=request.get("threads"),
         sliced_threads=request.get("sliced_threads"),
-        # §5-0's in-run gate, opt-in per job. False everywhere it was not asked for.
-        convert_check=bool(request.get("convert_check")),
+        convert_check=checker,
         rc_lookahead=request.get("rc_lookahead"),
         # **Passed at last.** `retime` has declared this parameter since it was written and
         # `_retime` never supplied it, so the retime path published two payloads for a
@@ -551,7 +560,6 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # on it.
         trace["retime"] = {k: v for k, v in stats.items()
                            if k not in ("estimate", "convert_check")}
-        trace["convert_check"] = stats.get("convert_check")
 
     return _decorate({
         "status": "DELIVERED",
@@ -568,7 +576,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # not attribute a difference to the settings that differed, which is exactly what §2 says
         # recording three of five costs. `routec` now reads all five off the writer that ran and
         # returns them, so both artefacts carry one set of numbers that cannot disagree.
-        "retime": dict(stats),
+        "retime": {k: v for k, v in stats.items()
+                   if k not in ("estimate", "convert_check")},
         # **`padded_megapixels` is the fit's independent variable and nothing computed it**
         # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
         # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
@@ -657,6 +666,16 @@ def _add(trace, block, field, value):
         pass
 
 
+def _convert_check_block(trace):
+    """§5-0's block off the live checker. **Never raises** — this runs inside the record's
+    `finally`, on exactly the crashed runs the object was hoisted out of `retime` to serve."""
+    try:
+        checker = (trace or {}).get("convert_check_live")
+        return checker.block() if checker is not None else None
+    except Exception:  # noqa: BLE001 — a record must never cost a delivered master
+        return None
+
+
 def _note(trace, block, field, value):
     """Bank one measurement into `trace`, creating the block. **Never raises.**
 
@@ -699,9 +718,10 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # null here would read as "swept and found nothing" to nobody and as a missing field
             # to the one caller that grades it.
             tie_check=(trace or {}).get("tie_check"),
-            # §5-0. Absent on every run that did not ask for the gate, for the same reason
-            # `tie_check` is: the kit's `--convert-check` REQUIRES the block.
-            convert_check=(trace or {}).get("convert_check"),
+            # §5-0. **Read off the live object rather than off the stats**, so a run that died
+            # mid-encode still files what it had compared. Absent on every run that did not arm
+            # the gate, for the same reason `tie_check` is: `--convert-check` REQUIRES the block.
+            convert_check=_convert_check_block(trace),
             # **A snapshot, not the live list.** The sampler stops when the job does and not
             # when the record is assembled, so handing `json.dumps` a list something may still be
             # appending to is handing it a list that can reallocate underneath the walk.

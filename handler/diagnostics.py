@@ -338,7 +338,16 @@ def _runpod_identity(job):
 #: described a request nobody sent.
 #:
 #: Now route C's scalars: the things that change what the worker computes.
-_REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale")
+#: **`convert_check` is here so a record SAYS the gate was armed** (`docs/conversion-wave.md`
+#: §5-0). Without it, an armed run that died before the checker could publish is
+#: indistinguishable from one nobody asked — and an armed run's `convert_out_s` is inflated by
+#: the reference arm's own host work, so a corpus row that cannot say which kind it is cannot be
+#: used to bank the wave's improvement. It is `False` on almost every run and filtered out below
+#: **It appears on EVERY record, including as `false`, and that is deliberate.** The filter
+#: below drops `None` and not falsey values, so an unarmed run says so explicitly rather than by
+#: omission — which is the distinction this project keeps paying for: an absent key and a
+#: measured `false` must not read alike to whoever reads the corpus next.
+_REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale", "convert_check")
 
 #: Read out of `release_3["interpolate"]` rather than off the top level, because that is where
 #: the envelope puts them.

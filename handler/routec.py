@@ -82,7 +82,7 @@ def _to_tensor(frame_bgr, torch):
     return torch.from_numpy(array).unsqueeze(0)
 
 
-class _ConvertCheck:
+class ConvertCheck:
     """§5-0's in-run dual-path comparison. **Never raises; a gate must not cost a master.**
 
     **THE CROSS-RUN GATE §5 ASKED FOR CANNOT WORK, and this exists because it was tried.**
@@ -116,7 +116,13 @@ class _ConvertCheck:
         self.frames = 0
         self.mismatches = 0
         self.max_abs_delta = 0
+        self.max_abs_delta_at = None
         self.first = []
+        #: Frames where the SHIPPED arm mutated the tensor it was given. **Zero is part of the
+        #: acceptance**, because `mismatches == 0` does not cover out-of-placeness on its own —
+        #: see `compare`. A non-zero count here is §2f's forbidden refinement having reached the
+        #: code, and it is the failure that delivers a near-white master silently.
+        self.mutated_frames = 0
         #: Frames the comparison itself failed on. **Not in §5-0's field list and reported
         #: anyway**, because the alternative is the failure this project keeps meeting: an
         #: instrument that breaks and leaves a record indistinguishable from one that worked.
@@ -124,47 +130,123 @@ class _ConvertCheck:
         #: and the kit fails the run on the honest ground — a comparison that did not compare.
         self.errors = 0
 
-    def compare(self, index, old_bytes, new_bytes):
-        """One frame, both ways. **Swallows everything** — see the class docstring.
+    def snapshot(self, frame):
+        """A pristine copy of `frame`, taken BEFORE the shipped arm touches it. **Never raises.**
 
-        **NOTHING IS COMMITTED TO `self` UNTIL THE WORK THAT WOULD JUSTIFY IT HAS SUCCEEDED.**
-        The first draft incremented `frames` and `mismatches` at the top and then did the numpy
-        work — so an exception between them left `mismatches: 1, max_abs_delta: 0`, a shape the
-        kit reads as *"a difference beyond +/-1, so NOT a rounding difference"*. **A broken
-        instrument would have been graded as a broken conversion**, which is the class the tie
-        check's own alignment control exists for, met again one wave later.
+        **THE ORDER IS THE WHOLE MECHANISM AND THE FIRST FIX FOR IT GOT THE ORDER WRONG.** The
+        clone was taken inside `compare`, which the loop calls AFTER `_to_rgb24_device` has
+        already returned — so on an in-place shipped arm it cloned an already-corrupted tensor,
+        the reference arm read the corruption, and the two agreed exactly as they did before the
+        fix. **Caught by executing the case rather than by reading the code**, which is the only
+        way this class of bug is ever caught.
+
+        `None` on failure, which `compare` counts as an error rather than as a pass: a gate that
+        could not take its own reference has not compared anything.
         """
         try:
+            return frame.clone()
+        except Exception:  # noqa: BLE001 — a gate must never displace a delivered master
+            return None
+
+    def compare(self, index, before, frame, new_bytes):
+        """One frame, both ways. **Swallows everything, including the reference arm.**
+
+        **THE REFERENCE ARM IS EVALUATED IN HERE AND NOT AT THE CALL SITE**, which is what makes
+        the class docstring's promise true. It was `compare(index, _to_rgb24(frame), payload)` —
+        so the reference conversion ran OUTSIDE this try, and at 4K it allocates several
+        full-resolution host float32 buffers per frame. A `MemoryError` there is not a
+        `WorkerError`, so it would have escaped `retime` entirely: **arming a diagnostic could
+        fail a job that unarmed delivers.**
+
+        **THE SNAPSHOT IS THE OTHER HALF, AND IT IS WHY THE GATE CAN SEE AN IN-PLACE OP AT ALL.**
+        It is taken by `snapshot`, at the call site, BEFORE the shipped arm runs — see there for
+        why the ordering is not a detail.
+        §5-0 argued that both arms seeing the same tensor means a difference can only be the
+        conversion. **The first half is true and it breaks the second half**: the same tensor is
+        a MUTABLE tensor, the device arm runs first, and an in-place device arm would corrupt it
+        before the reference arm ever read it — so the two would agree and the gate would report
+        zero on a run delivering near-white frames. **Two arms reading one object can prove
+        arithmetic equivalence and cannot prove out-of-placeness; they are different properties.**
+        So the reference arm reads a pristine copy, and `mutated` names the cause directly rather
+        than leaving a reader to infer it from a wall of differing pixels.
+
+        **NOTHING IS COMMITTED TO `self` UNTIL THE WORK THAT WOULD JUSTIFY IT HAS SUCCEEDED.**
+        An earlier draft incremented `frames` and `mismatches` at the top and then did the numpy
+        work — so an exception between them left `mismatches: 1, max_abs_delta: 0`, a shape the
+        kit reads as *"a difference beyond +/-1, so NOT a rounding difference"*. **A broken
+        instrument would have been graded as a broken conversion.**
+        """
+        try:
+            if before is None:
+                raise ValueError("no pristine snapshot was taken for frame {}".format(index))
+            old_bytes = self._convert(before)
+            mutated = not self._same(before, frame)
             # **The equality test first, and it is what makes this affordable.** `bytes.__eq__` is
             # a C memcmp; the numpy work below runs only on a frame that actually differed, which
             # on a passing run is never.
-            if old_bytes == new_bytes:
+            if old_bytes == new_bytes and not mutated:
                 self.frames += 1
                 return
-            old = np.frombuffer(old_bytes, dtype=np.uint8)
-            new = np.frombuffer(new_bytes, dtype=np.uint8)
-            # **int16 before subtracting.** uint8 arithmetic wraps, so a difference in the other
-            # direction reports 255 and `max_abs_delta` would say the change is not a rounding
-            # difference when it is exactly that. **§5's fallback turns entirely on this number
-            # being 1**, and CF's ruling is asked for on the strength of it.
-            delta = np.abs(old.astype(np.int16) - new.astype(np.int16))
-            worst = int(delta.max())
-            at = int(np.flatnonzero(old != new)[0])
-            entry = {"frame": int(index), "index": at,
-                     "old": int(old[at]), "new": int(new[at])}
+            entry = peak_entry = None
+            worst = 0
+            if old_bytes != new_bytes:
+                old = np.frombuffer(old_bytes, dtype=np.uint8)
+                new = np.frombuffer(new_bytes, dtype=np.uint8)
+                # **int16 before subtracting.** uint8 arithmetic wraps, so a difference in the
+                # other direction reports 255 and `max_abs_delta` would say the change is not a
+                # rounding difference when it is exactly that. **§5's fallback turns entirely on
+                # this number being 1**, and CF's ruling is asked for on its strength.
+                delta = np.abs(old.astype(np.int16) - new.astype(np.int16))
+                # **`argmax`, not `flatnonzero`.** The latter materialises EVERY differing index
+                # as int64 — ~199 MiB at 4K when every byte differs, which is exactly the run
+                # this gate exists to catch. **An instrument must not be most expensive on its
+                # own worst case**, and `argmax` on a bool array stops at the first True.
+                at = int((old != new).argmax())
+                peak = int(delta.argmax())
+                worst = int(delta[peak])
+                entry = {"frame": int(index), "index": at,
+                         "old": int(old[at]), "new": int(new[at])}
+                # **The worst pixel is named, and it is NOT the same pixel as `first`.** `first`
+                # holds the FIRST differing byte of a frame; `max_abs_delta` is the largest
+                # difference anywhere across every frame. A reader checking the headline against
+                # the evidence would otherwise compute `new - old` from `first[0]` and get a
+                # number belonging to a different pixel and usually a different frame, with
+                # nothing in the block saying so.
+                peak_entry = {"frame": int(index), "index": peak,
+                              "old": int(old[peak]), "new": int(new[peak])}
         except Exception:  # noqa: BLE001 — a gate must never displace a delivered master
             self.errors += 1
             return
         self.frames += 1
-        self.mismatches += 1
-        self.max_abs_delta = max(self.max_abs_delta, worst)
-        if len(self.first) < self.LIMIT:
-            self.first.append(entry)
+        if mutated:
+            self.mutated_frames += 1
+        if entry is not None:
+            self.mismatches += 1
+            if len(self.first) < self.LIMIT:
+                self.first.append(entry)
+            if worst > self.max_abs_delta:
+                self.max_abs_delta = worst
+                self.max_abs_delta_at = peak_entry
+
+    @staticmethod
+    def _convert(tensor):
+        """The reference arm. Named so the class, not the loop, owns which arm is the reference."""
+        return _to_rgb24(tensor)
+
+    @staticmethod
+    def _same(a, b):
+        """`torch.equal`, imported where it is used. **A failure here is a failure of the
+        comparison**, so it raises into `compare`'s own handler rather than returning a guess."""
+        import torch  # noqa: PLC0415 — torch is a GPU-box import on this module
+
+        return bool(torch.equal(a, b))
 
     def block(self):
-        """§5-0's four fields, plus `errors` — see `__init__`."""
+        """§5-0's four fields, plus three this build adds — see `__init__` and `compare`."""
         return {"frames": self.frames, "mismatches": self.mismatches,
                 "first": self.first, "max_abs_delta": self.max_abs_delta,
+                "max_abs_delta_at": self.max_abs_delta_at,
+                "mutated_frames": self.mutated_frames,
                 "errors": self.errors}
 
 
@@ -359,11 +441,15 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # maximum with it. A second fifty-minute run would have had its ceiling inferred from a
         # kill again, which is what the measurement was meant to end. The number now rides on the
         # refusal's own message, where the diagnostics bundle and the run-record both carry it.
-        # **Created here and handed down, never an attribute.** Contract §4b and the same
-        # argument `stages.StageClock` carries: a per-call result published on an object that
-        # outlives the call is read by somebody with no way to know it is stale, and a cascade
-        # variant calls `stream()` twice.
-        checker = _ConvertCheck() if convert_check else None
+        # **The checker is HANDED IN, not created here, and that is F2's fix.** It used to be
+        # built in this function and published only in the success `return` below — so a run
+        # reaped in ffmpeg at frame 900 of 1400 discarded nine hundred frames of comparison,
+        # including any mismatch already found, and filed a record indistinguishable from one
+        # that never armed the gate. **`handler` owns the object now**, banks it in `trace`
+        # before this call, and reads it in the `finally` that writes the record on every exit.
+        # `retime` still publishes it in `stats` for a direct caller that passed nothing.
+        checker = convert_check if isinstance(convert_check, ConvertCheck) else (
+            ConvertCheck() if convert_check else None)
         try:
             with writer_cm as writer:
                 for frame in stream:
@@ -385,6 +471,10 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # `_to_rgb24` survives as the reference arm of §5-0's gate and as the thing
                     # that runs when nobody asked for the gate — it is not dead code and it is
                     # not a fallback: it is the definition the new path is being held to.
+                    # **Taken BEFORE the shipped conversion and outside its clock.** This is
+                    # the gate's reference and the only thing standing between an in-place
+                    # shipped arm and a silent near-white master; see `ConvertCheck.snapshot`.
+                    before = checker.snapshot(frame) if checker is not None else None
                     if clock is None:
                         payload = _to_rgb24_device(frame)
                     else:
@@ -394,8 +484,13 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # instrument, not the shipped conversion, and charging it to `convert_out_s`
                     # would corrupt the one number this wave is judged by. It lands in
                     # `stage_residual_s`, reported and not absorbed.
+                    # **Compared against the snapshot taken above, not against `frame`.** The
+                    # shipped arm has already run by this line; on an in-place arm `frame` is
+                    # whatever that arm left behind, and comparing against it would prove the
+                    # corruption consistent with itself. `compare` swallows everything, reference
+                    # arm included — see `ConvertCheck.compare`.
                     if checker is not None:
-                        checker.compare(writer.frames_written, _to_rgb24(frame), payload)
+                        checker.compare(writer.frames_written, before, frame, payload)
                     if clock is None:
                         writer.write(payload)
                     else:
