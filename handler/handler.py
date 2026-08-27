@@ -45,6 +45,14 @@ from errors import Remedy, WorkerError
 
 WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 
+#: **The `trace` keys the two gates' live objects hang on.** Constants rather than string
+#: literals, because each is written in one function and read in another: a typo in either half
+#: produced a record with no block, no exception and no warning — while `diagnostics`' request
+#: echo still said the gate had been armed. **An absent block beside `request.input_check: true`
+#: is exactly the shape a crashed run produces**, so the two would have been indistinguishable.
+CONVERT_CHECK_LIVE = "convert_check_live"
+INPUT_CHECK_LIVE = "input_check_live"
+
 #: **§3b-0 item 4 retired `TIECHECK_ENV` and the predicate that read it.** The sweep is armed by
 #: `params.tie_check` now, so the question *"is it on"* is answered by `validation` like every
 #: other request field, and this module has nothing left to restate. **The env var that armed it
@@ -455,13 +463,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # exit. **The same argument `stages.StageClock` carries**, one wave later and one object over.
     checker = routec.ConvertCheck() if request.get("convert_check") else None
     if trace is not None and checker is not None:
-        trace["convert_check_live"] = checker
+        trace[CONVERT_CHECK_LIVE] = checker
     # §3b-1's gate, hoisted for the same reason: a run reaped mid-encode still files what it
     # compared. `_tensors` is consumed lazily inside the stream, so this object outlives the
     # decode as well as the encode.
     input_checker = routec.InputCheck() if request.get("input_check") else None
     if trace is not None and input_checker is not None:
-        trace["input_check_live"] = input_checker
+        trace[INPUT_CHECK_LIVE] = input_checker
 
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
@@ -663,7 +671,7 @@ def _live_block(trace, key):
 
 def _convert_check_block(trace):
     """§5-0's block off the live checker."""
-    return _live_block(trace, "convert_check_live")
+    return _live_block(trace, CONVERT_CHECK_LIVE)
 
 
 def _note(trace, block, field, value):
@@ -713,7 +721,7 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # the gate, for the same reason `tie_check` is: `--convert-check` REQUIRES the block.
             convert_check=_convert_check_block(trace),
             # §3b-1, read off its own live object for the same reason.
-            input_check=_live_block(trace, "input_check_live"),
+            input_check=_live_block(trace, INPUT_CHECK_LIVE),
             # **A snapshot, not the live list.** The sampler stops when the job does and not
             # when the record is assembled, so handing `json.dumps` a list something may still be
             # appending to is handing it a list that can reallocate underneath the walk.

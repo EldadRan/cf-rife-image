@@ -71,15 +71,23 @@ ENV = "CF_RIFE_TIECHECK_CHUNK"
 #: through `_to_rgb24`, which expects `1xCxHxW` — and sized so the host side stays small against
 #: the 46.57 GiB slice.
 #:
-#: **PEAK HOST COST IS ROUGHLY `23x` THE CHUNK'S VALUE COUNT IN BYTES, and the first draft of
-#: this comment said `15x`.** Counted at the moment `routec.py:98`'s `.round()` allocates: the
-#: uint32 `arange` (4x, and it lives the whole iteration), the `.copy()` behind `values` (4x),
-#: `_to_rgb24`'s own `clamp` copy (4x), the `x255` product (4x) and the rounded result (4x) — 20x
-#: before the uint8 stages and before the previous iteration's three result arrays, which are
-#: still bound while the new chunk allocates. **At the default that is ~1.15 GB, not ~750 MB.**
-#: The two the earlier figure missed were the `arange` and the clamp copy inside the deployed
-#: function. Device peak is ~650 MB. *This is the number an operator reasons from when picking an
-#: override after an OOM, which is the only reason it is worth counting to this precision.*
+#: **PEAK HOST COST IS ROUGHLY `28x` THE CHUNK'S VALUE COUNT IN BYTES — ~1.4 GB at the default.**
+#: This figure has now been wrong twice and the reason is worth more than the number: it is
+#: recounted only when somebody remembers to, and both times the code moved underneath it. It
+#: said `15x` while missing the uint32 `arange` and `_to_rgb24`'s own clamp copy; it then said
+#: `23x` until arms B and C started importing `routec._to_rgb24_device`, which adds a
+#: `permute().contiguous()` copy, a `.cpu()` and a `.tobytes()` on top of `_proposed`'s own
+#: un-permute — roughly three more chunk-sized host buffers for arm C, and for arm B the whole
+#: host chain besides.
+#:
+#: Live at the peak, per chunk: the uint32 `arange` (4x, held the whole iteration), the `.copy()`
+#: behind `values` (4x), the deployed chain's clamp copy, `x255` product and rounded result
+#: (12x), the uint8 stages, and the previous iteration's three result arrays, still bound while
+#: the new chunk allocates. Device peak is ~650 MB.
+#:
+#: *It is counted to this precision because it is what an operator reasons from when picking an
+#: override after an OOM* — and **a number nobody recounts when the code changes is the number
+#: that sends them to a wrong chunk size with confidence.**
 #:
 #: **Overridable through `CF_RIFE_TIECHECK_CHUNK`** — because the one thing
 #: nobody can test from here is how this behaves on the card, and a sweep that dies on memory
@@ -123,7 +131,7 @@ def _chunk_size():
     return (asked // 3) * 3
 
 
-def _deployed(values, torch):
+def _deployed(values, torch, height=1):
     """ARM A — the shipped chain, called as itself.
 
     `values` is a 1-D float32 tensor whose length is a multiple of 3. Shaped `1x3x1xW` and handed
@@ -134,14 +142,14 @@ def _deployed(values, torch):
     import numpy as np  # noqa: PLC0415 — a GPU-box import, like every other numpy touch
     import routec  # noqa: PLC0415 — imported HERE so an unset run never reaches it
 
-    width = values.numel() // 3
-    frame = values.reshape(1, 3, 1, width)
+    width = values.numel() // (3 * height)
+    frame = values.reshape(1, 3, height, width)
     out = np.frombuffer(routec._to_rgb24(frame), dtype=np.uint8)
-    # `_to_rgb24` emits `HxWx3` after `transpose(1, 2, 0)`; this is `1xWx3` -> `3x1xW` -> flat.
-    return out.reshape(1, width, 3).transpose(2, 0, 1).reshape(-1)
+    # `_to_rgb24` emits `HxWx3` after `transpose(1, 2, 0)`; undone back to `3xHxW` -> flat.
+    return out.reshape(height, width, 3).transpose(2, 0, 1).reshape(-1)
 
 
-def _proposed(values, torch):
+def _proposed(values, torch, height=1):
     """ARMS B and C — **`routec._to_rgb24_device` itself, imported, not restated.**
 
     **§2g-2's OBLIGATION, DISCHARGED.** When this module was written the shipped chain did not
@@ -157,10 +165,10 @@ def _proposed(values, torch):
     import numpy as np  # noqa: PLC0415
     import routec  # noqa: PLC0415 — imported HERE so an unset run never reaches it
 
-    width = values.numel() // 3
-    frame = values.reshape(1, 3, 1, width)
+    width = values.numel() // (3 * height)
+    frame = values.reshape(1, 3, height, width)
     out = np.frombuffer(routec._to_rgb24_device(frame), dtype=np.uint8)
-    return out.reshape(1, width, 3).transpose(2, 0, 1).reshape(-1)
+    return out.reshape(height, width, 3).transpose(2, 0, 1).reshape(-1)
 
 
 def _alignment_ok(torch, device, log):
@@ -187,18 +195,27 @@ def _alignment_ok(torch, device, log):
     A failure aborts the sweep rather than reporting a number, because a misaligned sweep's
     number is worse than no number: it looks like an answer.
     """
-    width = 256
+    # **H IS 2, NOT 1, AND THAT IS THE WHOLE OF THIS LINE.** The sweep's own chunks are
+    # `1x3x1xW`, and with a height of one `.permute(1, 2, 0)` and `.permute(2, 1, 0)` produce
+    # BYTE-IDENTICAL buffers — a length-1 axis is free to move. So the control caught a channel
+    # -axis error and was blind to a height/width one, on a real frame the same edit shears the
+    # master. **That mattered more from the moment arms B and C started importing
+    # `routec._to_rgb24_device`**: the control now stands over the outbound function that ships,
+    # and its stated purpose is to catch exactly the transpose edit the import exists to expose.
+    height, width = 2, 128
     # **The pattern is rotated per CHANNEL so its period is the whole vector and not 256.** A
     # plain `i % 256` repeats once per channel, and a misalignment of exactly one channel — 256
     # positions, which is precisely what a wrong `transpose` produces — would have slid one
     # repeat onto the next and matched perfectly. **A control blind to the bug it exists for is
     # worse than no control**, and this one was, in its first draft. Each channel is still a
     # rotation of the full 0-255 range, so every output level is exercised in every channel.
-    expected = [(i % 256 + 85 * (i // 256)) % 256 for i in range(3 * width)]
+    count = 3 * height * width
+    expected = [(i % 256 + 85 * (i // 256)) % 256 for i in range(count)]
     values = torch.tensor([(k + 0.25) / 255.0 for k in expected], dtype=torch.float32)
-    for name, got in (("deployed", list(_deployed(values, torch))),
-                      ("torch-cpu", [int(v) for v in _proposed(values, torch)]),
-                      ("torch-cuda", [int(v) for v in _proposed(values.to(device), torch)])):
+    for name, got in (("deployed", list(_deployed(values, torch, height))),
+                      ("torch-cpu", [int(v) for v in _proposed(values, torch, height)]),
+                      ("torch-cuda",
+                       [int(v) for v in _proposed(values.to(device), torch, height)])):
         if len(got) != len(expected):
             log("[tiecheck] ALIGNMENT CONTROL FAILED on the {} arm: it returned {} values where "
                 "{} were expected. The sweep is NOT run.".format(name, len(got), len(expected)))
@@ -333,8 +350,15 @@ def run(log=print):
             # library (numpy against torch) or the device (host against card).
             "mismatches_library": by_library,
             "mismatches_device": by_device,
-            "arms": {"cpu": "routec._to_rgb24 (numpy, deployed)",
-                     "cuda": "clamp/mul/round/to(uint8) (torch, §3a)"},
+            # **Both labels name FUNCTIONS now, and the second one used to name a
+            # transcription that no longer runs.** Item 3 repointed arms B and C at
+            # `routec._to_rgb24_device` and this self-description was not moved with it, so the
+            # record would have told a reader — and CF, on the §2g-3 escalation — to attribute a
+            # non-zero count to a hand-written copy of §3a that had just been deleted. Every
+            # other signal in the block correct and the arm identifier belonging to code that
+            # was gone, which is the shape this project keeps finding.
+            "arms": {"cpu": "routec._to_rgb24 (numpy, the deployed host chain)",
+                     "cuda": "routec._to_rgb24_device (torch, the shipped device chain)"},
         }
         log("[tiecheck] swept {:,} of {:,}; {:,} mismatches in {:.1f}s "
             "(library {:,}, device {:,})".format(

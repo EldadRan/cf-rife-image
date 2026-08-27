@@ -109,7 +109,26 @@ def _to_tensor_device(frame_bgr, torch, device):
     it; the copy is on the `uint8`, which is a quarter the bytes the old path copied as float32.
     """
     up = torch.from_numpy(np.ascontiguousarray(frame_bgr)).to(device)
-    return up[..., [2, 1, 0]].permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+    wide = up[..., [2, 1, 0]].permute(2, 0, 1).float()
+    # **A DEVICE-SIDE SCALAR, NOT A PYTHON FLOAT, AND §3b'S SNIPPET SAYS `.div(255.0)`.**
+    # PyTorch's CUDA true-division kernel special-cases a CPU-scalar divisor by computing
+    # `a * (1/b)` rather than `a / b`, and its own source says that "may lose one bit of
+    # precision". `.div(255.0)` wraps the Python float into exactly that scalar; numpy's float32
+    # divide takes no such path. **In float32, `a/255` and `a*(1/255)` disagree on 126 of the 256
+    # uint8 values, first at 3, worst 5.96e-08 at 192** — reproduced from IEEE alone, since there
+    # is no torch on the machine this was written on.
+    #
+    # **Whether torch actually takes that path is NOT established here and must not be read as
+    # if it were**; it falsifies in one line on the card. A device tensor is not a CPU scalar, so
+    # the special case cannot apply either way: if the path was never taken this costs one
+    # negligible allocation, and if it was, it is the difference between a wave that lands and a
+    # wave whose own gate reports it broken on every frame.
+    #
+    # **The sharp edge is that a CPU-device exercise would not have shown it.** The CPU kernel's
+    # reciprocal shortcut is gated to reduced floating types, not float32 — so the gate passes on
+    # a CPU interpolator and fails only on the card, which is the check exercised from the one
+    # direction that hides the case it exists for.
+    return wide.div(torch.as_tensor(255.0, dtype=wide.dtype, device=wide.device)).unsqueeze(0)
 
 
 class InputCheck:
@@ -170,6 +189,13 @@ class InputCheck:
             new_host = new_tensor.detach().to("cpu")
             entry = peak_entry = None
             worst = 0.0
+            # **`torch.equal` first, and unlike `ConvertCheck`'s memcmp this one has no cheap
+            # path behind it.** On a frame that differs, the numpy work below allocates five
+            # full-resolution host buffers — ~400 MB at 4K — and if the divisor claim above holds
+            # that is EVERY frame rather than none. `argmax` over `flatnonzero` is inherited from
+            # `ConvertCheck` and saves the index array; nothing saves the subtraction, because
+            # `max_abs_delta` is the field §3b-1 grades and it needs the whole difference.
+            # **Stated rather than discovered on a box already running x264 at tens of GiB.**
             if not torch.equal(old_tensor, new_host):
                 old = old_tensor.reshape(-1).numpy()
                 new = new_host.reshape(-1).numpy()
@@ -502,11 +528,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             InputCheck() if input_check else None)
         stream, stats = variants.run(
             variant, interpolator,
-            _tensors(frames_from(capture, expect=(height, width), clock=clock), clock=clock,
-                     # **The interpolator's device, read off the interpolator.** §3b does the
-                     # inbound arithmetic where the model lives, so the producer has to know
-                     # that before the interpolator ever sees a tensor.
-                     device=interpolator.device, checker=input_checker),
+            # **The interpolator's device, read off the interpolator.** §3b does the inbound
+            # arithmetic where the model lives, so the producer has to know that before the
+            # interpolator ever sees a tensor.
+            _tensors(frames_from(capture, expect=(height, width), clock=clock),
+                     interpolator.device, clock=clock, checker=input_checker),
             # **The declared cadence, from the same object `n_in` was derived from.** These two
             # lines used to disagree: `source_frame_count` reads `source["fps"]` — the container's
             # `r_frame_rate` — while this read cv2's `CAP_PROP_FPS`, which is `avg_frame_rate`. A
@@ -818,7 +844,7 @@ def _read_peak(was_reset):
         return None
 
 
-def _tensors(frames, clock=None, device=None, checker=None):
+def _tensors(frames, device, clock=None, checker=None):
     """cv2 frames to tensors, lazily, one at a time — never a list, whatever the clip length.
 
     **This is `convert_in_s`, the INBOUND step** (§10a): the strided gather over the decoder's
@@ -829,6 +855,15 @@ def _tensors(frames, clock=None, device=None, checker=None):
     complains about — a boundary nobody can read — wearing the opposite sign.
     """
     import torch  # noqa: PLC0415 — the interpolator has already imported it by the time we run
+
+    # **`device` is positional and REQUIRED, and it used to default to `None`.** `Tensor.to(None)`
+    # matches the `to(device=None, dtype=None)` overload and returns `self` — so a caller who
+    # forgot it got a correct-valued tensor produced entirely on the host, `convert_in_s` back at
+    # its pre-wave value, and no error anywhere. **A wave that silently does not happen is worse
+    # than one that fails**, and a keyword with a benign default is how that gets shipped.
+    if device is None:
+        raise ValueError("_tensors needs the device the model lives on; None would convert on "
+                         "the host and report the wave as having no effect")
 
     for index, frame in enumerate(frames):
         # **Taken BEFORE the shipped conversion and outside its clock** — §5-0a's ordering rule,
