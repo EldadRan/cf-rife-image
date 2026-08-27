@@ -16,6 +16,8 @@ the import and `open_source` no longer takes a CLI it never used for anything el
 """
 import numpy as np
 
+import stages
+
 from errors import INVALID_SOURCE, WorkerError
 
 #: BGR uint8 out of cv2, RGB float in [0, 1] for RIFE, rgb24 bytes for the writer. Stated once
@@ -462,7 +464,27 @@ def _to_rgb24(tensor):
     return np.ascontiguousarray(array).tobytes()
 
 
-def frames_from(capture, expect=None, clock=None):
+class DecodeCount:
+    """How many frames the DECODER actually handed on. **One number, one owner.**
+
+    **`retime.n_in` is frames DECODED and never the source file's implied length** (ruled
+    2026-08-27). Derived from duration times rate it would be a description of the container;
+    counted here it is a description of what happened, and the identity
+    `input_check.frames == retime.n_in` then holds at every ratio — including a DECIMATING one,
+    where `_emit.advance_to` pulls one frame fewer than the file holds and a derived `n_in` would
+    have failed a clean run.
+
+    **Two counters in two modules, and neither reads the other.** This one is incremented in the
+    decoder; `InputCheck.frames` is incremented in the converter. That is what keeps the identity
+    evidence rather than a tautology — a single counter read twice would agree with itself no
+    matter what happened between them.
+    """
+
+    def __init__(self):
+        self.decoded = 0
+
+
+def frames_from(capture, expect=None, clock=None, count=None):
     """Decode the source into cv2 frames, in order, until it is exhausted.
 
     `expect` is the `(height, width)` the writer was told, checked once on the first frame.
@@ -492,6 +514,8 @@ def frames_from(capture, expect=None, clock=None):
                     "the decoder returns {}x{} frames but the container reports {}x{}; the "
                     "encode is sized from the container and would shear."
                     .format(frame.shape[1], frame.shape[0], expect[1], expect[0]))
+        if count is not None:
+            count.decoded += 1
         yield frame
 
 
@@ -526,12 +550,17 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # object that outlives the call is read by somebody with no way to know it is stale.
         input_checker = input_check if isinstance(input_check, InputCheck) else (
             InputCheck() if input_check else None)
+        # **Counted at the decoder, not derived from the container** — see `DecodeCount`. The
+        # plan above is still sized from `source_frame_count`, because a plan has to exist before
+        # anything is decoded; this is what the record reports afterwards.
+        decoded = DecodeCount()
         stream, stats = variants.run(
             variant, interpolator,
             # **The interpolator's device, read off the interpolator.** §3b does the inbound
             # arithmetic where the model lives, so the producer has to know that before the
             # interpolator ever sees a tensor.
-            _tensors(frames_from(capture, expect=(height, width), clock=clock),
+            _tensors(frames_from(capture, expect=(height, width), clock=clock,
+                                 count=decoded),
                      interpolator.device, clock=clock, checker=input_checker),
             # **The declared cadence, from the same object `n_in` was derived from.** These two
             # lines used to disagree: `source_frame_count` reads `source["fps"]` — the container's
@@ -713,13 +742,18 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
         return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
-                    # **`docs/conversion-wave.md` §3b-0 item 2.** The record carried `n_out`,
-                    # `n_copy`, `n_hold` and `n_synth` and never the count they were all derived
-                    # FROM. **A field this obviously missing was invisible until something needed
-                    # to be graded against it**: the inbound conversion runs once per SOURCE
-                    # frame, so `n_out` is the wrong reference and grading the inbound gate
-                    # against it would pass a comparison covering 40% of the work at 24->60.
-                    n_in=n_in,
+                    # **`docs/conversion-wave.md` §3b-0 item 2, and it is FRAMES DECODED.**
+                    # The record carried `n_out`, `n_copy`, `n_hold` and `n_synth` and never the
+                    # count they were all derived from — invisible until the inbound gate needed
+                    # grading against it, since that conversion runs once per SOURCE frame and
+                    # `n_out` would pass a comparison covering 40% of the work at 24->60.
+                    #
+                    # **Ruled as a definition rather than a tolerance** (2026-08-27): the
+                    # derived count describes the container, and at a DECIMATING ratio the plan
+                    # pulls one frame fewer than the file holds — `envelope` bounds `target_fps`
+                    # only as positive, so nothing refuses one. A derived `n_in` would have
+                    # failed a clean run on the identity the gate is graded by.
+                    n_in=decoded.decoded,
                     # **§5-0, and it travels beside `estimate` for the same reason** — `retime`
                     # is handed no `trace`. `handler._retime` lifts it to the record's TOP level
                     # rather than filing it under `retime`, because the kit grades
@@ -876,6 +910,19 @@ def _tensors(frames, device, clock=None, checker=None):
         else:
             with clock.timing("convert_in_s"):
                 tensor = _to_tensor_device(frame, torch, device)
+                # **§9b'S TRAP, ONE STAGE OVER, FOR THE THIRD TIME** — §9b at `_synthesise`,
+                # §10b at `_load_pair`, and now here. The `.to(device)` inside blocks, because a
+                # copy from pageable host memory synchronises; **everything after it does not.**
+                # The gather, the widen and the divide are enqueued and return, and their real
+                # cost lands at the next synchronisation — `stages.synchronise` inside
+                # `_load_pair`, charged to `convert_dev_s`. Unsynchronised, `convert_in_s` would
+                # be an upload clock wearing a conversion's name, **on the one number this wave
+                # is judged by.**
+                #
+                # Unlike §10b's, this wait is genuinely moved rather than added: the pad in
+                # `_load_pair` consumes this tensor, so the sync there was already waiting on
+                # this work. What changes is which field is charged.
+                stages.synchronise(tensor)
         # **Outside the timed block**, because the reference arm is the instrument and not the
         # shipped conversion; charging it to `convert_in_s` would corrupt the one number this
         # wave is judged by. It lands in `stage_residual_s`, reported and not absorbed.

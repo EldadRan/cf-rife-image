@@ -260,6 +260,72 @@ def _sentinels(torch, device):
     return out
 
 
+#: The inbound domain: every `uint8` a decoder can hand over. **256 values, not a billion** —
+#: `_to_tensor` reads `uint8` and the whole input space is one byte wide, so this arm is
+#: exhaustive at a cost that rounds to nothing.
+INBOUND_DOMAIN = 256
+
+
+def _inbound(log):
+    """§3b's inbound chain, host against device, over EVERY `uint8`. **Never raises.**
+
+    **THIS EXISTS BECAUSE A PREMISE WAS UNPROVEN AND THIS PROJECT'S ANSWER TO THAT IS A
+    MEASUREMENT.** §3b-1 rests on both inbound paths doing one divide by 255.0 and therefore
+    being bit-identical. **PyTorch's CUDA true-division kernel special-cases a CPU-SCALAR divisor
+    by computing `a * (1/b)`**, and in float32 that disagrees with `a / b` on 126 of the 256
+    `uint8` values — first at 3, worst 5.960464e-08 at 192, reproduced from IEEE alone. So
+    `.div(255.0)` as §3b's snippet spells it might not be a divide at all.
+
+    `routec._to_tensor_device` now divides by a device-side scalar tensor, which the special case
+    cannot reach. **That AVOIDS the question and this ANSWERS it** — and the difference matters,
+    because a docstring saying *"torch might do this so we did something else"* is a claim nobody
+    ever closes. The domain is 256 values wide, so the reading is free.
+
+    **The sharp edge, and it is why a CPU-only exercise would have proved nothing:** the CPU
+    kernel's reciprocal shortcut is gated to reduced floating types, not float32. **A CPU-device
+    run passes cleanly and only the card can fail**, which is the check exercised from the one
+    direction that hides the case it exists for.
+    """
+    import numpy as np  # noqa: PLC0415
+    import routec  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    out = {"swept": 0, "mismatches": 0, "max_abs_delta": 0.0, "first": [],
+           "divisor_is_reciprocal": None}
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        # One pixel per value, `1x1x3` BGR, which is the shape a decoder hands `_to_tensor`.
+        frame = np.arange(INBOUND_DOMAIN, dtype=np.uint8).reshape(INBOUND_DOMAIN, 1, 1)
+        frame = np.ascontiguousarray(np.repeat(frame, 3, axis=2))
+        host = routec._to_tensor(frame, torch)
+        dev = routec._to_tensor_device(frame, torch, device).detach().to("cpu")
+        a = host.reshape(-1).numpy()
+        b = dev.reshape(-1).numpy()
+        differ = np.flatnonzero(a != b)
+        out["swept"] = int(a.size)
+        out["mismatches"] = int(differ.size)
+        if differ.size:
+            delta = np.abs(a - b)
+            out["max_abs_delta"] = float(delta.max())
+            for i in differ[:16]:
+                out["first"].append({"index": int(i), "old": float(a[i]), "new": float(b[i])})
+        # **The question itself, asked directly rather than inferred from the arms.** A CPU-scalar
+        # divide on the card against the same values times the float32 reciprocal: equal means
+        # torch took the reciprocal path, and the premise §3b rested on was false.
+        probe = torch.arange(INBOUND_DOMAIN, dtype=torch.float32, device=device)
+        scalar = probe.div(255.0)
+        exact = probe.div(torch.as_tensor(255.0, dtype=torch.float32, device=device))
+        out["divisor_is_reciprocal"] = not bool(torch.equal(scalar, exact))
+        log("[tiecheck] inbound: {} of {} uint8 values differ, max {:.3e}; the CPU-scalar "
+            "divisor {} the reciprocal path".format(
+                out["mismatches"], out["swept"], out["max_abs_delta"],
+                "TAKES" if out["divisor_is_reciprocal"] else "does not take"))
+    except Exception as exc:  # noqa: BLE001 — an errand must never cost a delivered master
+        out["error"] = "{}: {}".format(type(exc).__name__, str(exc)[:160])
+        log("[tiecheck] inbound arm did not complete ({})".format(out["error"]))
+    return out
+
+
 def run(log=print):
     """Sweep the domain and return `(block, reason)`. **Never raises.**
 
@@ -350,6 +416,10 @@ def run(log=print):
             # library (numpy against torch) or the device (host against card).
             "mismatches_library": by_library,
             "mismatches_device": by_device,
+            # **§3b's inbound chain, and it turns an unproven premise into a reading.** The
+            # outbound sweep above tested `clamp/mul/round/uint8`; this is a DIVIDE, and a
+            # neighbouring proof is not this proof.
+            "inbound": _inbound(log),
             # **Both labels name FUNCTIONS now, and the second one used to name a
             # transcription that no longer runs.** Item 3 repointed arms B and C at
             # `routec._to_rgb24_device` and this self-description was not moved with it, so the
