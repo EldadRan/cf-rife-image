@@ -45,6 +45,41 @@ from errors import Remedy, WorkerError
 
 WORKER_VERSION = os.environ.get("WORKER_VERSION", "0.1.0-dev")
 
+#: `docs/conversion-wave.md` §2g-1's gate. **THE AUTHORITY FOR THIS NAME IS `tiecheck.ENV` AND
+#: THIS IS A DELIBERATE RESTATEMENT OF IT**, which the shared law permits only when a pointer
+#: genuinely will not do — so here is why it will not. **The whole content of §2g-1's third
+#: constraint is that an unset run never imports the sweep**, and importing `tiecheck` to ask it
+#: what its own env var is called is the import being avoided. A read of `os.environ` cannot be
+#: done through a module you are refusing to load.
+#:
+#: **The NAME is all that is restated.** What counts as switched on — `0`, `false`, `off` and the
+#: rest — lives in `tiecheck.requested()` alone, because a second copy of a list is a list that
+#: rots in one place, and this one decides whether a billion-comparison sweep runs.
+TIECHECK_ENV = "CF_RIFE_TIECHECK"
+
+
+def tiecheck_requested():
+    """Is §2g's sweep switched on? **Two tests, and the split is the whole design.**
+
+    The first is a `str.strip()` on an environment variable and it is what every ordinary job
+    pays: unset means unset, and nothing is imported. **Only a job that actually set the variable
+    reaches the second**, which imports `tiecheck` and asks it — so the off-spellings have one
+    home and a run that wrote `CF_RIFE_TIECHECK=0` pays one module import to be told no.
+
+    **That is not a hole in §2g-1's third constraint.** The constraint is that the instrument is
+    absent from *the runs nobody is asking about*, and a run that set the variable by hand is not
+    one of those. `F-2026-08-26-3` is about instruments that ride along uninvited.
+    """
+    if not (os.environ.get(TIECHECK_ENV) or "").strip():
+        return False
+    try:
+        import tiecheck  # noqa: PLC0415 — reached only when the variable is set to something
+    except Exception as exc:  # noqa: BLE001 — an errand must never cost a delivered master
+        print("[tiecheck] {} is set but the module would not import ({}: {}); "
+              "the job is unaffected.".format(TIECHECK_ENV, type(exc).__name__, str(exc)[:120]))
+        return False
+    return tiecheck.requested()
+
 
 def build_identity():
     """What code produced this result, in a form that survives the run.
@@ -379,6 +414,41 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         warnings.append("the fit predicate could not price this job: the hardware snapshot "
                         "reports no vram_total_gb, so nothing was checked")
 
+    # **The tie check, and the environment is read BEFORE the module is imported** — §2g-1's
+    # third constraint is that an unset run pays nothing, and an import at the top of this file
+    # would be a module read and a parse on every cold start of every job nobody is asking about.
+    # `requested()` is a `str.strip()` on an env var; the sweep behind it is a billion
+    # comparisons. **`F-2026-08-26-3` is the standing lesson**: an instrument present in the runs
+    # it is not being asked about changes what it measures.
+    #
+    # **Here rather than after the retime, and the reason is the run-record.** `trace` is what a
+    # crashed run's numbers survive in, so a sweep banked before the interpolate loop is a sweep
+    # that still reaches the record if the retime then dies — and the sweep is the deliverable on
+    # this job, while the retime is what keeps the job from being spent purely on an errand
+    # (§2g-1). It runs after the fit predicate has refused or passed, so it never allocates on a
+    # card the job was about to be turned away from.
+    if tiecheck_requested():
+        import tiecheck  # noqa: PLC0415 — see above; the import IS the cost being avoided
+
+        progress.phase("load", pct=2, force=True, note="tie check")
+        # **Wrapped in `keeping_the_promise`, because the sweep is a longer callback-free stretch
+        # than the drain that class was written for.** One payload is minted on the line above and
+        # then nothing calls back until a billion comparisons have finished — from outside, a
+        # frozen `at` on a `/status` that keeps answering is indistinguishable from a dead worker,
+        # which is the 11-minute silence `progress.keeping_the_promise` documents. It would be
+        # that silence on the one job the sweep was asked for.
+        with progress.keeping_the_promise():
+            swept, why_not = tiecheck.run()
+        # **Guarded, because `trace` is documented as optional on this path** and every other
+        # writer in this function respects that. Unguarded, a direct caller with the variable set
+        # would take a `TypeError` AFTER the sweep had finished and thrown its result away.
+        if trace is not None:
+            trace["tie_check"] = swept
+        # **The reason rides the record, not the log** — see `tiecheck.run`. Four distinct
+        # failures otherwise produce a record byte-identical to a run that never asked.
+        if why_not:
+            warnings.append(why_not)
+
     progress.phase("load", pct=3, force=True, note="interpolator")
     # **`load_s` is the one §9a stage that happens outside `routec`** — the checkpoint read and
     # the cast, which `progress.begin_phase` deliberately excludes from the per-frame rate and
@@ -616,6 +686,11 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             attempts=attempts,
             output=(trace or {}).get("output"),
             retime=(trace or {}).get("retime"),
+            # §2g-2. Absent on every run that did not sweep, which is every run: the kit's
+            # `--tie-check` REQUIRES the block rather than shrugging when it is missing, so a
+            # null here would read as "swept and found nothing" to nobody and as a missing field
+            # to the one caller that grades it.
+            tie_check=(trace or {}).get("tie_check"),
             # **A snapshot, not the live list.** The sampler stops when the job does and not
             # when the record is assembled, so handing `json.dumps` a list something may still be
             # appending to is handing it a list that can reallocate underneath the walk.

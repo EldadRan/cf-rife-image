@@ -126,7 +126,7 @@ def build_stub(build_identity, machine, request=None, rationale=None, source=Non
 def build(status, build_identity, machine, request=None, rationale=None, source=None,
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
-          retime=None, transfer=None, eta=None, estimate=None):
+          retime=None, transfer=None, eta=None, estimate=None, tie_check=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -194,6 +194,13 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         "attempts": attempts or [],
         "warnings": list(warnings or []),
     }
+    # **`docs/conversion-wave.md` §2g-2, and OMITTED rather than nulled when it did not run.**
+    # Every ordinary job is a job that did not sweep, so a `null` here would be a field on every
+    # record in the corpus saying nothing. The kit's `--tie-check` REQUIRES the block and grades
+    # its absence, which is the behaviour that makes "the sweep did not happen" distinguishable
+    # from "the sweep found nothing" — the distinction `F-2026-08-25-2` is about.
+    if tie_check:
+        body["tie_check"] = tie_check
     if progress is not None:
         body["seconds_per_frame"] = progress.seconds_per_frame()
     if error:
