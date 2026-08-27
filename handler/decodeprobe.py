@@ -19,8 +19,22 @@ meaningful rather than decorative:
     bgr_s       rawvideo bgr24 to /dev/null     adds swscale's yuv->BGR
 
 **IT IS NOT THE FIX.** `OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;8"` is a Dockerfile `ENV` and
-costs no code; this probe is what says whether it worked and what is left. **`decode_s` unchanged
-after that lands is itself the answer**, not a null result.
+costs no code. **What this probe cannot do is say whether the BACKEND honoured it** — that
+variable is OpenCV's and these passes shell out to the ffmpeg CLI, which never reads it. So
+`decode_s` unchanged after the ENV lands reads two ways, *"honoured and threading did not help"*
+and *"never reached the decoder"*, and nothing here separates them.
+
+**WHAT IT DOES ANSWER IS THE BETTER QUESTION, AND IT NEEDS NO SECOND RUN.** `decode_s` wraps
+`capture.read()` (`routec.py:620`), which is the cv2 path and returns BGR; `bgr_s` is ffmpeg
+decoding the SAME source to the SAME format. **So `decode_s` against `bgr_s` is cv2 against
+ffmpeg on identical work, inside one record, with no A/B and no second job.**
+
+- **Close** — the capture backend is fine and the ENV is not the lever, whatever it did.
+- **`decode_s` far larger** — the capture path is the defect regardless of what the variable did,
+  and that is worth knowing before anyone spends two runs toggling an environment variable.
+
+*One asymmetry, small and stated rather than discovered: `decode_s` also covers the surplus
+`grab()` sweep at `routec.py:847`, which is bounded at two frames by `SURPLUS_TOLERANCE_FRAMES`.*
 
 **IT DOES NOT TOUCH `decode_s`.** The stage clock is unchanged, so a probed run's `decode_s`
 stays comparable to every unprobed one — and the probe re-decodes the source three times, so a
