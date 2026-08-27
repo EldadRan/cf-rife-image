@@ -494,24 +494,6 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         audio_source=source_path if request["keep_audio"] else None,
         variant=request.get("force_variant") or "direct", scale=scale, clock=clock)
 
-    # **`docs/instrumentation.md` §11, and it runs AFTER the retime for one reason: `frames`.**
-    # §11c grades the block against `retime.n_in`, which is the DECODER'S count and does not
-    # exist until the decode has happened. Running the probe first would mean either recounting
-    # the source here — a second answer to "how long is this clip" — or filing a block whose
-    # frame count came from the container rather than from what was decoded.
-    #
-    # **Banked in `trace` rather than returned**, so a run that dies in the upload still files
-    # what the probe measured. The import is inside the branch: an unasked run pays not one
-    # module read, which is §2g-1's surviving constraint and this project's standing lesson about
-    # instruments that ride along uninvited.
-    if request.get("decode_probe"):
-        import decodeprobe  # noqa: PLC0415 — the import IS the cost being avoided
-
-        progress.phase("interpolate", pct=97, force=True, note="decode probe")
-        probe_block = decodeprobe.run(source_path, stats.get("n_in"))
-        if trace is not None:
-            trace["decode_probe"] = probe_block
-
     client = storage.client_for(request["output"])
     # **The upload's own clock and byte count, same rule as the fetch** (§8a). The size is read
     # before the PUT rather than after it: the object on the far side is what the byte count is
@@ -525,6 +507,32 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     finally:
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
     _note(trace, "transfer", "upload_bytes", upload_bytes)
+
+    # **`docs/instrumentation.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
+    # It sat between the finished master and its upload, where three full re-decodes at a
+    # half-hour timeout each put **up to 5400 seconds between a master existing on disk and
+    # existing anywhere else.** The master lives in `workdir`, which `handle`'s `finally`
+    # removes, so an execution timeout or a reap during the probe would have destroyed a master
+    # that was already made — and no exception handling inside the probe covers that, because it
+    # is not an exception. **A probe must never cost a delivered master, and in that position it
+    # could.** Below the upload it costs only itself.
+    #
+    # **After the retime for a second reason that still holds: `frames`.** §11c grades the block
+    # against `retime.n_in`, the DECODER'S count, which does not exist until the decode has
+    # happened — the alternative was recounting the source here, a second answer to "how long is
+    # this clip".
+    #
+    # **Wrapped in `keeping_the_promise`**, which the tie check eighty lines above already uses
+    # for the same reason: nothing calls back into `Progress` for the whole of three decodes, and
+    # a frozen `/status` on a healthy worker is the 11-minute silence that class was written for.
+    if request.get("decode_probe"):
+        import decodeprobe  # noqa: PLC0415 — an unasked run pays not one module read
+
+        progress.phase("upload", pct=99, force=True, note="decode probe")
+        with progress.keeping_the_promise():
+            probe_block = decodeprobe.run(source_path, stats.get("n_in"))
+        if trace is not None:
+            trace["decode_probe"] = probe_block
 
     # **The same `output` shape the upscale path returns, and that is a correction rather than a
     # choice.** Route C first returned `{"master": key}` — a shape nobody reads. `run_one` takes

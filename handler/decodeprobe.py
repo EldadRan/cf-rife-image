@@ -31,7 +31,13 @@ per CF's rule that a per-job control belongs in the request.
 import subprocess
 import time
 
-#: §11a, verbatim. Named here so the record, this module and the kit read one list.
+#: §11a, verbatim — the five fields the kit grades. **`run` asserts the block carries all of
+#: them rather than this sitting here unread**: the first cut declared this tuple, built the
+#: block from a dict literal, and nothing ever compared the two. A list named as the single
+#: source of truth that nothing consults is worse than no list, because the next person trusts it.
+#:
+#: The block also carries `capture_options` and `elapsed_s`, which §11a does not name and the kit
+#: ignores. This tuple is the REQUIRED set, not the exact one.
 FIELDS = ("entropy_s", "yuv_s", "bgr_s", "frames", "threads")
 
 #: The env var item 2 sets on the image. Reported so a reading can be attributed to a
@@ -44,9 +50,35 @@ CAPTURE_OPTIONS_ENV = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
 TIMEOUT_S = 1800
 
 
+#: **`-map 0:v:0` and `-an` on EVERY pass, and their absence was a real defect.** `-f null -`
+#: maps every stream, so the entropy pass decoded the source's AUDIO and re-encoded it to
+#: pcm_s16le while the two rawvideo passes mapped video only. `entropy_s` then carried work the
+#: other two did not — and that `cv2.VideoCapture.read()`, the thing `decode_s` measures, never
+#: does either.
+#:
+#: **Three consequences, and the third is the one that would have wasted somebody's day.**
+#: `entropy_s` was not the floor it is named as; `yuv_s - entropy_s` was contaminated and could
+#: come out NEGATIVE; and §11c's ordering check failed on a perfectly healthy audio-bearing
+#: source, under a log line reading *"this cannot happen unless the probe is measuring something
+#: other than what it names"*. Measured on two clips identical but for the audio stream: 4 of 4
+#: out of order with audio, 4 of 4 ordered without.
+#:
+#: **The end-to-end exercise that passed was on a clip with no audio track**, which is exactly
+#: the case where this is invisible.
+_VIDEO_ONLY = ("-map", "0:v:0", "-an")
+
+#: **Threading is stated rather than inherited.** The ffmpeg CLI does not read
+#: `OPENCV_FFMPEG_CAPTURE_OPTIONS` — that variable is OpenCV's — so these passes would otherwise
+#: run at ffmpeg's own `-threads 0` auto default while the block reported OpenCV's setting beside
+#: them. **A number measured under one configuration and labelled with another is the shape this
+#: project keeps finding**, so the passes name their own and the block reports both.
+PROBE_THREADS = "8"
+
+
 def _pass(args, path, label, log):
     """One ffmpeg decode, wall-clocked. Returns seconds, or `None` if it did not complete."""
-    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", path] + args
+    command = (["ffmpeg", "-v", "error", "-nostdin", "-threads", PROBE_THREADS, "-i", path]
+               + list(_VIDEO_ONLY) + args)
     started = time.perf_counter()
     try:
         completed = subprocess.run(command, stdout=subprocess.DEVNULL,
@@ -76,6 +108,15 @@ def run(path, frames, log=print):
 
     started = time.perf_counter()
     try:
+        # **Checked BEFORE the first subprocess, not after the third.** The first cut built the
+        # block at the end with `int(frames)` in it, so a `None` threw after up to 5400 s of
+        # completed measurement and discarded all of it. A guard on a value known before any
+        # work starts belongs before the work.
+        frames = int(frames)
+    except Exception:  # noqa: BLE001
+        log("[decode-probe] no decoded frame count to price the passes against; not run")
+        return None
+    try:
         # **`-f null` first, and it is the only pass with no output buffer at all.** Entropy
         # decoding and nothing else, which is the floor.
         entropy = _pass(["-f", "null", "-"], path, "entropy", log)
@@ -90,12 +131,28 @@ def run(path, frames, log=print):
                 "filed with a hole, because §11c grades an ORDERING and two of three numbers "
                 "cannot be ordered")
             return None
-        block = {"entropy_s": entropy, "yuv_s": yuv, "bgr_s": bgr, "frames": int(frames),
-                 "threads": os.environ.get(CAPTURE_OPTIONS_ENV) or "unset",
+        block = {"entropy_s": entropy, "yuv_s": yuv, "bgr_s": bgr, "frames": frames,
+                 # **`threads` is what THESE PASSES ran at**, which is what the three seconds
+                 # beside it were measured under. The capture backend's setting is a different
+                 # fact about a different decoder and gets its own key rather than borrowing this
+                 # one — the probe shells out to the ffmpeg CLI and never goes through OpenCV, so
+                 # it cannot report on the backend by measuring itself.
+                 "threads": PROBE_THREADS,
+                 "capture_options": os.environ.get(CAPTURE_OPTIONS_ENV) or "unset",
                  "elapsed_s": round(time.perf_counter() - started, 3)}
+        missing = [f for f in FIELDS if f not in block]
+        if missing:
+            log("[decode-probe] block is missing {} — not filed".format(", ".join(missing)))
+            return None
+        # **The two thread facts are printed as two facts.** The first draft of this line
+        # formatted `block["threads"]` — which is what THESE passes ran at — under the
+        # `OPENCV_FFMPEG_CAPTURE_OPTIONS` label, so the log said `OPENCV_FFMPEG_CAPTURE_
+        # OPTIONS=8` on a box where that variable was unset. The field split of F5 was
+        # pointless if the log put them back together.
         log("[decode-probe] entropy {:.1f}s, +yuv {:.1f}s, +bgr {:.1f}s over {} frames "
-            "({}={})".format(entropy, yuv - entropy, bgr - yuv, block["frames"],
-                             CAPTURE_OPTIONS_ENV, block["threads"]))
+            "(these passes: -threads {}; capture backend: {}={})".format(
+                entropy, yuv - entropy, bgr - yuv, block["frames"], block["threads"],
+                CAPTURE_OPTIONS_ENV, block["capture_options"]))
         # **Reported, not enforced.** §11c is the kit's check and this is the worker's own
         # reading of it — a probe that refused to file an out-of-order result would delete the
         # evidence that it measured something other than what it names.

@@ -442,6 +442,19 @@ def _to_rgb24_device(tensor, staging=None):
     return staging.fetch(frame)
 
 
+class StagingInvariantViolated(Exception):
+    """§3c-1's invariant broke. **Its own type, and the reason is that `RuntimeError` is not one.**
+
+    The first cut raised `RuntimeError` here and re-raised it past the fallback with
+    `except RuntimeError: raise`. **Torch reports essentially every failure as `RuntimeError`** —
+    a failed `cudaHostAlloc` behind `pin_memory=True`, `torch.cuda.OutOfMemoryError` (a subclass),
+    a device fault in `copy_` — so that clause did not distinguish this invariant from an
+    allocation failure. **A pinned-allocation failure under host-memory pressure would have
+    killed a job that delivered a master before this wave**, which is the opposite of what a
+    speed-up may cost.
+    """
+
+
 class PinnedStaging:
     """A reused page-locked destination for the device-to-host copy — §3c-1. **Never raises.**
 
@@ -468,9 +481,21 @@ class PinnedStaging:
     **Which is exactly what a future write-behind queue would break**, silently, on a buffer
     whose previous contents are still in flight.
 
-    **So it is ASSERTED here rather than relied on.** `_armed` is set when a buffer is handed out
-    and cleared when the write returns; refilling while armed refuses. The check costs a boolean
-    per frame and it is the difference between an invariant and a comment about one.
+    **WHAT `_armed` ACTUALLY CATCHES, STATED PRECISELY, BECAUSE THE FIRST DRAFT OF THIS
+    DOCSTRING OVERSTATED IT IN BOTH DIRECTIONS.**
+
+    - **It is not what protects the present.** `.tobytes()` always returns a fresh immutable
+      copy, so the payload handed to `writer.write` never aliases this buffer no matter what the
+      writer does. **`.tobytes()` is today's guarantee; `write` blocking is not the operative
+      one**, and the invariant cannot be violated on this path at all.
+    - **It does not catch the write-behind queue either.** `released()` is called by the write
+      loop on the line after `write` returns, unconditionally — so a queue that returns on ENQUEUE
+      clears the flag just the same and the next frame refills happily. **Making that case real
+      needs `released()` called by whoever finished with the BYTES**, not by the loop.
+    - **What it does catch is a restructured loop**: a second `fetch` with no intervening
+      `released()` at all — a frame converted twice, a `released()` dropped in a refactor, a
+      second producer sharing one instance. That is worth a boolean and it is not nothing. It is
+      also not the invariant §3c-1 names, and a reader who believed it was would stop looking.
     """
 
     def __init__(self):
@@ -490,16 +515,22 @@ class PinnedStaging:
 
         try:
             if self._armed:
-                raise RuntimeError(
+                raise StagingInvariantViolated(
                     "the pinned staging buffer was refilled before the previous frame's write "
                     "returned. §3c-1's invariant is violated and the previous frame's bytes may "
                     "still be in flight to ffmpeg; this refuses rather than delivering a master "
                     "whose frames are a copy of each other")
-            shape = tuple(frame.shape)
+            # **Keyed on `(shape, dtype)` and not on shape alone.** `Tensor.copy_` CONVERTS
+            # rather than refusing, so a buffer allocated for one dtype silently truncates a
+            # frame of another — producing a payload of the correct LENGTH, which passes
+            # `MasterWriter.write`'s `len()` guard and every frame-count check there is.
+            # Unreachable today: `_to_rgb24_device` ends `.to(_uint8())` invariantly. One tuple
+            # compare against a silent-corruption class is not a trade worth thinking about.
+            shape = (tuple(frame.shape), frame.dtype)
             if self._buffer is None or self._shape != shape:
                 # **Allocated once per shape, which on this path means once.** A retime that
                 # changed frame size mid-clip is already refused upstream by `_load_pair`.
-                self._buffer = torch.empty(shape, dtype=frame.dtype,
+                self._buffer = torch.empty(shape[0], dtype=frame.dtype,
                                            device="cpu", pin_memory=True)
                 self._shape = shape
             self._buffer.copy_(frame)
@@ -510,7 +541,9 @@ class PinnedStaging:
             # its first dimension. The copy `tobytes` makes is ~3.2 s of the 65.4 at 8K; the
             # allocation and the un-pinned transfer are the rest, and they are what this removes.
             return self._buffer.numpy().tobytes()
-        except RuntimeError:
+        except StagingInvariantViolated:
+            # **The one thing that must escape.** Everything else falls back; this is a
+            # correctness violation and delivering past it would deliver duplicated frames.
             raise
         except Exception:  # noqa: BLE001 — a speed-up must never cost a delivered master
             self._armed = False
