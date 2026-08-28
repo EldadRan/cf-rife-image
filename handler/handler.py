@@ -471,6 +471,22 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     if trace is not None and input_checker is not None:
         trace[INPUT_CHECK_LIVE] = input_checker
 
+    # **§6d's provenance container, HANDED IN AND BANKED BEFORE THE ENCODE.**
+    #
+    # **The branch itself is NOT here, and that is §6d-1's correction.** It keys on the DELIVERED
+    # frame — `width * height` of what `MasterWriter` is constructed with — and this function
+    # holds `probe.probe_source`'s dimensions, which are a different reader's answer. The branch
+    # lives in `routec.retime`, at the two locals the writer is built from, so the branch and the
+    # encode cannot disagree about how big the frame is.
+    #
+    # **An empty dict rather than a return value**, for `ConvertCheck`'s reason exactly: `retime`
+    # fills it in place, and this object is already in `trace` by then — so a run reaped inside
+    # ffmpeg still files what its encoder settings were resolved from. A provenance travelling
+    # out in `stats` would be null on precisely the runs worth recording.
+    encode_defaults = {}
+    if trace is not None:
+        trace["encode_defaults"] = encode_defaults
+
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
         source, source_path, master_path, interpolator,
@@ -478,15 +494,35 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
             request, source["width"], source["height"]),
         snap_tolerance=config["snap_tolerance"],
         crf=request.get("crf"),
-        # **§6a's other four, each already defaulted by `validation`.** Passed by name rather than
+        # **§6a's other four. `preset` is still `validation`'s to default; the three below are
+        # §6d's and arrive already resolved from the branch above.** Passed by name rather than
         # assembled here: the worker builds the encoder's parameter string from validated fields
         # and never accepts one, which §6a rules and `encoder.x264_params` implements.
         preset=request.get("preset"),
+        # **PASSED THROUGH AS `None` WHERE THE CALLER SENT NOTHING**, which is the whole of §6d's
+        # mandatory property: absence stays distinguishable from a value all the way to the
+        # branch, and the branch is downstream in `retime` where the delivered frame exists.
         threads=request.get("threads"),
         sliced_threads=request.get("sliced_threads"),
         convert_check=checker,
         input_check=input_checker,
         rc_lookahead=request.get("rc_lookahead"),
+        encode_defaults=encode_defaults,
+        # **`docs/instrumentation.md` §8g-1's other half, and it is the half that makes the kit's
+        # decline honest rather than convenient.** §8g-1 lets the acceptance kit DECLINE TO GRADE
+        # an armed run's first ETA, because the instruments land in `wall_s` and §12 rules that
+        # pollution not recoverable by subtraction. **A gate that looks away while the estimate
+        # says nothing would hand an armed run's caller a silently wrong ETA**, which is a worse
+        # arrangement than the failing row it replaces — so the estimate names the instruments and
+        # the decline follows from something the answer said out loud.
+        #
+        # **Read off the REQUEST and not off the two live objects below it.** `convert_check` and
+        # `input_check` reach `retime` as objects, but `tie_check` and `decode_probe` do not reach
+        # it at all — they run in this function. Deriving the list from what `retime` happens to
+        # hold would silently answer for two of the four, which is the shape of a check that runs
+        # in the direction the code takes.
+        armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe")
+               if request.get(field)],
         # **Passed at last.** `retime` has declared this parameter since it was written and
         # `_retime` never supplied it, so the retime path published two payloads for a
         # 239-second job — `progress_emitted: 2`, the worker counting its own silence.
@@ -737,6 +773,15 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             attempts=attempts,
             output=(trace or {}).get("output"),
             retime=(trace or {}).get("retime"),
+            # §13. **Read out of `trace`, which is where the branch banked it before the encode
+            # began**, so a run reaped in ffmpeg still files what its settings were resolved from.
+            # Null on any run that died before the branch, which is the honest shape of a job
+            # whose encode was never configured.
+            # §13a: **present-and-null, never omitted.** The branch runs on every job, so an
+            # absent block is a defect and not a state — but the container is created before the
+            # branch, so an empty dict means "died before it ran" and must file as null rather
+            # than as `{}`, which would read as a provenance that was recorded and said nothing.
+            encode_defaults=(trace or {}).get("encode_defaults") or None,
             # §2g-2. Absent on every run that did not sweep, which is every run: the kit's
             # `--tie-check` REQUIRES the block rather than shrugging when it is missing, so a
             # null here would read as "swept and found nothing" to nobody and as a missing field

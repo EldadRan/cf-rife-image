@@ -127,7 +127,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
-          convert_check=None, input_check=None, decode_probe=None):
+          convert_check=None, input_check=None, decode_probe=None, encode_defaults=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -168,6 +168,20 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # worse than one with a gap because the gap is visible. Null on any path that produces no
         # retime, which is every upscale path and every refusal before the loop.
         "retime": retime,
+        # **WHO CHOSE the three encoder-thread settings** (`docs/instrumentation.md` §13). The
+        # settings themselves are in `retime`, read off the writer that ran, and they always
+        # were — what no existing field can say is which of §6d's two rows fired, or whether a
+        # caller overrode it. **A row reading `threads=16 sliced_threads=1` is produced
+        # identically by the large row firing and by a caller sending those two values at 4K**,
+        # and the corpus cannot separate two different experiments that print the same.
+        #
+        # **PRESENT-AND-NULL, not omitted, and that is the difference from `tie_check` below.**
+        # Those blocks are opt-in diagnostics, so their absence is a state — the run did not arm
+        # them — and omitting them is what keeps "did not run" distinguishable from "ran and
+        # found nothing". **The branch runs on every job.** So an absence here is a run that died
+        # before the encode was configured, or a defect, and never a choice — and §13's whole
+        # argument is that provenance must not have to be inferred from silence.
+        "encode_defaults": encode_defaults,
         "rationale": rationale,
         "source": source,
         "output": output,

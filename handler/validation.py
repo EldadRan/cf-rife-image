@@ -674,10 +674,24 @@ def validate(job_input):
                 "at.".format(", ".join(encoder.PRESETS), preset, encoder.DEFAULT_PRESET),
             )
 
+    # ── §6d's three fields. **UNSET STAYS `None` ALL THE WAY OUT OF HERE.** ────────────────────
+    #
+    # **This function used to resolve all three to constants, and §6d refuses that on sight.**
+    # `validate` runs at `handler.py:200` and the source is not probed until `:344`, so the padded
+    # area does not exist yet at this line and the branch cannot live here. It lives downstream,
+    # at the call site that hands the settings to the encoder — and once a default has been filled
+    # in HERE, that site cannot tell *"the caller asked for threads=4"* from *"the caller asked
+    # for nothing and validation supplied 4"*. **A branch there would silently overwrite an
+    # explicit caller value**, which is the clause of §6b that survives §6d.
+    #
+    # So the range checks stay exactly where they were — a sent value is still refused outside
+    # its range, with the same coded error — and only the DEFAULTING moves. `None` reaching
+    # `encoder.resolve_defaults` means the caller sent nothing, and that is the whole mechanism.
+    #
+    # **`crf` and `preset` above are untouched and still resolve here**, because §6d's table
+    # decides three fields and says nothing about either of them.
     threads = params.get("threads")
-    if threads is None:
-        threads = encoder.DEFAULT_THREADS
-    else:
+    if threads is not None:
         threads = _as_int(threads, "threads")
         if not encoder.THREADS_MIN <= threads <= encoder.THREADS_MAX:
             raise WorkerError(
@@ -686,17 +700,36 @@ def validate(job_input):
                 # will try: it is x264's spelling of *auto*, and auto on this worker's 96-core
                 # host is 128 frame-threads — the configuration that filled 46 GiB and got the
                 # first 8K run reaped. Refusing it silently would look like an off-by-one.
+                #
+                # **The closing sentence no longer names a constant, because there no longer is
+                # one.** It used to end *"{} is the default and what every measurement in its
+                # calibration was taken at"*, naming `encoder.DEFAULT_THREADS`. Under §6d an
+                # unset field is filled from the area table, so that sentence became false on the
+                # wire the day the branch shipped — and a refusal message that misdescribes what
+                # sending nothing would have done is worse than one that says less.
+                # **The closing sentence names the MECHANISM and reads the values off the
+                # table, and it must keep doing both.** Today both of §6d's rows say 16, so a
+                # message that spelled the two values out would read "16 at or below the
+                # boundary, 16 above it" — a sentence that tells a caller nothing while looking
+                # like it told them something. It is `sliced_threads` that differs between the
+                # rows, not this field. **Formatted from `AREA_DEFAULTS` rather than written
+                # out**, so the day the rows disagree this says so without anyone remembering to
+                # come back.
                 "field 'threads' must be within {}-{}, got {}. x264 reads 0 as 'auto', which on "
                 "a large host means up to {} frame-threads and is the setting this worker exists "
-                "to bound — so auto is not reachable through this field. {} is the default and "
-                "what every measurement in its calibration was taken at.".format(
+                "to bound — so auto is not reachable through this field. Send nothing and this "
+                "field is not a constant: it is chosen by the DELIVERED frame size against a "
+                "boundary of {} pixels, and the two rows say {} and {} respectively.".format(
                     encoder.THREADS_MIN, encoder.THREADS_MAX, threads,
-                    encoder.THREADS_MAX, encoder.DEFAULT_THREADS),
+                    encoder.THREADS_MAX,
+                    encoder.AREA_BOUNDARY_DELIVERED_PIXELS,
+                    encoder.AREA_DEFAULTS[encoder.AREA_ROW_SMALL]["threads"],
+                    encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["threads"]),
             )
 
     sliced_threads = params.get("sliced_threads")
-    sliced_threads = (encoder.DEFAULT_SLICED_THREADS if sliced_threads is None
-                      else _as_bool(sliced_threads, "sliced_threads"))
+    if sliced_threads is not None:
+        sliced_threads = _as_bool(sliced_threads, "sliced_threads")
 
     # **`docs/conversion-wave.md` §5-0. Default FALSE and there is no other reachable default.**
     # The gate doubles the outbound conversion for every delivered frame, so it is opt-in per
@@ -719,18 +752,34 @@ def validate(job_input):
     decode_probe = False if decode_probe is None else _as_bool(decode_probe, "decode_probe")
 
     rc_lookahead = params.get("rc_lookahead")
-    if rc_lookahead is None:
-        rc_lookahead = encoder.DEFAULT_RC_LOOKAHEAD
-    else:
+    if rc_lookahead is not None:
         rc_lookahead = _as_int(rc_lookahead, "rc_lookahead")
         if not encoder.RC_LOOKAHEAD_MIN <= rc_lookahead <= encoder.RC_LOOKAHEAD_MAX:
             raise WorkerError(
                 INVALID_FIELD_VALUE,
+                # **"this worker's default" is the phrase §6d made false**, and it was false
+                # here in the same way it was false for `threads`: an unset field is filled from
+                # the area table, so there is no constant to name. What is still true — and is
+                # what a caller actually wants from this sentence — is what the rows say and what
+                # the calibration was taken at, which today are the same number and need not stay
+                # that way. Read off the table for that reason.
+                # **THE CALIBRATION CLAUSE IS GONE, AND ITS SOURCE IS WHY.** It used to end
+                # *"{} is this worker's default and what every measurement in its calibration was
+                # taken at"*, formatted from `encoder.DEFAULT_RC_LOOKAHEAD`. Both halves are now
+                # wrong from that constant: §6d means there is no default, and the fact "the
+                # calibration was taken at rc_lookahead=10" now lives in
+                # `estimator.CORPUS["encoder_arm"]`. They agree at 10 today and would diverge the
+                # moment either moved, leaving this message asserting a fact about a corpus from
+                # a constant that does not own it. **The `threads` message dropped the same
+                # clause; this one now matches it.**
                 "field 'rc_lookahead' must be within x264's range {}-{}, got {}. 0 disables the "
-                "lookahead and is the cheapest setting; {} is this worker's default and what "
-                "every measurement in its calibration was taken at.".format(
+                "lookahead and is the cheapest setting. Send nothing and this field is not a "
+                "constant: it is chosen by the DELIVERED frame size against a boundary of {} "
+                "pixels, and the two rows say {} and {} respectively.".format(
                     encoder.RC_LOOKAHEAD_MIN, encoder.RC_LOOKAHEAD_MAX, rc_lookahead,
-                    encoder.DEFAULT_RC_LOOKAHEAD),
+                    encoder.AREA_BOUNDARY_DELIVERED_PIXELS,
+                    encoder.AREA_DEFAULTS[encoder.AREA_ROW_SMALL]["rc_lookahead"],
+                    encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["rc_lookahead"]),
             )
 
     # **Refused rather than validated-then-dropped**, and this one read as supported harder than

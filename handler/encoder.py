@@ -21,6 +21,7 @@ carried an edit list, which cannot arise here.
 
 import os
 import subprocess
+import time
 
 import probe
 
@@ -72,6 +73,127 @@ THREADS_MIN, THREADS_MAX = 1, 128
 #: x264's own range for `rc-lookahead`. 0 disables the lookahead entirely, which is a legitimate
 #: setting and the cheapest one; 250 is x264's ceiling.
 RC_LOOKAHEAD_MIN, RC_LOOKAHEAD_MAX = 0, 250
+
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# §6d — THE AREA TABLE. What a caller receives when it sends nothing.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+#: **The boundary, in INTEGER DELIVERED PIXELS** (contract §6d as amended by §6d-1). 3840x2160 is
+#: exactly this, so the 4K measurement IS the boundary rather than a number the contract invented —
+#: both rows are applied at a frame size where their arm was actually run.
+#:
+#: **IT IS THE DELIVERED FRAME AND NOT THE PADDED AREA, AND THAT WAS A CORRECTION.** The first
+#: draft keyed on `interp_plan.padded_megapixels` — §9a's variable — on the argument that the table
+#: should use the independent variable the project already had. **That was reasoning by adjacency.**
+#: §9a is right for §9a because THE MODEL allocates the padded tensor; this table's consumer is the
+#: ENCODER, which allocates against the delivered frame and never sees the padding at all. The
+#: padding multiple is a function of `scale`, so `force_scale=0.5` moved a 4K job across the
+#: boundary and handed it an arm measured only at 8K **while the frame ffmpeg encodes had not
+#: changed by one pixel**. And `docs/test-plan.md` §25a's mechanism — the whole reason there are
+#: two rows — is stated in delivered frame sizes: a slice frame ~12 MB at 4K and cache-resident,
+#: ~50 MB at 8K and not. *The table had been keyed on a quantity its own justifying mechanism does
+#: not mention.*
+#:
+#: **The two keys agree at `scale=1` and diverge only where padding and delivery diverge**, so
+#: every measurement this project has taken agrees with both and no run in the corpus could have
+#: told them apart. *Reuse looked like consistency and was an unexamined premise.*
+#:
+#: **NEVER COMPARE THIS IN MEGAPIXELS.** `8294400 / 1e6` against a float literal is an identity
+#: comparison at the exact point a real job sits on, and the shared law forbids it. Width and
+#: height are integers; multiply and compare them there.
+#:
+#: **Recorded on every row** (`docs/instrumentation.md` §13a) because it is a constant that will
+#: move. **It moved within hours of that argument being written and before a single row was
+#: banked**, which is the difference between a field argued for and a field guessed at.
+AREA_BOUNDARY_DELIVERED_PIXELS = 8_294_400
+
+AREA_ROW_SMALL = "area:small"
+AREA_ROW_LARGE = "area:large"
+
+AREA_DEFAULTS = {
+    #                       threads  sliced_threads  rc_lookahead
+    AREA_ROW_SMALL: {"threads": 16, "sliced_threads": False, "rc_lookahead": 10},
+    AREA_ROW_LARGE: {"threads": 16, "sliced_threads": True, "rc_lookahead": 10},
+}
+
+#: The three fields the table decides. `crf` and `preset` are NOT among them — they are §6a
+#: fields with their own defaults and the table says nothing about either, so a job that sends
+#: neither still gets `DEFAULT_CRF` and `DEFAULT_PRESET`.
+AREA_FIELDS = ("threads", "sliced_threads", "rc_lookahead")
+
+#: What `encode_defaults.basis` may read (`docs/instrumentation.md` §13a). **One field and not
+#: three**, and `"mixed"` is why it needs a name: §6d keeps every setting individually
+#: overridable, so a caller may send `threads` and leave `sliced_threads` unset. A per-field basis
+#: would be three columns answering one question; a single field that could not express the
+#: partial case would file that job under whichever half it happened to check first.
+BASIS_CALLER = "caller"
+BASIS_MIXED = "mixed"
+
+
+def area_row(delivered_pixels):
+    """Which of §6d's two rows a frame takes. **`<=` the boundary is the small row.**
+
+    **`delivered_pixels` is `width * height` OF THE FRAME THE ENCODER IS HANDED**, which §6d-1
+    pins to the size `MasterWriter` is constructed with — not the source's probed size and not the
+    model's padded area. The caller passes the same two integers it builds the writer from, so the
+    branch and the encode cannot be deciding against different answers to "how big is this frame".
+
+    The comparison is on an integer and this function will not accept anything else — a float
+    reaching here is a megapixel figure arriving where a pixel count was meant, which is precisely
+    the comparison §6d spends a paragraph refusing.
+    """
+    if isinstance(delivered_pixels, bool) or not isinstance(delivered_pixels, int):
+        raise WorkerError(INTERNAL, (
+            "the encoder default is keyed on INTEGER delivered pixels and got {!r} ({}). "
+            "It is width x height of the frame handed to the encoder; a megapixel figure is a "
+            "float and is a different quantity.").format(
+                delivered_pixels, type(delivered_pixels).__name__))
+    return (AREA_ROW_SMALL if delivered_pixels <= AREA_BOUNDARY_DELIVERED_PIXELS
+            else AREA_ROW_LARGE)
+
+
+def resolve_defaults(delivered_pixels, threads=None, sliced_threads=None,
+                     rc_lookahead=None):
+    """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
+
+    Returns `(settings, provenance)` — the three resolved values, and the
+    `docs/instrumentation.md` §13a block that says who chose them.
+
+    **`None` MEANS THE CALLER SENT NOTHING, AND THAT IS THE WHOLE MECHANISM.** §6d states the
+    requirement as a property rather than as an implementation: *absence must remain
+    distinguishable from a value all the way to the branch*, and *a design in which the two are
+    indistinguishable at the branch site is refused on sight*. `validation` used to resolve all
+    three to constants before the source was even probed, so this function would have been unable
+    to tell *"the caller asked for threads=4"* from *"the caller asked for nothing and validation
+    supplied 4"* — and a branch that cannot tell those apart silently overwrites an explicit
+    caller value, which is the clause of §6b that survives §6d. **A knob a caller sets and the
+    worker quietly ignores is worse than no knob.**
+
+    So `validation` now hands these three through as `None` when unset, having range-checked
+    whatever WAS sent, and this is the only place a default is chosen for them.
+    """
+    row = area_row(delivered_pixels)
+    sent = {"threads": threads, "sliced_threads": sliced_threads, "rc_lookahead": rc_lookahead}
+    chosen = {name: value for name, value in sent.items() if value is not None}
+    settings = dict(AREA_DEFAULTS[row])
+    settings.update(chosen)
+    # **Three states, and the middle one is the reason `basis` is one field.** Nothing sent is the
+    # row; everything sent is the caller; anything else is genuinely mixed and says so rather than
+    # being filed under whichever half was checked first.
+    if not chosen:
+        basis = row
+    elif len(chosen) == len(AREA_FIELDS):
+        basis = BASIS_CALLER
+    else:
+        basis = BASIS_MIXED
+    provenance = {
+        "basis": basis,
+        # **The boundary as it stood in the image that ran, NOT the job's own area** — §13a is
+        # explicit that `padded_megapixels` already carries the second.
+        "boundary": AREA_BOUNDARY_DELIVERED_PIXELS,
+    }
+    return settings, provenance
 
 
 def x264_params(threads=DEFAULT_THREADS, sliced_threads=DEFAULT_SLICED_THREADS,
@@ -193,6 +315,28 @@ class MasterWriter:
         #: memory ceiling that does not report memory has to be run twice to learn anything, and
         #: each run is fifty minutes of A40. None where it cannot be measured.
         self.encoder_peak_rss_gb = None
+        #: **`docs/test-plan.md` §18c's diagnostic, and it is a DIAGNOSTIC AND NOT A QUEUE.**
+        #: §18c sized the write-behind queue's entire theoretical prize at `compute_s` less the
+        #: producer — 18.7 s at 4K — and said whether it is capturable depends on what that 18.7 s
+        #: IS. **Uniform means pipe-transfer cost**, which a writer thread with a two-or-three
+        #: frame buffer hides behind GPU compute; **bursty means residual encoder backpressure**,
+        #: which buffering only smooths. One number cannot tell those apart and a distribution can.
+        #:
+        #: **The samples are the `stdin.write` ITSELF and nothing around it** — not the length
+        #: check, not the lazy start, not the `/proc` read — because §18c's question is about
+        #: exactly that call: *"frame threading already took the encoder-side buffering; the
+        #: queue's remaining job is only the stdin write itself."* This is deliberately NARROWER
+        #: than `write_wait_s`, which times all of `write`.
+        #:
+        #: **A list rather than a histogram, and the cost is nothing.** Eight bytes a frame
+        #: against 50 MiB a frame at 8K — 480 frames is under 4 KB — and order statistics need
+        #: the samples. A histogram computed on the way in would have fixed its buckets before
+        #: anyone knew the scale, which is the shape this measurement exists to discover.
+        self._write_durations = []
+        #: Seconds spent in `__exit__` closing the pipe and waiting for ffmpeg — **the encoder's
+        #: queued backlog, which no per-write sample can see** (see `__exit__`). None until the
+        #: encode has ended, which is also the honest reading for a run reaped before it did.
+        self.drain_s = None
         self._proc = None
         self._identity = dict(identity or {})
         self._audio_source = audio_source
@@ -333,10 +477,15 @@ class MasterWriter:
             self._start()
         if self._proc is None or self._proc.poll() is not None:
             raise WorkerError(INTERNAL, self._died("ffmpeg exited before the frames did"))
+        started = time.perf_counter()
         try:
             self._proc.stdin.write(frame_bytes)
         except BrokenPipeError:
             raise WorkerError(INTERNAL, self._died("ffmpeg closed the pipe"))
+        # **Banked after the write returned and not in a `finally`**, for `staging.released()`'s
+        # reason one module over: a write that raised did not transfer a frame, and a duration
+        # recorded for it would put the pipe's death in a distribution of the pipe's throughput.
+        self._write_durations.append(time.perf_counter() - started)
         self.frames_written += 1
         # **Sampled here because this is where the loop already blocks.** `write` returns when
         # the pipe accepts the frame, which is exactly when the encoder is working — so the
@@ -345,6 +494,102 @@ class MasterWriter:
         peak = _peak_rss_gb(self._proc.pid)
         if peak is not None and peak > (self.encoder_peak_rss_gb or 0.0):
             self.encoder_peak_rss_gb = peak
+
+    def write_distribution(self):
+        """§18c's question as numbers: **is the write cost uniform or bursty?** Never raises.
+
+        Returns None where nothing was written. Otherwise the order statistics, plus the two
+        quantities that actually discriminate:
+
+        - **`p99_over_p50`** — how much worse the tail is than the middle. A pipe moving a fixed
+          number of bytes into a buffer that is always ready is flat; an encoder that stops to
+          think is not.
+        - **`slowest_n_share`, with `slowest_n` beside it** — the fraction of the TOTAL spent in
+          the slowest `n` writes, where `n` is one percent of the count ROUNDED UP. This is the
+          one that decides what a buffer would buy, and it is not the same question as the ratio
+          above: a tail that is ten times the median but holds two percent of the time is a tail
+          a queue cannot pay for. **The count is published rather than the word "1%"**, because
+          at these frame counts the two are not the same thing and the difference biases the
+          answer toward not building the queue.
+
+        **`first_ms` is reported apart from every other sample and is excluded from none of
+        them.** ffmpeg is spawned lazily inside the first `write` (`_start`, just above), so the
+        first frame's write is the one racing the encoder's own start-up. It is a real cost the
+        job pays; it is not a sample of steady-state throughput, and a reader who cannot see it
+        separately would read a one-frame artefact as a tail.
+
+        **THE READINGS EXPIRE AT x265 AND NOTHING MAY BE BANKED ON THEM.** §18c's own note: they
+        are CRF- and codec-specific, and every value in the encoder's parameter string names a
+        parameter the next codec does not have. This is why the distribution is PRINTED and files
+        no record field — a log entry is read by whoever went looking for it, and a corpus column
+        outlives its meaning and gets averaged in by someone who never read §18c.
+        """
+        # **NO `except` HERE, AND THAT IS THE FIX RATHER THAN AN OMISSION.** This used to swallow
+        # and return None, which is also what it returns when nothing was written — so a failed
+        # computation printed *"no frames were written"* through the caller, a positive false
+        # statement about a run that wrote 480 frames, and the caller's own honest error branch
+        # was unreachable because this could not raise. **One return value standing for two
+        # states is the defect this record has been fixed for before.** The never-raises posture
+        # is kept where it matters, at the call site in a `finally`:
+        # `routec._print_write_distribution` catches and says which of the two happened.
+        import math  # noqa: PLC0415 — one call, on a path that runs once per encode
+
+        first = self._write_durations[0] if self._write_durations else None
+        # **THE FIRST WRITE IS EXCLUDED FROM EVERY STEADY-STATE STATISTIC, AND IT HAD NOT BEEN.**
+        # ffmpeg is spawned lazily inside the first `write` (`_start`, just above), so that sample
+        # is racing the encoder's own start-up. It was reported apart AND left in the totals,
+        # which made the numbers §18c decides on describe something a queue cannot remove:
+        # `[2.0] + [0.04] * 479` reads `p99/p50 = 1.0` — perfectly flat — while
+        # `slowest_n_share` reads 0.102, so ten percent of "the tail a buffer would buy back" is
+        # one process spawn. **Every number correct, the ten percent belonging to something
+        # else.** `first_ms` still carries it, which is the honest home for it.
+        samples = sorted(self._write_durations[1:])
+        count = len(samples)
+        if not count:
+            # **One write is not a distribution and this says so rather than describing itself.**
+            # A single-frame encode has nothing left once the start-up sample is set aside.
+            return None if first is None else {
+                "samples": 0, "first_ms": round(1000.0 * first, 3),
+                "note": "one write only; the start-up sample is excluded and nothing remains",
+            }
+        total = sum(samples)
+
+        def at(fraction):
+            # Nearest-rank, which is the only percentile definition that returns a sample that
+            # was actually observed. Interpolating between two writes invents a duration, and
+            # this measurement's whole purpose is telling a real tail from a smooth one.
+            index = min(count - 1, max(0, int(round(fraction * (count - 1)))))
+            return samples[index]
+
+        p50, p90, p99 = at(0.50), at(0.90), at(0.99)
+        # **CEILING, AND THE COUNT IS REPORTED BESIDE THE SHARE.** This was `count // 100`, a
+        # floor, and the log line called the result "the slowest 1%" — at 480 writes it was 4
+        # samples, 0.83%; at any count under 100 it was one sample and could be several percent.
+        # **The bias ran toward a smaller share, which is toward "the queue is not worth
+        # building"** — one of the two answers §18c exists to choose between, so a measurement
+        # that leans that way by an arithmetic accident is the wrong one to leave in.
+        slowest_n = max(1, int(math.ceil(count / 100.0)))
+        top = samples[count - slowest_n:]
+        return {
+            # **The steady-state count, which is one fewer than the frames written.** Named so
+            # nobody reconciles it against `frames_written` and finds an off-by-one.
+            "samples": count,
+            "total_s": round(total, 3),
+            "mean_ms": round(1000.0 * total / count, 3),
+            "min_ms": round(1000.0 * samples[0], 3),
+            "p50_ms": round(1000.0 * p50, 3),
+            "p90_ms": round(1000.0 * p90, 3),
+            "p99_ms": round(1000.0 * p99, 3),
+            "max_ms": round(1000.0 * samples[-1], 3),
+            # **Outside every statistic above.** The one sample that paid for ffmpeg's start-up.
+            "first_ms": round(1000.0 * first, 3),
+            # None rather than a large number where the median is zero — a ratio against zero is
+            # not a big ratio, it is an absent one, and `inf` in a log line reads as a
+            # measurement.
+            "p99_over_p50": None if p50 <= 0 else round(p99 / p50, 2),
+            "slowest_n": slowest_n,
+            "slowest_n_share": None if total <= 0 else round(sum(top) / total, 4),
+        }
 
     def _died(self, why):
         stderr = b""
@@ -359,11 +604,28 @@ class MasterWriter:
     def __exit__(self, exc_type, exc, traceback):
         if self._proc is None:
             return False
+        # **THE DRAIN, AND WITHOUT IT §18c's DISTRIBUTION ANSWERS THE WRONG QUESTION.** Every
+        # sample in `_write_durations` is a `stdin.write`, and the encoder's queued backlog is
+        # not paid there — it is paid HERE, in `close()` then `wait()`, after the last frame has
+        # been handed over. At 8K with a lookahead the encoder can be holding tens of 50 MiB
+        # frames, and all of that settles in this call.
+        #
+        # **So a run with real backpressure can print a perfectly flat distribution**, and §18c's
+        # decision rule reads flat as *"pipe-transfer cost, a small writer buffer hides it"* —
+        # the wrong answer, produced by numbers every one of which is correct. *Right number,
+        # different subject.*
+        #
+        # Measured rather than argued, and reported beside the distribution so the two are read
+        # together. **Not banked to `write_wait_s`**: that field is `routec`'s loop clock and its
+        # boundaries are the loop's, and moving a quantity into a stage after the corpus was
+        # banked against it would make two populations wearing one field name.
+        drain_started = time.perf_counter()
         try:
             self._proc.stdin.close()
         except Exception:  # noqa: BLE001
             pass
         self._proc.wait()
+        self.drain_s = time.perf_counter() - drain_started
         # An exception on the way in owns the failure; do not replace it with one about ffmpeg,
         # which most likely died *because* of it. The original diagnosis is the useful one —
         # especially for an OOM, where the exception carries the phase and the allocation that

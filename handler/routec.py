@@ -637,7 +637,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None, preset=None, threads=None,
            sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False,
-           input_check=False):
+           input_check=False, armed=None, encode_defaults=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -695,6 +695,57 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # the whole chain — so "decode complete" is never true and the only quantity that is true
         # per frame is the frame count. Both halves were already in hand and neither was used:
         # `n_out` in the stats returned before the loop begins, and `frames_written` on the writer.
+        # ── §6d's BRANCH, AND THIS IS THE ONLY SITE THAT CHOOSES AN ENCODER SETTING ──────────
+        #
+        # **HERE, because `width` and `height` are the DELIVERED frame and this is where they
+        # exist.** §6d-1 pins the key to the size `MasterWriter` is constructed with, and those
+        # are the two integers below — literally the same locals, so the branch and the encode
+        # cannot be deciding against different answers to how big the frame is. They come from
+        # `decode.open_source` (`:655`), not from `probe.probe_source`; the two readers agree on
+        # ordinary sources and are two readers, and this is not the place to find out.
+        #
+        # **THIS REPLACED THE OLD `None`-to-constant GUARD RATHER THAN SITTING BESIDE IT.** §6d
+        # forbids a second site that picks encoder settings, *"because a second answer to the
+        # question of what a job encoded at"* — the guard resolved exactly these three to the
+        # pre-§6d constants, so leaving it in place under a branch would have been that second
+        # answer, reachable by any caller that did not go through `handler`. **One site now, and
+        # a direct caller gets the area row the same as a request does.**
+        #
+        # **`None` STILL MEANS THE CALLER SENT NOTHING, AND THAT IS THE WHOLE MECHANISM.**
+        # `validation` deliberately no longer defaults these three, precisely so that this line
+        # can tell an absence from a value; §6b's surviving clause is that an explicitly-sent
+        # field is obeyed and never silently overridden.
+        encode_settings, encode_provenance = encoder.resolve_defaults(
+            int(width) * int(height),
+            threads=threads, sliced_threads=sliced_threads, rc_lookahead=rc_lookahead)
+        encode_threads = encode_settings["threads"]
+        encode_sliced = encode_settings["sliced_threads"]
+        encode_rc_lookahead = encode_settings["rc_lookahead"]
+        # **Filled IN PLACE into the caller's dict rather than returned in `stats`.** `handler`
+        # banks this object in `trace` before calling us, so a run reaped in ffmpeg still files
+        # what its settings were resolved from — the same argument `ConvertCheck` is handed in
+        # for, one wave earlier. A provenance that travelled out in `stats` would be null on
+        # exactly the runs worth recording.
+        if encode_defaults is not None:
+            encode_defaults.update(encode_provenance)
+        print("[encode] defaults {} at {} delivered pixels ({}x{}, boundary {}): threads={} "
+              "sliced-threads={} rc-lookahead={}".format(
+                  encode_provenance["basis"], int(width) * int(height), width, height,
+                  encode_provenance["boundary"], encode_threads,
+                  1 if encode_sliced else 0, encode_rc_lookahead), flush=True)
+
+        # **`crf` and `preset` are NOT §6d's and still resolve to constants here.** The table
+        # decides three fields and says nothing about either. **Their substitution is REPORTED**
+        # (`substituted` below) rather than silent: a direct caller that sent no `crf` would
+        # otherwise have the estimate declare `crf=12` and stamp `estimator_v3/crf12` onto the
+        # basis §8g grades, saying which CRF the job was computed for when nobody declared one.
+        encode_crf = crf if crf is not None else encoder.DEFAULT_CRF
+        encode_preset = preset if preset is not None else encoder.DEFAULT_PRESET
+        substituted = [name for name, value in (("crf", crf), ("preset", preset))
+                       if value is None]
+        encode_arm = {"crf": encode_crf, "preset": encode_preset, "threads": encode_threads,
+                      "sliced_threads": encode_sliced, "rc_lookahead": encode_rc_lookahead}
+
         estimate = None
         if progress is not None:
             progress.plan_frames(stats.get("n_out"))
@@ -710,23 +761,18 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # returned. Everything above this line is the fetch, the probe and the model load,
             # which is what `begin_phase` below excludes from the rate rather than what the ETA
             # is priced from.
-            estimate = _seed_estimate(progress, source, stats, scale)
+            estimate = _seed_estimate(progress, source, stats, scale, encode_arm, armed,
+                                      substituted)
 
         writer_cm = encoder.MasterWriter(
             master_path, width, height, float(target_fps), identity,
             audio_source=audio_source, audio_codec=source.get("audio_codec"),
             audio_limit_s=source.get("video_duration_s"),
-            crf=crf if crf is not None else encoder.DEFAULT_CRF,
-            # **`None` means "the caller did not choose", so the default is applied HERE and in
-            # one place.** `validation` already defaults every one of these, so nothing reaching
-            # this line through `handle` is None — these guards are for the direct callers a test
-            # makes, and they resolve to the same constants `validation` would have used.
-            preset=preset if preset is not None else encoder.DEFAULT_PRESET,
-            threads=threads if threads is not None else encoder.DEFAULT_THREADS,
-            sliced_threads=(sliced_threads if sliced_threads is not None
-                            else encoder.DEFAULT_SLICED_THREADS),
-            rc_lookahead=(rc_lookahead if rc_lookahead is not None
-                          else encoder.DEFAULT_RC_LOOKAHEAD))
+            # **Read off `encode_arm`'s own names**, which is what makes the estimate's declared
+            # arm and the encode's actual settings impossible to disagree — the same argument the
+            # record already makes by reading all five off the writer that ran, one step earlier.
+            crf=encode_crf, preset=encode_preset, threads=encode_threads,
+            sliced_threads=encode_sliced, rc_lookahead=encode_rc_lookahead)
         # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
         # `Progress` was constructed — before the fetch, before the probe, before the model
         # load — so the first measured seconds-per-frame amortised all of that into the per-frame
@@ -829,6 +875,16 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # that was never written.
             print("[encode] ffmpeg peak RSS {} GiB over {} frame(s)".format(
                 writer_cm.encoder_peak_rss_gb, writer_cm.frames_written), flush=True)
+            # **`docs/test-plan.md` §18c's diagnostic, printed here for the same reason the line
+            # above is: a run reaped mid-encode is a run whose write distribution is the most
+            # interesting thing it has, and a `finally` is the only place that survives it.**
+            #
+            # **It is a DIAGNOSTIC AND NOT A QUEUE.** §18c is explicit that this is one small
+            # experiment to decide whether the write-behind queue is worth building at all —
+            # uniform says a small writer buffer hides the cost, bursty says buffering only
+            # smooths it — and its readings are CRF- and codec-specific and expire at x265.
+            # **Nothing is banked on it and it files no record field.**
+            _print_write_distribution(writer_cm)
         # **The other half of the derived count.** `stream()` refuses a source shorter than the
         # plan; this refuses one longer. A container whose duration and rate imply fewer frames
         # than it holds would otherwise deliver a silently truncated retime.
@@ -927,7 +983,52 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             capture.release()
 
 
-def _seed_estimate(progress, source, stats, scale):
+def _print_write_distribution(writer):
+    """§18c's distribution as one log block. **Never raises and never delays a delivery.**
+
+    Order statistics rather than a histogram, because a histogram's buckets would have to be
+    chosen before anyone knows the scale — which is the thing this measurement exists to
+    discover. `p99_over_p50` and `slowest_n_share` carry the verdict, `drain_s` carries the half
+    no per-write sample can see, and **the two must be read together**: a flat distribution with
+    a large drain is backpressure, not pipe transfer.
+
+    **The conclusion is the gate's to draw from a run, not this function's to print.**
+    """
+    try:
+        distribution = writer.write_distribution()
+        # **THE DRAIN IS PRINTED FIRST AND UNCONDITIONALLY, AND THAT IS THE FIX.** It used to sit
+        # after an early return taken whenever there were no samples — so the one run where the
+        # drain is the interesting number, a first `write` that broke the pipe after ffmpeg was
+        # already spawned, printed nothing about the seconds `__exit__` then spent waiting for it.
+        # **A fallback that skips the case it exists for.**
+        print("[write-dist] drain {} s closing the pipe and waiting for ffmpeg | docs/test-plan.md "
+              "18c: flat writes AND a small drain is pipe transfer; a large drain is encoder "
+              "backpressure however flat the writes look".format(
+                  "not measured" if writer.drain_s is None else round(writer.drain_s, 3)),
+              flush=True)
+        if not distribution:
+            print("[write-dist] no writes were sampled; nothing to distribute", flush=True)
+            return
+        if not distribution.get("samples"):
+            print("[write-dist] {}; first write {} ms".format(
+                distribution.get("note", "nothing to distribute"),
+                distribution.get("first_ms")), flush=True)
+            return
+        print("[write-dist] {samples} steady-state write(s), {total_s}s total, mean {mean_ms}ms | "
+              "min {min_ms} p50 {p50_ms} p90 {p90_ms} p99 {p99_ms} max {max_ms} ms".format(
+                  **distribution), flush=True)
+        print("[write-dist] p99/p50 {} | slowest {} write(s) hold {} of the total | first write "
+              "{} ms, EXCLUDED from every figure above because it races ffmpeg's start-up and a "
+              "queue cannot remove a process spawn".format(
+                  distribution["p99_over_p50"], distribution["slowest_n"],
+                  distribution["slowest_n_share"], distribution["first_ms"]), flush=True)
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never displace a real failure
+        print("[write-dist] NOT reported ({}: {}). The job is unaffected.".format(
+            type(exc).__name__, str(exc)[:120]), flush=True)
+
+
+def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
+                   substituted=None):
     """Price the job, seed the ETA with it, and hand the whole answer back. **Never raises.**
 
     Returns the §9b estimate — point, band, basis and corpus — or None where it could not be
@@ -937,15 +1038,35 @@ def _seed_estimate(progress, source, stats, scale):
     """
     import estimator  # noqa: PLC0415 — pure-python, imported here like everything else on this path
 
+    # **Bound BEFORE the `try`, so the `finally` below reads a name that always exists.** The
+    # alternative was fishing it out of `locals()`, which works and is unreadable — and a
+    # measurement whose control flow needs explaining is one nobody will touch correctly later.
+    estimate = None
     try:
         n_in = source_frame_count(source)
+        # **§9e's two declared inputs.** `crf` because every row in the corpus is CRF 12 and a
+        # coefficient cannot be estimated for an axis with one value — so the axis is named and
+        # an estimate outside it says so rather than extrapolating. The arm for the sharper
+        # reason: it moves `compute_s` by up to 1.72x on identical work, so an estimate quoted
+        # against a different arm is outside its population and not merely at its edge.
         per_frame, estimate = estimator.seconds_per_frame(
             source["width"], source["height"], n_in,
-            stats.get("n_out"), stats.get("n_synth"), scale=scale or 1)
+            stats.get("n_out"), stats.get("n_synth"), scale=scale or 1,
+            crf=(encode_arm or {}).get("crf"), encoder_arm=encode_arm, armed=armed,
+            substituted=substituted)
         # **Labelled `predicted_<basis>` by `expect` itself**, so the payload distinguishes a
         # planned estimate from a measured one — which is the whole reason `eta_basis` exists and
         # the reason §8g grades `eta.first_basis` as well as `eta.first_s`.
-        progress.expect(per_frame, basis=estimator.BASIS)
+        # **`basis_for(crf)` and not the bare `BASIS`** — contract §9e requires the declared CRF
+        # in the basis string, and THIS is the channel that carries it to the caller and to
+        # `eta.first_basis`, which is what §8g grades. Read off the estimate rather than
+        # recomputed, so the seed and the answer cannot name different bases.
+        # **`.get` with a fallback, NOT `estimate["basis"]`.** Subscripting made the ETA SEED
+        # depend on the estimate's shape: a usable `per_frame` alongside an estimate missing that
+        # key would raise here, `expect` would never be called, and the run would fall back to
+        # `observed` — rebuilding §8d's 11,553-second failure that this very line exists to
+        # prevent. **The seed is the valuable half and it must survive a malformed label.**
+        progress.expect(per_frame, basis=(estimate or {}).get("basis") or estimator.BASIS)
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's
@@ -968,9 +1089,31 @@ def _seed_estimate(progress, source, stats, scale):
                   estimate["band_frac"]), flush=True)
         return estimate
     except Exception as exc:  # noqa: BLE001 — an estimate must never cost a delivered master
+        # **CLEARED, AND WITHOUT THIS THE `finally` CONTRADICTS THE RECORD.** `estimate` is
+        # assigned before `progress.expect` and the priced-print, so a failure in either left it
+        # bound while this branch returned None — the record would file `estimate: null` while
+        # the `finally` below had already printed OUTSIDE THE CORPUS sentences for that same
+        # estimate. **Two artefacts of one run disagreeing about whether the job was priced**,
+        # which is the exact defect moving the print into a `finally` was meant to remove; it had
+        # only been inverted. One name decides both.
+        estimate = None
         print("[eta] not priced ({}: {}); the ETA falls back to what this run measures".format(
             type(exc).__name__, str(exc)[:200]), flush=True)
         return None
+    finally:
+        # **OUTSIDE THE `try` THAT DECIDES WHETHER THE ESTIMATE EXISTS, AND THAT IS DELIBERATE.**
+        # §9e requires the caveat said out loud on the run itself: an estimate that has left its
+        # corpus and says so only in a record is a caveat discovered after the money is spent.
+        # **But printing it inside the try put it between `progress.expect` and the `return`** —
+        # so a failure in the print would be caught above and return None, filing `estimate: null`
+        # in the record while every progress payload the caller already received carried an
+        # `eta_basis` derived from that same estimate. *Two artefacts of one run disagreeing about
+        # whether the job was priced.* Nothing here can change what is returned.
+        try:
+            for sentence in (estimate or {}).get("outside_corpus") or []:
+                print("[eta] OUTSIDE THE CORPUS: {}".format(sentence), flush=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _reset_peak():

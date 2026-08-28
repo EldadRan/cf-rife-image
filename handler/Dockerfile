@@ -203,6 +203,17 @@ COPY *.py ./
 
 # The handler must import with the heavy chain still lazy — if this ever pulls in torch, the
 # rung-1 suite stops running in CI and nobody finds out until a GPU-less runner fails.
-RUN python3 -c "import handler; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler import OK, torch still lazy')"
+#
+# **`decodeprobe` is named here because nothing else imports it at module scope.** It is pulled
+# in lazily, inside the one function that runs it, so a syntax error or a bad module-scope import
+# in that file reaches a GPU host and not this line. Naming it costs nothing and it does not
+# weaken the assertion beside it: `decodeprobe` imports `subprocess` and `time` and nothing else
+# (`handler/decodeprobe.py:45-46`; its only other import is `os`, inside a function at :121), so
+# the lazy-torch property this line exists to hold is unchanged by adding it.
+#
+# **AND AN IMPORT CHECK COVERS IMPORTS.** It catches a module that will not parse and a
+# module-scope import that will not resolve. It does not enter `run`, `_pass` or any of the three
+# ffmpeg argument lists, and it is not evidence about any of them.
+RUN python3 -c "import handler, decodeprobe; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler + decodeprobe import OK, torch still lazy')"
 
 CMD ["python3", "-u", "handler.py"]

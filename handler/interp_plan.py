@@ -54,12 +54,20 @@ class Unquotable(Exception):
     """Raised where a number would be invented. Carries what is missing and who owns it."""
 
 
-def padded_megapixels(width, height, scale=1):
-    """The area the formula is a function of, in megapixels, after §9's padding rule.
+def padded_pixels(width, height, scale=1):
+    """The padded area as an **integer count of pixels**, which is the form it is measured in.
 
-    **This much is arithmetic and is knowable today** — it is the fit's independent variable, and
-    it is computable without a single measurement. Reported so Phase 2's readings can be plotted
-    against the same quantity the predicate will use, rather than against raw frame size.
+    **Contract §6d needs this and `padded_megapixels` cannot serve it.** The encoder default is
+    keyed on a boundary a real resolution lands exactly on — 3840x2160 pads to 8,355,840 — and
+    the megapixel form divides by 1,000,000 first, so the comparison at that boundary would be
+    `8.35584` against a float literal. The shared law says identity comparisons never use floats,
+    and an ordering whose boundary is a value the corpus's own middle resolution sits precisely on
+    is that comparison wearing an ordering's clothes. **The padded dimensions are integers before
+    they are divided; this is where they are still integers.**
+
+    `padded_megapixels` is this function divided, rather than a second copy of the padding rule,
+    for the reason `estimator` imports it from here in the first place: two copies of a rule are
+    two rules.
     """
     if int(width) <= 0 or int(height) <= 0:
         # **The one function here that could invent a number, so it does not.** Negative
@@ -68,11 +76,37 @@ def padded_megapixels(width, height, scale=1):
         # zero made it `A <= usable` at any resolution. In a module whose whole thesis is that a
         # placeholder is worse than a refusal because it is indistinguishable from a measurement,
         # this was the placeholder.
+        #
+        # **It guards `padded_pixels` rather than `padded_megapixels` now, and it has to be the
+        # one below rather than the one above**: every caller of either reaches the arithmetic
+        # through here, so a guard left on the divided form would be a guard the integer form
+        # walked past.
         raise ValueError("padded area needs positive dimensions, got {}x{}".format(width, height))
     multiple = pad_multiple(scale)
     padded_w = -(-int(width) // multiple) * multiple
     padded_h = -(-int(height) // multiple) * multiple
-    return (padded_w * padded_h) / 1_000_000.0
+    # **Coerced HERE, where the integer-ness is produced, and not asserted at the consumer.**
+    # `encoder.area_row` refuses a non-int because the boundary comparison must not be a float —
+    # but a guard at the consumer is a module asserting a property another module owns, and if
+    # `pad_multiple` ever stopped coercing (`interpolate.py:169` does today,
+    # `int(max(PAD_BASE, PAD_BASE / scale))`) that guard would turn a caller's `force_scale` into
+    # a fatal INTERNAL after the fetch, the probe and the model load. **The two together are
+    # belt and braces on purpose**: this line makes the property true, and `area_row`'s guard
+    # makes a future violation loud instead of silently float-comparing the boundary.
+    return int(padded_w * padded_h)
+
+
+def padded_megapixels(width, height, scale=1):
+    """The area the formula is a function of, in megapixels, after §9's padding rule.
+
+    **This much is arithmetic and is knowable today** — it is the fit's independent variable, and
+    it is computable without a single measurement. Reported so Phase 2's readings can be plotted
+    against the same quantity the predicate will use, rather than against raw frame size.
+
+    **The megapixel form is for FITTING and never for a boundary comparison** — see
+    `padded_pixels`, which is where the integers still are.
+    """
+    return padded_pixels(width, height, scale) / 1_000_000.0
 
 
 def peak_vram_gb(width, height, scale=1, precision="fp32", registry=None):
