@@ -396,9 +396,51 @@ def outside_corpus(crf=None, encoder_arm=None, armed=None, substituted=None):
             # arm — but comparing it in both places emitted two sentences about one fact, which
             # is the duplication the shared law's ONE FACT, ONE HOME clause is about, in
             # miniature: a reader would count two departures where the job made one.
-            differs = {name: value for name, value in encoder_arm.items()
-                       if value is not None and name != "crf" and name in fitted
-                       and fitted[name] != value}
+            # **COVERAGE, NOT INTERSECTION, AND THE DIFFERENCE IS A WHOLE CLASS OF SILENCE**
+            # (`docs/gate-findings.md` F-2026-08-28-8). This comprehension used to carry
+            # `name in fitted`, which walks the arm the JOB supplied and compares only the names
+            # both sides happen to hold. **So removing a key removed a departure**: an arm that
+            # is a SUBSET of the fitted one reported nothing and the estimate claimed a
+            # population it was never in.
+            #
+            # **It surfaced on the codec and it was never about codecs.** §6e's h265 arm carries
+            # `crf` and `preset` and nothing else — `crf` is skipped by design and `preset`
+            # matched — so an h265 job, on a codec with ZERO rows in this corpus, produced a
+            # CLEANER answer than an ordinary h264 job that merely ran at a different `threads`.
+            # *Any future arm that is a subset of this one would have been structurally incapable
+            # of being reported out of population, and the reason would not have been visible in
+            # a single one of them.*
+            #
+            # **THE HONEST RULE IS THAT AN ARM WHICH DOES NOT COVER THE FITTED ARM IS OUT OF
+            # POPULATION.** So the walk is over `fitted` — the thing whose shape is known — and
+            # an absent name is a departure rather than a non-comparison. *The two are reported
+            # as separate sentences because they are different facts: one setting moved, and one
+            # does not exist on this job at all.*
+            differs, absent = {}, []
+            for name, want in fitted.items():
+                # `crf` HAS ITS OWN DECLARED AXIS ABOVE. It appears in `CORPUS["encoder_arm"]`
+                # too, so that a record carrying the arm carries the whole arm — but comparing
+                # it in both places emitted two sentences about one fact, which is the shared
+                # law's ONE FACT, ONE HOME clause in miniature: a reader would count two
+                # departures where the job made one.
+                if name == "crf":
+                    continue
+                # **MEMBERSHIP, NOT `.get()`, AND THE DIFFERENCE IS WHAT THE SENTENCE CLAIMS.**
+                # `.get()` folds *key missing* together with *key present holding None*, and the
+                # two deserve opposite answers: the producer of an h265 arm omits these names
+                # outright (`resolve_defaults` returns `{}`), so absence is the real signal,
+                # while a present `None` would be a value that arrived wrong. **Reporting a
+                # present `None` as "carries no such setting at all" would assert something
+                # false about the job in a sentence that reads correct** — the failure mode this
+                # whole function exists to remove, pointed the other way. Routed to `differs`
+                # instead, where it prints as `preset=None` and a reader can see it.
+                #
+                # *Neither `routec` nor `CORPUS` can produce a `None` here today. That is why
+                # this is written as a rule rather than left to hold by luck.*
+                if name not in encoder_arm:
+                    absent.append(name)
+                elif encoder_arm[name] != want:
+                    differs[name] = encoder_arm[name]
             if differs:
                 left.append(
                     "the encoder arm differs from the one this corpus was fitted at ({}): {}. "
@@ -406,6 +448,14 @@ def outside_corpus(crf=None, encoder_arm=None, armed=None, substituted=None):
                     "is outside its population and not merely at its edge".format(
                         ", ".join("{}={}".format(k, fitted[k]) for k in sorted(differs)),
                         ", ".join("{}={}".format(k, differs[k]) for k in sorted(differs))))
+            if absent:
+                left.append(
+                    "this corpus was fitted at {}, and this job's encoder arm carries no such "
+                    "setting{} at all — so the arm is not a different point in the fitted "
+                    "population, it is outside the space that population was measured in and "
+                    "nothing here interpolates across that".format(
+                        ", ".join("{}={}".format(k, fitted[k]) for k in sorted(absent)),
+                        "" if len(absent) == 1 else "s"))
     except Exception as exc:  # noqa: BLE001 — saying less must never cost a delivered master
         # **THE FAILURE SAYS SO RATHER THAN RETURNING SILENCE, AND THAT IS THE WHOLE POINT OF
         # THIS FUNCTION.** It used to `pass`, so a check that crashed returned `[]` — the same
