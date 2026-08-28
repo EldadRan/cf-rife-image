@@ -170,6 +170,19 @@ BASIS_CODEC_H265 = "codec:h265"
 #: **Declared as a BOUND and never claimed as an optimum.** §6c forbids an estimator throttling
 #: against a host-RSS model nobody has built, and a fixed cap on what the encoder ASKS FOR is not
 #: that model: it refuses nothing, downgrades nothing and predicts nothing.
+#: **The output pixel format per bit depth** (contract §6f). **`-pix_fmt` is what selects the
+#: PROFILE, and `-profile:v main10` is deliberately not sent beside it.** libx265 derives `main10`
+#: from a 10-bit input format on its own; sending both would be two statements of one fact, and
+#: the one that loses an argument with the other is the one nobody is looking at. *ONE FACT, ONE
+#: HOME, at the command line.*
+#:
+#: **The INPUT stays `rgb24` at both depths.** The model produces 8-bit RGB and nothing upstream
+#: of the encoder has more precision to give — so 10-bit here buys headroom in the prediction and
+#: transform loops rather than in the source, which is exactly the mechanism §6f expects to
+#: suppress BANDING. *A claim that this makes the master "10-bit content" would be false and the
+#: record carries `bit_depth` rather than a quality assertion.*
+PIXEL_FORMATS = {8: "yuv420p", 10: "yuv420p10le"}
+
 X265_POOLS = 16
 X265_FRAME_THREADS = 1
 X265_RC_LOOKAHEAD = 10
@@ -298,6 +311,23 @@ def x264_params(threads=DEFAULT_THREADS, sliced_threads=DEFAULT_SLICED_THREADS,
         1 if sliced_threads else 0, int(threads), int(rc_lookahead))
 
 
+def pixel_format(bit_depth=None):
+    """The encode's output pixel format for a bit depth. **`None` means the caller named none.**
+
+    **ONE HOME for the resolution**, because two callers need it and they must not disagree:
+    `MasterWriter` builds the command from it, and contract §6g's disk bound computes bytes per
+    pixel from it before the writer exists. *A bound computed against a different format from the
+    one that gets written is a bound about a different job.*
+    """
+    depth = envelope.DEFAULT_BIT_DEPTH if bit_depth is None else bit_depth
+    if depth not in PIXEL_FORMATS:
+        raise WorkerError(INTERNAL, (
+            "no pixel format for bit depth {!r}; `envelope` enumerates {} and `validation` "
+            "refuses the rest at the door.").format(
+                depth, ", ".join(str(d) for d in sorted(PIXEL_FORMATS))))
+    return PIXEL_FORMATS[depth]
+
+
 def x265_params(pools=X265_POOLS, frame_threads=X265_FRAME_THREADS,
                 rc_lookahead=X265_RC_LOOKAHEAD):
     """Build the `-x265-params` string from named fields. **Assembled, never accepted** — and
@@ -409,9 +439,17 @@ class MasterWriter:
 
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
-                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None,
-                 threads=None, sliced_threads=None, rc_lookahead=None):
+                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None, bit_depth=None,
+                 threads=None, sliced_threads=None, rc_lookahead=None,
+                 reference_path=None):
         self.path = path
+        #: **Where ffmpeg writes contract §6g's raw reference, or None for an unarmed run.**
+        #: A SECOND OUTPUT of this same command rather than a copy of what crossed the pipe: the
+        #: pipe carries `rgb24` and ffmpeg converts to the encode's own format before either
+        #: encoder sees a pixel, so this is the frames the codec actually encoded. *Same binary,
+        #: same swscale, same flags — there is no agreement question between two conversion paths
+        #: because there is only one.*
+        self.reference_path = reference_path
         self.width = width
         self.height = height
         self.fps = fps
@@ -475,6 +513,18 @@ class MasterWriter:
         #: that cannot exclude a population includes it — `compute_s` per megapixel, the encoder
         #: arm and the estimator's corpus are each a fit over rows, and two encoders averaged
         #: together is not a noisier corpus but one wrong in a direction that changes with the job.
+        #: **The master's bit depth** (contract §6f), and `None` means the caller named none —
+        #: resolved through `envelope` so the default has one home, exactly as `codec` is.
+        #:
+        #: **Public because the record carries it** (`docs/instrumentation.md` §15a), and it
+        #: carries the same self-keying invariant the three x264 fields do: `bit_depth: 10`
+        #: implies `codec: "h265"` by construction, because §6f refuses the pair at the door.
+        self.bit_depth = envelope.DEFAULT_BIT_DEPTH if bit_depth is None else bit_depth
+        if self.bit_depth not in PIXEL_FORMATS:
+            raise WorkerError(INTERNAL, (
+                "the master writer was constructed for bit depth {!r}; `envelope` enumerates {} "
+                "and `validation` refuses the rest at the door.").format(
+                    self.bit_depth, ", ".join(str(d) for d in sorted(PIXEL_FORMATS))))
         self.codec = envelope.DEFAULT_CODEC if codec is None else codec
         if self.codec not in CODEC_LIBRARIES:
             raise WorkerError(INTERNAL, (
@@ -491,6 +541,12 @@ class MasterWriter:
         #: **The two parameter strings are the pair, and each is null under the other's codec.**
         #: The column exists on every row either way, which is what lets a reader ask "what
         #: bounded this encode" without first knowing which codec answered.
+        if self.bit_depth != envelope.DEFAULT_BIT_DEPTH and self.codec != "h265":
+            raise WorkerError(INTERNAL, (
+                "the master writer was constructed for {}-bit under codec {!r}; §6f refuses that "
+                "pair at the door because h264 High10 is hardware-decoded almost nowhere, so "
+                "reaching here is a plumbing defect and not a request.").format(
+                    self.bit_depth, self.codec))
         if self.codec == "h265":
             if threads is not None or sliced_threads is not None or rc_lookahead is not None:
                 raise WorkerError(INTERNAL, (
@@ -562,7 +618,10 @@ class MasterWriter:
             command += ["-i", audio_source]
 
         command += ["-map", "0:v:0", "-c:v", CODEC_LIBRARIES[self.codec],
-                    "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+                    "-preset", preset, "-crf", str(crf),
+                    # §6f. `yuv420p` at 8 and `yuv420p10le` at 10, which is what makes the
+                    # encode `main10` — see `PIXEL_FORMATS`.
+                    "-pix_fmt", pixel_format(self.bit_depth)]
         # `-x26N-params` rather than more `-preset` flags: the preset stays the caller's and
         # these are the specific knobs §6a and §6e name, so a reader can see which of the two
         # moved.
@@ -618,6 +677,23 @@ class MasterWriter:
         # R2 with no job and no manifest still says what it is" mechanism is absent from every
         # file while every check around it passes.
         command += ["-movflags", "+faststart+use_metadata_tags", path]
+
+        # ── contract §6g's reference, as a SECOND OUTPUT on this same command ────────────────
+        #
+        # **Appended after the master's filename, which is what makes it a second output rather
+        # than more options on the first.** ffmpeg reads a filename as the end of an output spec,
+        # so everything from here to the next filename applies only to the reference.
+        #
+        # **`-map 0:v:0` again, because mapping is per-output.** Without it this output would take
+        # ffmpeg's default stream selection and, on a job carrying audio, would try to write an
+        # audio stream into a rawvideo file.
+        #
+        # **The SAME `-pix_fmt` the master is encoded at**, which is the whole point: 10-bit
+        # delivers a 10-bit reference and the scores are taken in the space the codec worked in.
+        # *`PIXEL_FORMATS` is read once, above, so the two cannot drift apart.*
+        if self.reference_path is not None:
+            command += ["-map", "0:v:0", "-f", "rawvideo",
+                        "-pix_fmt", pixel_format(self.bit_depth), self.reference_path]
 
         return command
 

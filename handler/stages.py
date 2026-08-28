@@ -48,6 +48,19 @@ STAGES = ("load_s", "decode_s", "model_s",
 #: makes a residual that grows with resolution worth chasing rather than shrugging at.
 RESIDUAL = "stage_residual_s"
 
+#: **The encoder's end-of-stream drain, a TERM IN THE IDENTITY AND NOT AN EIGHTH STAGE**
+#: (`docs/instrumentation.md` §16, §16c). `stdin.close()` then `wait()`, after the last frame has
+#: been handed over — the encoder's queued backlog, which at 8K with a lookahead can be tens of
+#: 50 MiB frames and settles entirely in that call.
+#:
+#: **IT IS MEASURED BY `encoder.MasterWriter` AND NOT BY THIS CLOCK**, which is half the reason it
+#: is not a stage: making it one would feed one instrument's output through another's timing
+#: context for no gain. **The other half is backward compatibility** — `STAGES` keeps its seven
+#: members, so the 45 records banked before this field close the identity unchanged, because a
+#: missing term contributes zero to a sum. *An eighth stage would have needed `record_version`
+#: keying in the kit to avoid retroactively un-certifying them.*
+DRAIN = "drain_s"
+
 
 class StageClock:
     """Per-retime accumulator for §9a's stages as amended by §10a. **Never raises.**
@@ -58,6 +71,11 @@ class StageClock:
 
     def __init__(self):
         self._totals = dict.fromkeys(STAGES, 0.0)
+        #: **PRESENT AND NULL on a run that never opened a writer** (§16), which is the honest
+        #: reading of a job refused before the encode or reaped in the model. Set from
+        #: `MasterWriter.drain_s` by whoever ran the encode; `None` until then, and `totals`
+        #: reports it as such rather than as a measured zero.
+        self.drain_s = None
         #: Names banked against that are not in `STAGES`. **Kept so a typo is visible rather than
         #: absorbed** — see `_bank`.
         self._unknown = {}
@@ -115,6 +133,26 @@ class StageClock:
         defect it is evidence of.
         """
         out = {name: round(self._totals.get(name, 0.0), 3) for name in STAGES}
+        # **§16c's term. Rounded like the stages and for the identical reason** — the remainder
+        # below is taken from the ROUNDED parts, so a term left unrounded here would leave its
+        # rounding error outside the identity and the check grades that identity exactly.
+        # **INSIDE the guard, because this function promises never to raise and `drain_s` is a
+        # PUBLIC attribute assigned from outside this class.** A non-numeric value there would
+        # otherwise turn a never-raising accumulator into a raise, and the run would lose all
+        # SEVEN stage timings rather than just the drain. Found in review.
+        try:
+            drain = None if self.drain_s is None else round(float(self.drain_s), 3)
+            # **NaN and the infinities convert WITHOUT raising**, and a NaN here would propagate
+            # into the residual and out through `json.dumps` as a bare `NaN` token, which strict
+            # JSON readers reject — a record the corpus cannot load, from a diagnostic. *`!=`
+            # against itself is the NaN test that does not need a float comparison.*
+            if drain is not None and (drain != drain or drain in (float("inf"), float("-inf"))):
+                raise ValueError("drain_s is not finite: {!r}".format(self.drain_s))
+        except Exception:  # noqa: BLE001 — this function must never raise; see the docstring
+            print("[stages] drain_s is {!r}, which is not seconds; reported as null".format(
+                self.drain_s), flush=True)
+            drain = None
+        out[DRAIN] = drain
         if compute_s is not None:
             try:
                 # **The remainder is taken from the ROUNDED stages, not the raw ones.**
@@ -126,7 +164,12 @@ class StageClock:
                 # remainder is taken, which is what makes the identity exact rather than
                 # exact-to-a-tolerance"* — and this is the same identity one layer down. The
                 # quarantine above is what keeps an unknown name out of the arithmetic entirely.
-                out[RESIDUAL] = round(float(compute_s) - sum(out[n] for n in STAGES), 3)
+                # **§16c: `compute_s` less the stages AND less the drain.** Before this the
+                # drain landed here unnamed — 8K h264 7.231 s against 8K h265 38.029 s, a 5x
+                # move in a bucket nobody reads, on the wave that introduced it. *A null drain
+                # contributes zero, so a run with no writer reports exactly what it used to.*
+                out[RESIDUAL] = round(
+                    float(compute_s) - sum(out[n] for n in STAGES) - (drain or 0.0), 3)
             except Exception:  # noqa: BLE001
                 pass
         return out

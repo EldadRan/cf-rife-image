@@ -637,7 +637,8 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None, preset=None, threads=None,
            sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False,
-           input_check=False, armed=None, encode_defaults=None, codec=None):
+           input_check=False, armed=None, encode_defaults=None, codec=None,
+           bit_depth=None, reference_score=False):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -646,10 +647,16 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
     arithmetic while the request records that nobody chose.
     """
     import encoder  # noqa: PLC0415 — imported here so this module stays importable without one
+    import reference  # noqa: PLC0415 — contract §6g, and stdlib-only like the rest of this pair
     import variants  # noqa: PLC0415
 
     from decode import open_source  # noqa: PLC0415 — cv2 is a GPU-box import, like the rest
 
+    # **Bound BEFORE the `try`, because the `finally` that releases it is at THIS level.** A name
+    # first assigned inside the block is unbound on every path that raises before reaching it, and
+    # the cleanup would then raise `NameError` and mask the failure it was running after —
+    # `capture` above is bound before the `try` for the same reason.
+    reference_path = None
     capture, shape = open_source(source_path)
     try:
         width, height = shape["width"], shape["height"]
@@ -754,6 +761,41 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # arriving from the same dict rather than from a second decision about what h265 has.
         encode_arm = dict(encode_settings, crf=encode_crf, preset=encode_preset)
 
+        # ── contract §6g's DISK BOUND, AND IT FIRES BEFORE THE FIRST FRAME ──────────────────
+        #
+        # **HERE, because this is the first line at which all three inputs exist**: the delivered
+        # frame size, the planned output count, and the pixel format the encode will use. It is
+        # ALSO before `MasterWriter` is constructed, which is the requirement — §6g rules the
+        # refusal *"before the first frame"* and gives the reason in full: *a job that fills the
+        # disk at frame 400 has spent the whole model cost to produce nothing, which is the most
+        # expensive failure this worker can have.*
+        #
+        # **The bound is computed against the DIRECTORY THE REFERENCE WILL BE WRITTEN TO**, not
+        # against a hard-coded figure — the free space is this worker's, now, and a constant here
+        # would be the parent project's number wearing this project's units.
+        # **Bound before the branch so every path to the stats has it**, including the unarmed
+        # one — a name that exists only inside an `if` is a `NameError` on the path that skipped.
+        # *`reference_path` is bound above the `try` instead, because its cleanup is at function
+        # level and must be able to read it on a path that never reached this line.*
+        reference_block = None
+        reference_format = None
+        if reference_score:
+            reference_path = os.path.join(os.path.dirname(master_path) or ".",
+                                          "reference.raw")
+            # **The format is resolved through `encoder.pixel_format`, which is the same call
+            # `MasterWriter` makes** — so the bytes the bound reserves and the bytes ffmpeg
+            # writes cannot be computed from two different answers to "what format is this".
+            reference_format = encoder.pixel_format(bit_depth)
+            reference.refuse_if_it_will_not_fit(
+                os.path.dirname(reference_path) or ".", width, height,
+                # **Passed AS IT IS, with no `or 0`.** The callee refuses a non-positive
+                # count; coercing an absent one to zero here would produce a refusal naming a
+                # planned count of 0 that the request never had. *`n_out` is a plain int by
+                # construction — `interpolate.target_count` returns `int(...)` — so the callee's
+                # type check refuses a shape this path cannot produce, which is what an internal
+                # guard is for.*
+                stats.get("n_out"), reference_format)
+
         estimate = None
         if progress is not None:
             progress.plan_frames(stats.get("n_out"))
@@ -783,6 +825,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # writer is then the single object that knows what ran — which is what the record
             # reads it off, exactly as it already does for the five settings.
             codec=codec,
+            # §6f. Passed by name beside the codec, and the writer refuses the pair `validation`
+            # already refused — a second guard on a path a request cannot reach.
+            bit_depth=bit_depth,
+            # §6g. None on an unarmed run, which is what leaves the command a single output.
+            reference_path=reference_path,
             crf=encode_crf, preset=encode_preset, **encode_settings)
         # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
         # `Progress` was constructed — before the fetch, before the probe, before the model
@@ -889,6 +936,18 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     else writer_cm.x264_params),
                 remedy=exc.remedy, shortfall=exc.shortfall) from exc
         finally:
+            # **§16: the drain reaches the RECORD, and this is the line that carries it there.**
+            # It has been measured on every run this project has ever done and recorded on none —
+            # `encoder.py` computes it, the block below PRINTS it, and no record has ever held
+            # it. **Banked on the clock because that is the object `handler._timings` already
+            # reads**, and inside the `finally` for the reason the two prints are: a run reaped
+            # mid-encode is a run whose drain is the most interesting number it has.
+            #
+            # *`writer_cm.drain_s` is None until `__exit__` has run, and a null term contributes
+            # zero to §16c's identity — so a run that died before the drain reports exactly what
+            # it used to.*
+            if clock is not None:
+                clock.drain_s = writer_cm.drain_s
             # Said out loud whichever way the encode ended, because a log line survives a bundle
             # that was never written.
             print("[encode] ffmpeg peak RSS {} GiB over {} frame(s)".format(
@@ -903,6 +962,27 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # smooths it — and its readings are CRF- and codec-specific and expire at x265.
             # **Nothing is banked on it and it files no record field.**
             _print_write_distribution(writer_cm)
+        # ── contract §6g's SCORING, and it runs only after the master exists ──────────────────
+        #
+        # **OUTSIDE the `try/finally` above and after the writer has closed**, because the
+        # reference is not complete until ffmpeg has exited: it is that process's second output,
+        # and reading it while the process still holds it would score a truncated file against a
+        # finished master and report the difference as quality.
+        #
+        # **A failure here must never cost a delivered master.** The master is written, verified
+        # and about to be uploaded by the time this runs; §6g's instrument is a diagnostic and
+        # `reference` is absent from the record when it does not produce one — which §17a already
+        # rules is the honest shape. *The exception is swallowed with its text printed, exactly as
+        # `_print_write_distribution` is, and for the same reason.*
+        if reference_path is not None:
+            try:
+                reference_block = reference.score(
+                    master_path, reference_path, width, height, float(target_fps),
+                    reference_format, stats.get("n_out"), os.path.dirname(master_path) or ".")
+            except Exception as exc:  # noqa: BLE001 — a score must never displace a master
+                print("[reference] not scored ({}: {})".format(
+                    type(exc).__name__, exc), flush=True)
+                reference_block = None
         # **The other half of the derived count.** `stream()` refuses a source shorter than the
         # plan; this refuses one longer. A container whose duration and rate imply fewer frames
         # than it holds would otherwise deliver a silently truncated retime.
@@ -976,12 +1056,42 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # **What RAN, read off the writer** — the codec, both parameter strings
                     # and the settings that codec has. See `_encode_fields`.
                     **_encode_fields(writer),
+                    # **§17, and it rides the stats because `retime` is handed no `trace`** —
+                    # the same channel `estimate` and `convert_check` use. `handler` lifts it to
+                    # the record's TOP level and uploads its PNGs. **None on an unarmed run and
+                    # on one whose scoring failed**, which §17a rules is ABSENT rather than null.
+                    reference=reference_block,
                     # **Same defect, same fix, one line further.** §2 lists `snap_tolerance` among
                     # the axes a run must carry and the record filed it null for the same reason.
                     # `target_fps` is what the whole job was FOR. Both were envelope-only.
                     target_fps=float(target_fps),
                     snap_tolerance=snap_tolerance)
     finally:
+        # **THE REFERENCE GOES FIRST, AND THE ORDER IS THE FIX.** `capture.release()` below is an
+        # unguarded cv2 call; if it raises on a wedged `VideoCapture` the rest of this block never
+        # runs, and a cleanup sequenced behind it would leak exactly on the paths it exists for.
+        # *Ordering rather than wrapping, because changing how a pre-existing release reports its
+        # own failure is a different decision from making this cleanup reliable.* Found in review.
+        #
+        # **§6g's disk is released on EVERY exit from this function, not only the scored one.**
+        # `reference.score` deletes the file in its own `finally`, but it is reached only when
+        # the encode SUCCEEDED — an ffmpeg failure, an OOM, a broken pipe or the re-raised writer
+        # error all propagate past the scoring block, and tens of GB of `reference.raw` would
+        # survive in the workdir. **On a warm worker that is the next job's disk**: it computes
+        # its own bound against a `free` that is 20 GB short and refuses a request that would
+        # have fit, with a message blaming the caller's frame size. *Found in review; the module
+        # docstring promised "deleted whatever happens" and delivered it only for one path.*
+        #
+        # **Belt and braces rather than a move.** `score`'s own cleanup stays where it is,
+        # because it releases the disk BEFORE the PNG uploads rather than after this function
+        # returns, and on the 8K path those are different amounts of time.
+        if reference_path is not None:
+            try:
+                if os.path.exists(reference_path):
+                    os.remove(reference_path)
+            except OSError as exc:  # noqa: BLE001 — cleanup must not displace a real failure
+                print("[reference] could not remove {}: {}".format(reference_path, exc),
+                      flush=True)
         if capture is not None:
             capture.release()
 
@@ -1017,6 +1127,11 @@ def _encode_fields(writer):
     record's top level, where §15c's inference rule reads it.*
     """
     fields = {"codec": writer.codec,
+              # **§6f, and carried EXPLICITLY at 8 rather than omitted.** §15a rules absence to
+              # mean 8, so both spellings are legal — and one rule for `codec` and `bit_depth`
+              # together is easier to hold than a field that appears only at one of its values.
+              # *Absence stays meaningful for the 45 rows that predate the field.*
+              "bit_depth": writer.bit_depth,
               "x264_params": writer.x264_params,
               "x265_params": writer.x265_params,
               "crf": writer.crf,

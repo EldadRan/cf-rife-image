@@ -498,6 +498,9 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # used**, which is the value §15b requires and the only one that stays true the day
         # `codec: "source"` is implemented and the ask stops equalling the outcome.
         trace["codec"] = request["release_3"]["codec"]
+        # §6f, banked for §15c's reason exactly: absence on the record means 8, so a reaped
+        # 10-bit run that filed nothing would be read as an 8-bit row — a wrong value, not a gap.
+        trace["bit_depth"] = request["release_3"]["bit_depth"]
 
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
@@ -525,6 +528,12 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # what moved is the refusal. Passed through by name so the library is chosen in exactly
         # one place, `encoder.CODEC_LIBRARIES`.
         codec=request["release_3"]["codec"],
+        # §6f, travelling beside the codec because they are refused as a PAIR at the door.
+        bit_depth=request["release_3"]["bit_depth"],
+        # **contract §6g's fifth gate.** `retime` computes the disk bound from the delivered
+        # frame size and the planned count and REFUSES before the first frame, so an unaffordable
+        # request costs nothing rather than the whole model pass.
+        reference_score=request.get("reference_score"),
         # **`docs/instrumentation.md` §8g-1's other half, and it is the half that makes the kit's
         # decline honest rather than convenient.** §8g-1 lets the acceptance kit DECLINE TO GRADE
         # an armed run's first ETA, because the instruments land in `wall_s` and §12 rules that
@@ -538,7 +547,12 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # it at all — they run in this function. Deriving the list from what `retime` happens to
         # hold would silently answer for two of the four, which is the shape of a check that runs
         # in the direction the code takes.
-        armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe")
+        # **`reference_score` joins as the FIFTH** (contract §6g). §12's rule is the same for
+        # all five — an armed run's `compute_s` is comparable to nothing — and this is the one
+        # that also makes the run's DISK and its `write_wait_s` incomparable, because retention
+        # writes to the same volume the master is written to.
+        armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe",
+                                   "reference_score")
                if request.get(field)],
         # **Passed at last.** `retime` has declared this parameter since it was written and
         # `_retime` never supplied it, so the retime path published two payloads for a
@@ -560,6 +574,50 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     finally:
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
     _note(trace, "transfer", "upload_bytes", upload_bytes)
+
+    # ── contract §6g's worst-frame PNGs, uploaded beside the master ──────────────────────────
+    #
+    # **§17b: the PNG is not a formality.** *An aggregate nobody can look behind is the state
+    # §6e's artefact ruling exists to leave* — the scores say a frame is the worst one and the
+    # picture is what lets a person agree or disagree.
+    #
+    # **HERE, after the master's upload, and never before it.** The master is the deliverable and
+    # these are evidence about it; a diagnostic upload that ran first would put its own failure
+    # between a finished master and its only copy, which is the correction §11 already made to
+    # the decode probe. **`worst_pngs` is rewritten from local paths to KEYS**, because a record
+    # naming `/tmp/...` describes a file nobody else can open.
+    # **READ OFF `stats` AND NOT OFF `trace`, and the difference is a silent failure.** `trace`
+    # does not carry this block until forty lines below, where the retime stats are filed — so a
+    # read from `trace` here is None on every run, no PNG is ever uploaded, and `worst_pngs`
+    # reaches the record still holding LOCAL paths. **Nothing would have caught it**: the kit
+    # grades `frames` and the three metric blocks and never opens the keys, so the record would
+    # have passed while naming files nobody else can read. *It is the same dict object either
+    # way, so rewriting `worst_pngs` here is what `trace` files below.*
+    reference_block = stats.get("reference")
+    if reference_block:
+        keys_uploaded = []
+        for png_path in reference_block.get("worst_pngs") or []:
+            try:
+                name = os.path.basename(png_path)
+                keys_uploaded.append(storage.upload(client, request["output"], name, png_path,
+                                                    keys.content_type(name)))
+                _add(trace, "transfer", "upload_bytes", os.path.getsize(png_path))
+            except Exception as exc:  # noqa: BLE001 — evidence must never cost a delivery
+                print("[reference] worst-frame upload failed for {}: {}".format(
+                    png_path, exc), flush=True)
+        # **Only the keys that actually landed.** A key listed for an upload that failed would
+        # make the record claim evidence it does not have — §17b's own point, one step earlier.
+        reference_block["worst_pngs"] = keys_uploaded
+        # **BANKED HERE, THE INSTANT THE KEYS ARE REAL, AND NOT FIFTY LINES DOWN.** The §11 decode
+        # probe sits between this point and where the retime stats are filed, and it is three full
+        # re-decodes at a half-hour timeout each — so a raise or a reap in that span would leave a
+        # run that reserved the disk, wrote the reference, scored it, cut and uploaded the PNGs
+        # and paid for all of it, filing a record with no `reference` key. **§17a rules that
+        # absence to mean nobody asked**, so the most expensive instrument in the worker would
+        # report as unarmed on exactly the runs that went wrong. *Found in review; it is the same
+        # failure the missing `reference=` argument caused, narrowed to a slow one.*
+        if trace is not None:
+            trace["reference"] = reference_block
 
     # **`docs/instrumentation.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
     # It sat between the finished master and its upload, where three full re-decodes at a
@@ -635,12 +693,19 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # `codec` nested inside `retime` is invisible to it, and a row that carries the field
         # somewhere the rule does not look is a row the rule reads as h264.
         trace["retime"] = {k: v for k, v in stats.items()
-                           if k not in ("estimate", "convert_check", "input_check", "codec")}
+                           if k not in ("estimate", "convert_check", "input_check",
+                                        "codec", "bit_depth", "reference")}
         # **What RAN, replacing what was asked for.** They are the same value today — §6e leaves
         # `codec: "source"` refused, so there is no resolution step between the ask and the
         # outcome — and this line is what makes that a fact about the writer rather than a fact
         # about the request that happens to hold.
         trace["codec"] = stats.get("codec", trace["codec"])
+        trace["bit_depth"] = stats.get("bit_depth", trace["bit_depth"])
+        # **§17a: banked ONLY when the instrument produced one**, and banked ABOVE, as soon as
+        # the uploaded keys exist. This is the fallback for a run that produced scores and never
+        # reached the upload — the same dict either way, so it cannot disagree with itself.
+        if stats.get("reference") is not None and "reference" not in trace:
+            trace["reference"] = stats["reference"]
 
     return _decorate({
         "status": "DELIVERED",
@@ -666,7 +731,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # two strings came back empty. *One fact, one home, per document: the record's home is
         # its top level and the envelope's is here.*
         "retime": {k: v for k, v in stats.items()
-                   if k not in ("estimate", "convert_check", "input_check")},
+                   if k not in ("estimate", "convert_check", "input_check", "reference")},
         # **`padded_megapixels` is the fit's independent variable and nothing computed it**
         # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
         # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
@@ -823,6 +888,18 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # opposite of `encode_defaults` above, and the difference is which of absence and
             # null the reader was told to interpret.
             codec=(trace or {}).get("codec"),
+            # §6f, and OMITTED rather than null for `codec`'s reason: §15a rules absence to mean
+            # 8, so a present-and-null field would be a row that is neither depth.
+            bit_depth=(trace or {}).get("bit_depth"),
+            # **§17. THIS LINE IS THE WHOLE INSTRUMENT'S ONLY WAY ONTO THE RECORD, and it was
+            # missing** — found in review. Without it §6g ran in full on every armed job: the
+            # disk was reserved, the reference written, the scoring performed, the PNGs uploaded
+            # and paid for — and the record filed nothing. **And the failure was invisible by
+            # construction**, because §17a rules an absent block to be the UNARMED state, so the
+            # kit reports `Skip` and a reader cannot tell "nobody asked" from "it ran and its
+            # answer was dropped". *The most expensive instrument in the worker, reporting as
+            # though it had never been switched on.*
+            reference=(trace or {}).get("reference"),
             # §2g-2. Absent on every run that did not sweep, which is every run: the kit's
             # `--tie-check` REQUIRES the block rather than shrugging when it is missing, so a
             # null here would read as "swept and found nothing" to nobody and as a missing field

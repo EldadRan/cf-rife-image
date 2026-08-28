@@ -250,6 +250,9 @@ PARAMS_FIELDS = {
     # **`docs/instrumentation.md` §11's decode decomposition.** Re-decodes the source three
     # times beside the retime, so it is opt-in per job like every other probe in this surface.
     "decode_probe",
+    # contract §6g's fifth gate. **Registered here or the door refuses it by name**, which is
+    # `_refuse_unknown`'s job and is why a new field is two edits rather than one.
+    "reference_score",
 }
 
 #: **Nothing is unconditionally required, and that is the point.** `target_short_edge_px` is
@@ -772,6 +775,19 @@ def validate(job_input):
     decode_probe = params.get("decode_probe")
     decode_probe = False if decode_probe is None else _as_bool(decode_probe, "decode_probe")
 
+    # **contract §6g's FIFTH GATE, and the most expensive of the five.** It retains every frame
+    # handed to the encoder on worker disk, scores the delivered master against them, and uploads
+    # the scores — so it writes tens of GB to the same volume the master is written to and runs
+    # three filters over every delivered frame.
+    #
+    # **Opt-in per job for the reason the other four are, one order of magnitude louder.**
+    # `docs/instrumentation.md` §12 rules that request-gated instruments do not compose and that
+    # an armed run's `compute_s` is comparable to nothing; this one also makes the run's DISK
+    # comparable to nothing. *A run carrying it must not bank a performance number.*
+    reference_score = params.get("reference_score")
+    reference_score = (False if reference_score is None
+                       else _as_bool(reference_score, "reference_score"))
+
     rc_lookahead = params.get("rc_lookahead")
     if rc_lookahead is not None:
         rc_lookahead = _as_int(rc_lookahead, "rc_lookahead")
@@ -802,6 +818,32 @@ def validate(job_input):
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_SMALL]["rc_lookahead"],
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["rc_lookahead"]),
             )
+
+    # ── §6f — 10-BIT IS REFUSED UNDER h264, AND THE REASON IS DELIVERY ──────────────────
+    #
+    # **CF's ruling: `bit_depth` is a field and not a codec name**, so `main10` is switchable
+    # without `output.codec` having to answer two questions at once. `envelope` has already
+    # refused anything that is not 8 or 10; what is decided here is whether the codec can honour
+    # the one that was sent.
+    #
+    # **THE REASON IS DELIVERY RATHER THAN TASTE, AND THE MESSAGE SAYS SO.** HEVC `main10` is
+    # hardware-decoded by essentially every modern playback chain; h264 `High10` is decoded in
+    # hardware by almost none. **A master this worker can produce and the wall cannot play is
+    # worse than a refusal** — so the caller is told the FACT and not the rule, and can act on it
+    # by moving to h265 rather than by learning that we said no.
+    #
+    # **Refused rather than dropped, which is §6e ruling 2's shape one field over**: a field that
+    # cannot be honoured is refused at the door, because a dropped one leaves the caller believing
+    # a 10-bit master exists and the record would carry `bit_depth: 10` beside an 8-bit encode.
+    if release_3["bit_depth"] != envelope.DEFAULT_BIT_DEPTH and release_3["codec"] != "h265":
+        raise WorkerError(
+            FIELD_NOT_SUPPORTED,
+            "'output.bit_depth: {}' was sent with 'output.codec: {}'. 10-bit is served on h265 "
+            "only, and the reason is playback rather than capability: HEVC main10 is decoded in "
+            "hardware by essentially every modern chain and h264 High10 by almost none, so a "
+            "master this worker can produce and your screen cannot play is worse than this "
+            "refusal. Send 'output.codec: h265' with it, or drop the field for 8-bit."
+            .format(release_3["bit_depth"], release_3["codec"]))
 
     # ── §6e RULING 2 — x264's THREE FIELDS ARE REFUSED UNDER h265, NOT DROPPED ──────────
     #
@@ -893,6 +935,7 @@ def validate(job_input):
         "tie_check": tie_check,
         "input_check": input_check,
         "decode_probe": decode_probe,
+        "reference_score": reference_score,
         "derive": derive,
         "output": _validate_output(job_input["output"]),
         "diagnostics": diagnostics,

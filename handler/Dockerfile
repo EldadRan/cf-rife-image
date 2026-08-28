@@ -97,6 +97,55 @@ RUN curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 6
 # what makes the identity tags exist at all — without it ffmpeg succeeds, the file plays, and the
 # tags are silently absent (docs/decisions.md 3.3).
 #
+# **`libvmaf` IS ASSERTED HERE RATHER THAN INSTALLED ANYWHERE, AND THAT IS THE POINT**
+# (contract §6g). The pinned build already carries it — its embedded configuration line reads
+# `--enable-libvmaf` beside `--enable-libx264` and `--enable-libx265` — so this file needs no new
+# build-time dependency for CAMBI. **What it needs is the assertion**, because the same is true of
+# libx264 and nothing in this file names that either: a capability nobody checks is a capability
+# that disappears when the pin moves.
+#
+# **AND IT RUNS THE INVOCATION RATHER THAN GREPPING FOR A NAME, WHICH IS THE WHOLE DIFFERENCE**
+# (`docs/gate-findings.md` F-2026-08-28-15). A name grep catches a pin that moved to a build
+# without the capability. **It cannot catch a build where the capability is present and the
+# invocation is wrong** — and that is `F-2026-08-28-7` delivered: ffmpeg accepted `-x264-params`
+# under `libx265`, exited 0, and wrote a master with no bound.
+#
+# **TWO UNPROVEN FACTS DIE HERE FOR THE PRICE OF ONE.** Neither the gate nor the builder could
+# establish, by any method either had, that this build's `libvmaf` accepts `feature=name=...` —
+# `strings` finds `log_path` and `log_fmt` in the binary and does NOT find `feature`, which is
+# ambiguous rather than damning, and string-probing a 138 MB binary is the method that produced
+# `F-2026-08-28-7` in the first place. **The second fact is the metric KEY NAMES**: `psnr_y`,
+# `float_ssim` and `cambi` are the same class of assumption, and `reference.parse_log` REFUSES
+# rather than defaulting when one is missing — because a metric scored as 0.0 reads as excellent
+# CAMBI and as a broken PSNR from one silence. *Both are settled in two seconds, at build time.*
+#
+# **AND IT ASSERTS EVERY PRECONDITION `reference.parse_log` REFUSES ON, not just the key names.**
+# A build can satisfy a key check and still be refused by the parser on every delivered job —
+# `parse_log` also requires the frame COUNT to match, `frameNum` to be zero-based and contiguous,
+# and each value to convert to `float`. *A `{"cambi": null}` satisfies `k in m` and raises a
+# `TypeError` — not even the coded refusal — inside a real run.* **Each of those is asserted here,
+# on both frames**, so the build fails in two minutes rather than the instrument failing silently
+# on every job for ever. Found in review of this wave.
+#
+# **CHECKED WHERE THE PARSER READS IT, NOT ANYWHERE IN THE FILE.** A `grep` for `"cambi"` proves
+# the string appears SOMEWHERE in the log; `reference.parse_log` requires the key inside
+# `frames[i]["metrics"]`. A build whose libvmaf reported these only under `pooled_metrics` would
+# pass a grep and refuse every delivered job — **the assertion exercised from the direction the
+# code takes rather than the direction the failure comes from**, which is the class this whole
+# block is being hardened against. *Found in review of this wave.*
+#
+# **The two sources DIFFER on purpose.** Identical inputs give infinite PSNR, and `inf` is not
+# valid JSON — an assertion that wrote a log nothing could parse would fail for the wrong reason.
+# 128x128 rather than smaller because CAMBI's default window is 63 pixels wide.
+#
+# **`libx265` IS ASSERTED BESIDE IT ON A RULED EXCEPTION, AND THE EXCEPTION IS RECORDED RATHER
+# THAN ABSORBED.** The gap is real — §6e made x265 a shipping path and nothing anywhere asserted
+# the encoder exists, so a pin moving to a build without it would fail every h265 job at RUN time
+# instead of here. **It is not part of §6f, §6g, §16 or §17**, and it was reverted once as scope
+# growth before the gate ordered it explicitly: what made it payable is that this wave already
+# opens this block for `libvmaf`, so deferring it would mean touching the block twice and paying a
+# second build for one line. *A ruled exception, not a precedent.*
+#
 # **Written to files rather than piped into `grep -q`.** `grep -q` exits the instant it matches,
 # which closes the pipe under ffmpeg and kills it with SIGPIPE — exit 141, which `-o pipefail`
 # then propagates and `set -e` turns into a failed build. It is a race against ffmpeg finishing
@@ -108,10 +157,17 @@ RUN set -eux; \
     ffmpeg -hide_banner -h muxer=mp4 > /tmp/mp4muxer.txt; \
     grep -q libwebp /tmp/encoders.txt; \
     grep -q libx264 /tmp/encoders.txt; \
+    grep -q libx265 /tmp/encoders.txt; \
     grep -q use_metadata_tags /tmp/mp4muxer.txt; \
+    ffmpeg -hide_banner -loglevel error \
+      -f lavfi -i "testsrc2=size=128x128:rate=1:duration=2,format=yuv420p" \
+      -f lavfi -i "testsrc=size=128x128:rate=1:duration=2,format=yuv420p" \
+      -lavfi "[0:v][1:v]libvmaf=feature=name=cambi|name=psnr|name=float_ssim:log_path=/tmp/vmaf.json:log_fmt=json" \
+      -f null -; \
+    python3 -c "import json,sys; K=('cambi','psnr_y','float_ssim'); f=json.load(open('/tmp/vmaf.json'))['frames']; assert len(f)==2, 'scored %d frames, expected 2' % len(f); [ (lambda m: [ (k in m) or sys.exit('frames[%d].metrics lacks %s; it reports %s' % (i,k,sorted(m))) for k in K ] + [ float(m[k]) for k in K ])(e['metrics']) for i,e in enumerate(f) ]; [ e.get('frameNum') in (None,i) or sys.exit('frameNum %r at position %d; the parser needs zero-based contiguous' % (e.get('frameNum'),i)) for i,e in enumerate(f) ]; print('libvmaf ok: %d frames, %s' % (len(f), sorted(f[0]['metrics'])))"; \
     ffmpeg -version > /tmp/ffver.txt; \
     echo "toolchain: $(python3 -V), $(head -1 /tmp/ffver.txt)"; \
-    rm -f /tmp/encoders.txt /tmp/mp4muxer.txt /tmp/ffver.txt
+    rm -f /tmp/encoders.txt /tmp/mp4muxer.txt /tmp/ffver.txt /tmp/vmaf.json
 
 # ── Python dependencies ─────────────────────────────────────────────────────────────────────
 # **Nothing here pins `torch` or `torchvision`, and that is load-bearing rather than an omission.**

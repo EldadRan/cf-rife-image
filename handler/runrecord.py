@@ -128,7 +128,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
           convert_check=None, input_check=None, decode_probe=None, encode_defaults=None,
-          codec=None):
+          codec=None, bit_depth=None, reference=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -140,7 +140,24 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # **Version the shape, because this one is meant to be read years from now** by something
         # that was not written yet. A corpus whose entries cannot say which shape they are is a
         # corpus that can only be parsed by the code that wrote it.
-        "record_version": 1,
+        # **BUMPED 1 -> 2 BY THIS WAVE, AND IT IS THE FIELD'S FIRST JOB**
+        # (`docs/instrumentation.md` §16b). It has been the literal `1` since the project began
+        # and NOTHING READ IT — an eighth member of `F-2026-08-25-1`'s class, sitting in plain
+        # sight on every row.
+        #
+        # **§16 makes `drain_s` mandatory, and 45 banked records legitimately lack it.** A kit
+        # that failed them would retroactively un-certify work that met the spec in force when it
+        # ran, so the kit keys the rule on this number: below 2 an absent `drain_s` is legal and
+        # SKIPS, at 2 and above it is a defect. *Self-keying, which is §14a's form — a check
+        # keyed on the build commit would need editing at every image, one keyed on a date would
+        # be wrong for a replay, and one that skipped on absence would let a NEW image drop the
+        # field silently.*
+        #
+        # **BUMPED ONCE FOR THE WHOLE WAVE, NOT PER FIELD.** `bit_depth` and the `reference`
+        # block have their own absence rules — §15a's inference and §17a's armed-instrument skip
+        # — and neither needs the version. `drain_s` is the only field this wave makes MANDATORY
+        # on a path that already ran.
+        "record_version": 2,
         "utc": diagnostics._now(),
         "status": status,
         "build": build_identity,
@@ -240,6 +257,19 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     # present is what ran, and there is no third state to spell.
     if codec is not None:
         body["codec"] = codec
+    # §6f, and omitted rather than nulled for `codec`'s reason exactly: §15a rules that a row
+    # with no `bit_depth` is an 8-bit row, because every record written before §6f was `yuv420p`
+    # from an unconditional literal. **A present-and-null field would be a row that is neither
+    # depth**, on a field whose whole purpose is that every row can be attributed to one.
+    if bit_depth is not None:
+        body["bit_depth"] = bit_depth
+    # **§17a, and OMITTED rather than nulled like the four gates above it.** `reference_score`
+    # runs only when asked, so absence is a state — the run did not arm it — and the kit grades
+    # that as `Skip` rather than as a pass. *A present-and-null block would be an instrument
+    # asserting it ran and found nothing, which is exactly what it cannot distinguish itself from
+    # if the field is always there.*
+    if reference:
+        body["reference"] = reference
     if progress is not None:
         body["seconds_per_frame"] = progress.seconds_per_frame()
     if error:

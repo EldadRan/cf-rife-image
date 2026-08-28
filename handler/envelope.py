@@ -21,6 +21,23 @@ CODECS = ("h264", "h265", "source")
 #: today and must still encode h264 after this ships — `default_off_identity` is the assertion.
 DEFAULT_CODEC = "h264"
 
+#: **`main10` IS A PROFILE AND NOT A CODEC NAME** (contract §6f). CF's ruling was *"we can switch
+#: main10 on and off as needed"*, and a switch is a field — folding it into `CODECS` as a third
+#: value would make one enumeration answer two questions, which encoder and at what precision.
+#: *§6d's lesson one surface over: a value that quietly stands for two states is the defect this
+#: project has been fixed for twice.*
+#:
+#: **10 is REFUSED UNDER h264 and the refusal lives in `validation`, not here.** This module owns
+#: the enumeration — is it a bit depth at all — and the cross-field rule is a capability question
+#: about the codec, which is the door's. Same split as `codec`: `source` is enumerable here and
+#: refused there.
+BIT_DEPTHS = (8, 10)
+
+#: **Unchanged, so an omitted field cannot move anything** — the reason `DEFAULT_CODEC` gives.
+#: Every record written before §6f was `yuv420p` from an unconditional literal, so absence is 8
+#: by construction (`docs/instrumentation.md` §15a).
+DEFAULT_BIT_DEPTH = 8
+
 #: CF: request-carried, default 60.
 DEFAULT_TARGET_FPS = 60.0
 
@@ -50,6 +67,23 @@ def derive(params):
         raise WorkerError(
             INVALID_FIELD_VALUE,
             "field 'output.codec' must be one of {}; got {!r}".format(CODECS, codec))
+
+    # **The enumeration only. Contract §6f's cross-field rule — 10 is h265-only — is
+    # `validation`'s**, exactly as `codec: source` is enumerable here and refused there.
+    #
+    # **THE TYPE IS CHECKED BEFORE THE MEMBERSHIP, AND A MEMBERSHIP TEST ALONE WOULD NOT DO IT.**
+    # `8.0 in (8, 10)` is True and `True == 1` — Python compares across numeric types — so a
+    # float or a bool can satisfy `in BIT_DEPTHS` and reach the record wearing a type the field
+    # does not have. *`8.0` on a row is the shared law's float-identity clause arriving in a
+    # field nobody would think to check, and it would compare equal in the kit too.*
+    bit_depth = output.get("bit_depth", DEFAULT_BIT_DEPTH)
+    if isinstance(bit_depth, bool) or not isinstance(bit_depth, int) \
+            or bit_depth not in BIT_DEPTHS:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'output.bit_depth' must be one of {}; got {!r}. It is a PROFILE switch and "
+            "not a codec name — 10 selects HEVC main10 and is refused on h264.".format(
+                BIT_DEPTHS, bit_depth))
 
     # **`upscale: false` is explicit, and the tempting spelling was a trap.** Letting a missing
     # size field mean "no upscale" needs no new field and reuses the sizing refusal as the
@@ -90,8 +124,13 @@ def derive(params):
                 raise WorkerError(
                     INVALID_FIELD_VALUE,
                     "field '{}' has no meaning without 'interpolate'".format(orphan))
-        return {"codec": codec, "interpolate": None, "upscale": True,
-                "release_2_equivalent": codec == DEFAULT_CODEC}
+        return {"codec": codec, "bit_depth": bit_depth, "interpolate": None, "upscale": True,
+                # **`bit_depth` joins the equivalence test rather than riding beside it.** A
+                # 10-bit request is not what a release-2 caller sends, and `default_off_identity`
+                # asserts that the DEFAULT path is unmoved — which stays true, because an omitted
+                # field is 8.
+                "release_2_equivalent": (codec == DEFAULT_CODEC
+                                         and bit_depth == DEFAULT_BIT_DEPTH)}
 
     if not isinstance(interpolate, dict):
         raise WorkerError(INVALID_FIELD_VALUE, "field 'interpolate' must be an object")
@@ -133,6 +172,7 @@ def derive(params):
 
     return {
         "codec": codec,
+        "bit_depth": bit_depth,
         "interpolate": {"target_fps": float(target_fps), "snap_tolerance": tolerance,
                         "route": route},
         "upscale": upscale is not False,

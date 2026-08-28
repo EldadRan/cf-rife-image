@@ -347,8 +347,13 @@ def _runpod_identity(job):
 #: below drops `None` and not falsey values, so an unarmed run says so explicitly rather than by
 #: omission — which is the distinction this project keeps paying for: an absent key and a
 #: measured `false` must not read alike to whoever reads the corpus next.
+#: **The FIFTH gate is here or an armed run looks unarmed on its own record** (contract §6g).
+#: The kit reads `record["request"][gate]` to decide whether to grade the ETA — §8g-1 — so a gate
+#: missing from this tuple is a gate the record cannot report and the kit cannot skip on.
+#: *`reference_score` was added with §6g; the four before it were added the same way and for the
+#: same reason.*
 _REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale", "convert_check",
-                   "tie_check", "input_check", "decode_probe")
+                   "tie_check", "input_check", "decode_probe", "reference_score")
 
 #: Read out of `release_3["interpolate"]` rather than off the top level, because that is where
 #: the envelope puts them.
