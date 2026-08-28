@@ -637,7 +637,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
            snap_tolerance=None, crf=None, audio_source=None, progress=None,
            variant="direct", scale=None, preset=None, threads=None,
            sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False,
-           input_check=False, armed=None, encode_defaults=None):
+           input_check=False, armed=None, encode_defaults=None, codec=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -715,12 +715,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # `validation` deliberately no longer defaults these three, precisely so that this line
         # can tell an absence from a value; §6b's surviving clause is that an explicitly-sent
         # field is obeyed and never silently overridden.
+        #
+        # **AND UNDER h265 THERE IS NO BRANCH TO TAKE** (contract §6e, `docs/instrumentation.md`
+        # §15a). §6d's table is x264's vocabulary and cannot have resolved an h265 job, so
+        # `resolve_defaults` returns NO settings and a basis that says the table was skipped —
+        # and everything below reads off `encode_settings` rather than assuming three keys.
         encode_settings, encode_provenance = encoder.resolve_defaults(
-            int(width) * int(height),
+            int(width) * int(height), codec=codec,
             threads=threads, sliced_threads=sliced_threads, rc_lookahead=rc_lookahead)
-        encode_threads = encode_settings["threads"]
-        encode_sliced = encode_settings["sliced_threads"]
-        encode_rc_lookahead = encode_settings["rc_lookahead"]
         # **Filled IN PLACE into the caller's dict rather than returned in `stats`.** `handler`
         # banks this object in `trace` before calling us, so a run reaped in ffmpeg still files
         # what its settings were resolved from — the same argument `ConvertCheck` is handed in
@@ -728,11 +730,15 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # exactly the runs worth recording.
         if encode_defaults is not None:
             encode_defaults.update(encode_provenance)
-        print("[encode] defaults {} at {} delivered pixels ({}x{}, boundary {}): threads={} "
-              "sliced-threads={} rc-lookahead={}".format(
-                  encode_provenance["basis"], int(width) * int(height), width, height,
-                  encode_provenance["boundary"], encode_threads,
-                  1 if encode_sliced else 0, encode_rc_lookahead), flush=True)
+        print("[encode] defaults {} at {} delivered pixels ({}x{}, boundary {}): {}".format(
+            encode_provenance["basis"], int(width) * int(height), width, height,
+            encode_provenance["boundary"],
+            # **The settings that were resolved, or the fact that none were.** Formatted from
+            # the dict rather than from three named locals, so the h265 line says what is true
+            # about h265 instead of printing x264's vocabulary with placeholder values in it.
+            " ".join("{}={}".format(name, encode_settings[name])
+                     for name in encoder.AREA_FIELDS if name in encode_settings)
+            or "no x264 thread settings — this codec has no such table"), flush=True)
 
         # **`crf` and `preset` are NOT §6d's and still resolve to constants here.** The table
         # decides three fields and says nothing about either. **Their substitution is REPORTED**
@@ -743,8 +749,10 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         encode_preset = preset if preset is not None else encoder.DEFAULT_PRESET
         substituted = [name for name, value in (("crf", crf), ("preset", preset))
                        if value is None]
-        encode_arm = {"crf": encode_crf, "preset": encode_preset, "threads": encode_threads,
-                      "sliced_threads": encode_sliced, "rc_lookahead": encode_rc_lookahead}
+        # **`encode_settings` is spread rather than restated**, so the arm carries three keys
+        # under h264 and none of them under h265 — the same absence §15a requires of the record,
+        # arriving from the same dict rather than from a second decision about what h265 has.
+        encode_arm = dict(encode_settings, crf=encode_crf, preset=encode_preset)
 
         estimate = None
         if progress is not None:
@@ -771,8 +779,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # **Read off `encode_arm`'s own names**, which is what makes the estimate's declared
             # arm and the encode's actual settings impossible to disagree — the same argument the
             # record already makes by reading all five off the writer that ran, one step earlier.
-            crf=encode_crf, preset=encode_preset, threads=encode_threads,
-            sliced_threads=encode_sliced, rc_lookahead=encode_rc_lookahead)
+            # **The codec goes to the ONE place that maps a name to a library**, and the
+            # writer is then the single object that knows what ran — which is what the record
+            # reads it off, exactly as it already does for the five settings.
+            codec=codec,
+            crf=encode_crf, preset=encode_preset, **encode_settings)
         # **The rate clock starts where the frames do** (§8d). `_phase_started` was set when
         # `Progress` was constructed — before the fetch, before the probe, before the model
         # load — so the first measured seconds-per-frame amortised all of that into the per-frame
@@ -866,9 +877,16 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                 raise
             raise WorkerError(
                 exc.code,
+                # **The bound that was actually in force, named by the codec that had it.**
+                # Reporting `x264-params` on an h265 encode would put the one string that was
+                # null onto the one message written when the encoder ran out of memory — the
+                # reading a person does under time pressure, with nothing else left to read.
                 "{} — ffmpeg reached {} GiB RSS before it stopped, over {} frame(s) written "
-                "with x264-params {!r}".format(
-                    exc.message, peak, writer_cm.frames_written, writer_cm.x264_params),
+                "with {}-params {!r}".format(
+                    exc.message, peak, writer_cm.frames_written,
+                    "x265" if writer_cm.codec == "h265" else "x264",
+                    writer_cm.x265_params if writer_cm.codec == "h265"
+                    else writer_cm.x264_params),
                 remedy=exc.remedy, shortfall=exc.shortfall) from exc
         finally:
             # Said out loud whichever way the encode ended, because a log line survives a bundle
@@ -955,24 +973,9 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # ffmpeg's own high-water mark, beside the GPU's. The 8K ceiling was in the
                     # encoder rather than the model, and neither number alone would have said so.
                     encoder_peak_rss_gb=writer.encoder_peak_rss_gb,
-                    # **What RAN, read off the writer** (§6c). A campaign attributing a
-                    # difference between two arms to the settings that differed needs the settings
-                    # that were used and not the module's defaults — and now that they can move,
-                    # those are two different things.
-                    x264_params=writer.x264_params,
-                    # **ALL FIVE, `crf` INCLUDED, AND THE RECORD IS WHY.** `crf` and `preset` used
-                    # to be added to the ENVELOPE by `handler._retime` and never reached `stats` —
-                    # so `trace["retime"]`, which is built from `stats`, filed both as null on
-                    # every run ever written, while the envelope beside it said `crf: 12`.
-                    # `instrumentation.md` §2 names `crf, preset` as the two missing settings and
-                    # says why: *a corpus recording three of five cannot attribute a difference*.
-                    # The corpus is the RECORD. Reading all five off the writer that ran is what
-                    # puts them in both artefacts and makes them impossible to disagree.
-                    crf=writer.crf,
-                    preset=writer.preset,
-                    threads=writer.threads,
-                    sliced_threads=writer.sliced_threads,
-                    rc_lookahead=writer.rc_lookahead,
+                    # **What RAN, read off the writer** — the codec, both parameter strings
+                    # and the settings that codec has. See `_encode_fields`.
+                    **_encode_fields(writer),
                     # **Same defect, same fix, one line further.** §2 lists `snap_tolerance` among
                     # the axes a run must carry and the record filed it null for the same reason.
                     # `target_fps` is what the whole job was FOR. Both were envelope-only.
@@ -981,6 +984,48 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
     finally:
         if capture is not None:
             capture.release()
+
+
+def _encode_fields(writer):
+    """What the encode RAN AT, read off the writer that ran it (§6c, §15a).
+
+    **ALL FIVE SETTINGS, `crf` INCLUDED, AND THE RECORD IS WHY.** `crf` and `preset` used to be
+    added to the ENVELOPE by `handler._retime` and never reached `stats` — so `trace["retime"]`,
+    which is built from `stats`, filed both as null on every run ever written while the envelope
+    beside it said `crf: 12`. `instrumentation.md` §2 names them as the two missing settings and
+    says why: *a corpus recording three of five cannot attribute a difference*. **The corpus is
+    the RECORD.** Reading them off the writer is what puts them in both artefacts and makes them
+    impossible to disagree — the module's defaults are not the same thing as what ran, now that
+    the settings can move.
+
+    **THE THREE x264 FIELDS ARE OMITTED ENTIRELY UNDER h265, WHICH IS NOT THE SAME AS NULL**
+    (`docs/instrumentation.md` §15a). *A row reading `sliced_threads: false` beside
+    `codec: "h265"` would assert that a parameter x265 does not have took a value* — the corpus
+    telling a reader something untrue in a field they have no reason to doubt. With §6e ruling
+    2's refusal at the door and this absence here, **`sliced_threads` present on a row implies
+    h264 by construction**, which is the self-keying property §14a already relies on.
+
+    **The two parameter strings are both always present, each null under the other's codec.** The
+    column exists on every row either way, so a reader can ask what bounded an encode without
+    first knowing which codec answered — §15a's own argument for shipping `x265_params` as a null
+    column even if no bound had shipped at all.
+
+    **`codec` is here rather than assembled in `handler` from the request.** §15b holds that this
+    field records WHAT RAN and not what was asked for; the two are the same thing today only
+    because §6e leaves `codec: "source"` refused, and reading it off the writer is what keeps the
+    field true on the day they stop being the same. *`handler` lifts it out of `retime` to the
+    record's top level, where §15c's inference rule reads it.*
+    """
+    fields = {"codec": writer.codec,
+              "x264_params": writer.x264_params,
+              "x265_params": writer.x265_params,
+              "crf": writer.crf,
+              "preset": writer.preset}
+    if writer.codec != "h265":
+        fields.update(threads=writer.threads,
+                      sliced_threads=writer.sliced_threads,
+                      rc_lookahead=writer.rc_lookahead)
+    return fields
 
 
 def _print_write_distribution(writer):

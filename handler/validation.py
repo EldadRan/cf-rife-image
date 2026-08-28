@@ -513,6 +513,15 @@ def _validate_output(output):
     return output
 
 
+def _english_list(items):
+    """`a`, `a and b`, `a, b and c`. **A refusal a caller reads once has to parse on that read**,
+    and three names joined by two `and`s is a sentence they have to re-read to count."""
+    items = list(items)
+    if len(items) <= 2:
+        return " and ".join(items)
+    return "{} and {}".format(", ".join(items[:-1]), items[-1])
+
+
 def _refused_upscale_field(name, value, because):
     """`None` if the field is absent or empty, REFUSED BY NAME otherwise.
 
@@ -606,12 +615,24 @@ def validate(job_input):
             "request must ask for a retime explicitly with 'upscale: false' in 'params'. Refused "
             "rather than retimed without being asked, because a caller who asked to be upscaled "
             "has not asked for this.")
-    if release_3["codec"] != envelope.DEFAULT_CODEC:
+    # **§6e UNSEALED THIS SURFACE RATHER THAN BUILDING IT.** `envelope.CODECS` has carried all
+    # three names since `rife-seed`; what moved is this refusal, from *"only h264"* to the pair
+    # the worker now implements. **`"source"` stays in `CODECS` and stays refused HERE**, which
+    # is what keeps it a CAPABILITY refusal rather than a schema error: deleting the name would
+    # turn a caller's forward-looking request into "no such value", and the capability answer is
+    # the true one. *Implementing it needs the probe's codec resolved after the file is open and
+    # a refusal for every third codec — a surface of its own, and CF did not ask for it.*
+    #
+    # **Read off `encoder.CODEC_LIBRARIES` rather than written out**, so the day a third library
+    # lands this sentence is right without anyone remembering to come back — and so the door and
+    # the encoder cannot disagree about what is implemented.
+    if release_3["codec"] not in encoder.CODEC_LIBRARIES:
         raise WorkerError(
             INVALID_FIELD_VALUE,
-            "'output.codec: {}' is contract-legal and this worker cannot serve it yet; only {!r} "
-            "is implemented. Refused rather than silently encoded as {}.".format(
-                release_3["codec"], envelope.DEFAULT_CODEC, envelope.DEFAULT_CODEC))
+            "'output.codec: {}' is contract-legal and this worker cannot serve it yet; only {} "
+            "are implemented. Refused rather than silently encoded as {}.".format(
+                release_3["codec"], " and ".join(sorted(encoder.CODEC_LIBRARIES)),
+                envelope.DEFAULT_CODEC))
 
 
     target = params.get("target_short_edge_px")
@@ -781,6 +802,54 @@ def validate(job_input):
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_SMALL]["rc_lookahead"],
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["rc_lookahead"]),
             )
+
+    # ── §6e RULING 2 — x264's THREE FIELDS ARE REFUSED UNDER h265, NOT DROPPED ──────────
+    #
+    # **CF's ruling, 2026-08-28: *"It's the wrong shape."*** A request carrying `threads`,
+    # `sliced_threads` or `rc_lookahead` alongside `codec: h265` is refused here, naming the
+    # codec and the field.
+    #
+    # **THE FIELDS HAVE NO x265 SPELLING.** x265 parallelises by wavefront through `--pools` and
+    # `--frame-threads`; **`sliced-threads` has no equivalent at all — it is ABSENT, not
+    # renamed** — so there is no honest translation to make, and the only alternatives were
+    # refusing and dropping.
+    #
+    # **DROPPING IS THE WRONG SHAPE BECAUSE OF WHAT THESE FIELDS ARE FOR.** §6a made them fields
+    # rather than a pass-through options string *precisely so that a bound on the encoder could
+    # not be handed to the caller*: they exist to bound memory on a path §1 says has no host
+    # guard. **A dropped bound leaves the caller believing a bound is in force, and the record
+    # would show their value beside an encode that never saw it** — a row wrong in the direction
+    # nobody checks. *§6b's surviving clause is the same rule one step out: an explicitly-sent
+    # field is obeyed and never silently overridden. A field that CANNOT be obeyed is not
+    # overridden, it is dropped — the case §6b never had to consider, because until now every
+    # field applied to every job.*
+    #
+    # **AND IT KEEPS THE CORPUS HONEST.** With the refusal, `sliced_threads` on a row implies
+    # h264 by construction (`docs/instrumentation.md` §15a). Without it, the field could appear
+    # on an h265 row having done nothing.
+    #
+    # **HERE, AFTER ALL THREE ARE PARSED, AND THAT ORDER IS DELIBERATE.** A caller who sent both
+    # a malformed value and the wrong codec is told about the value first — the refusal they can
+    # act on without knowing this rule exists.
+    if release_3["codec"] == "h265":
+        crossed = [name for name, value in
+                   (("threads", threads), ("sliced_threads", sliced_threads),
+                    ("rc_lookahead", rc_lookahead)) if value is not None]
+        if crossed:
+            raise WorkerError(
+                FIELD_NOT_SUPPORTED,
+                "'output.codec: h265' was sent together with {}, which {} x264's own "
+                "setting{} and {} no x265 spelling: x265 parallelises by wavefront through "
+                "pools and frame-threads, and 'sliced-threads' is absent from it rather than "
+                "renamed. Refused rather than accepted and dropped, because a dropped bound "
+                "leaves you believing a bound is in force and the record would carry your value "
+                "beside an encode that never saw it. Send these with 'output.codec: h264', or "
+                "send h265 without them and the encoder is bounded by this worker's own "
+                "declared x265 settings.".format(
+                    _english_list(["'{}'".format(name) for name in crossed]),
+                    "is" if len(crossed) == 1 else "are",
+                    "" if len(crossed) == 1 else "s",
+                    "has" if len(crossed) == 1 else "have"))
 
     # **Refused rather than validated-then-dropped**, and this one read as supported harder than
     # any other: `_validate_derive` checked role uniqueness, per-role field strictness and

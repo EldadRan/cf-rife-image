@@ -486,6 +486,18 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     encode_defaults = {}
     if trace is not None:
         trace["encode_defaults"] = encode_defaults
+        # **§15c READS AN ABSENT `codec` AS h264, SO A RUN THAT DIES WITHOUT FILING ONE IS NOT A
+        # GAP — IT IS A WRONG VALUE.** Every record written before §15 was produced by an
+        # unconditional `libx264`, so absence is h264 by construction and the kit states that as
+        # an inference rule. A reaped h265 run filing nothing would be read as an h264 row by
+        # that rule, and averaged into the h264 corpus by everything downstream of it.
+        #
+        # **So it is banked BEFORE the encode, from the validated request** — the same argument
+        # `encode_defaults` above is banked for, one degree stronger: that block's absence is
+        # honest, and this one's is not. **Overwritten below with what the writer actually
+        # used**, which is the value §15b requires and the only one that stays true the day
+        # `codec: "source"` is implemented and the ask stops equalling the outcome.
+        trace["codec"] = request["release_3"]["codec"]
 
     progress.phase("interpolate", pct=10, force=True)
     stats = routec.retime(
@@ -508,6 +520,11 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         input_check=input_checker,
         rc_lookahead=request.get("rc_lookahead"),
         encode_defaults=encode_defaults,
+        # **§6e. One field, and it is the one this repository already had** — `envelope` has
+        # carried `CODECS` since `rife-seed` and `validation` refused everything but the default;
+        # what moved is the refusal. Passed through by name so the library is chosen in exactly
+        # one place, `encoder.CODEC_LIBRARIES`.
+        codec=request["release_3"]["codec"],
         # **`docs/instrumentation.md` §8g-1's other half, and it is the half that makes the kit's
         # decline honest rather than convenient.** §8g-1 lets the acceptance kit DECLINE TO GRADE
         # an armed run's first ETA, because the instruments land in `wall_s` and §12 rules that
@@ -613,8 +630,17 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # kit grades `convert_check.frames` AGAINST `retime.n_out`, and a check nested inside the
         # block it is checked against reads as part of that measurement rather than as the check
         # on it.
+        # **`codec` is lifted out for §15's reason and not `convert_check`'s.** §15c's
+        # inference rule reads `record.get("codec", "h264")` at the record's TOP level — a
+        # `codec` nested inside `retime` is invisible to it, and a row that carries the field
+        # somewhere the rule does not look is a row the rule reads as h264.
         trace["retime"] = {k: v for k, v in stats.items()
-                           if k not in ("estimate", "convert_check", "input_check")}
+                           if k not in ("estimate", "convert_check", "input_check", "codec")}
+        # **What RAN, replacing what was asked for.** They are the same value today — §6e leaves
+        # `codec: "source"` refused, so there is no resolution step between the ask and the
+        # outcome — and this line is what makes that a fact about the writer rather than a fact
+        # about the request that happens to hold.
+        trace["codec"] = stats.get("codec", trace["codec"])
 
     return _decorate({
         "status": "DELIVERED",
@@ -631,6 +657,14 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # not attribute a difference to the settings that differed, which is exactly what §2 says
         # recording three of five costs. `routec` now reads all five off the writer that ran and
         # returns them, so both artefacts carry one set of numbers that cannot disagree.
+        # **`codec` STAYS HERE, AND THIS TUPLE DELIBERATELY DIFFERS FROM THE RECORD'S ABOVE.**
+        # The record lifts it out because §15c's inference rule reads `record["codec"]` at the
+        # top level and a nested copy would be both invisible to the rule and a second home for
+        # one fact. **The envelope has no such rule and no top level to lift to**, so stripping
+        # it here would leave a caller holding `x265_params` non-null, `x264_params` null and
+        # nothing that names the codec — a response whose codec has to be INFERRED from which of
+        # two strings came back empty. *One fact, one home, per document: the record's home is
+        # its top level and the envelope's is here.*
         "retime": {k: v for k, v in stats.items()
                    if k not in ("estimate", "convert_check", "input_check")},
         # **`padded_megapixels` is the fit's independent variable and nothing computed it**
@@ -782,6 +816,13 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # branch, so an empty dict means "died before it ran" and must file as null rather
             # than as `{}`, which would read as a provenance that was recorded and said nothing.
             encode_defaults=(trace or {}).get("encode_defaults") or None,
+            # §15. **Top level, where §15c's inference rule reads it**, and OMITTED rather than
+            # null on a run that never got as far as banking one — `record.get("codec", "h264")`
+            # returns `None` for a present-and-null field and "h264" for an absent one, so the
+            # two spellings of "we do not know" are not interchangeable here. This is the
+            # opposite of `encode_defaults` above, and the difference is which of absence and
+            # null the reader was told to interpret.
+            codec=(trace or {}).get("codec"),
             # §2g-2. Absent on every run that did not sweep, which is every run: the kit's
             # `--tie-check` REQUIRES the block rather than shrugging when it is missing, so a
             # null here would read as "swept and found nothing" to nobody and as a missing field

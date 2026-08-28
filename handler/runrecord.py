@@ -127,7 +127,8 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           attempts=None, output=None, load_strip=None, host_banners=None, timings=None,
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
-          convert_check=None, input_check=None, decode_probe=None, encode_defaults=None):
+          convert_check=None, input_check=None, decode_probe=None, encode_defaults=None,
+          codec=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -227,6 +228,18 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     # §11a, omitted rather than nulled like every other opt-in block.
     if decode_probe:
         body["decode_probe"] = decode_probe
+    # **§15, AND ITS OMISSION IS NOT THE SAME KIND AS THE FOUR BLOCKS ABOVE.** Those are opt-in
+    # diagnostics whose absence means "did not run". **This one's absence has a VALUE**: §15c
+    # rules that a row with no `codec` is an h264 row, because every record written before §15
+    # was produced by an unconditional `libx264` with no branch that could reach anything else.
+    #
+    # **SO PRESENT-AND-NULL IS THE ONE SPELLING THAT MUST NOT SHIP.** The kit reads the rule as
+    # `record.get("codec", "h264")` — which returns the default for an ABSENT key and `None` for
+    # a present one holding null. *A null here would produce a row that is neither codec, on a
+    # field whose whole purpose is that every row can be attributed to one.* Absent is h264,
+    # present is what ran, and there is no third state to spell.
+    if codec is not None:
+        body["codec"] = codec
     if progress is not None:
         body["seconds_per_frame"] = progress.seconds_per_frame()
     if error:

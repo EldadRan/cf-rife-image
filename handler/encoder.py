@@ -23,6 +23,7 @@ import os
 import subprocess
 import time
 
+import envelope
 import probe
 
 from errors import INTERNAL, WorkerError
@@ -131,6 +132,49 @@ BASIS_CALLER = "caller"
 BASIS_MIXED = "mixed"
 
 
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# §6e — THE CODEC IS THE CALLER'S CHOICE, and each library gets its bound assembled for it.
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+
+#: **ffmpeg's encoder name for each codec this worker implements**, and the mapping exists so
+#: that the library is chosen in ONE place from a name the contract enumerated.
+#:
+#: **`envelope.CODECS` carries a third name and it is deliberately absent from here.**
+#: `"source"` is contract-legal and unimplemented — §6e leaves it refused at the door as a
+#: CAPABILITY refusal — and a library for it here would be this worker claiming to resolve a
+#: codec it never opens the file to read. *Deleting the name from `envelope` would turn a
+#: forward-looking request into a schema error instead; leaving it here would turn it into a
+#: silent encode. Neither is the true answer, and the refusal is.*
+CODEC_LIBRARIES = {"h264": "libx264", "h265": "libx265"}
+
+#: What `encode_defaults.basis` reads under h265 (`docs/instrumentation.md` §15a). **§6d's table
+#: is x264's and cannot have resolved an h265 job**, so the honest reading is *"the table was not
+#: consulted because this codec has no such table"* — a state, and it needs a name because null
+#: was already taken: §13a reserves absent-or-null for a run that died before the branch, and
+#: reusing it would make provenance inferable from silence.
+BASIS_CODEC_H265 = "codec:h265"
+
+#: **x265's memory bound, and every value in it is DECLARED rather than fitted** (contract §6e
+#: ruling 1, outcome B — CF, 2026-08-28). *This project has zero x265 measurements; the reading
+#: arrives as a side effect of §6e's certification, and until it does the encoder is capped at
+#: the door rather than trusted.*
+#:
+#: **IT IS A MAPPING OF §6d's LARGE ROW ONTO x265's OWN MECHANISMS, NOT A TRANSLATION OF ITS
+#: NAMES.** `frame-threads` is what multiplies frames-in-flight and therefore the working set —
+#: the role `threads` plays in x264 — so it is pinned to 1 for the same reason the large row sets
+#: `sliced-threads=1`: parallelism comes from INSIDE the frame rather than from more frames at
+#: once. x265's wavefront (`wpp`) is on by default and is that inside-the-frame parallelism, so
+#: the bound does not have to choose between being cheap and being parallel. `pools` caps the
+#: worker threads; `rc-lookahead` mirrors §6a's value rather than inventing a second one.
+#:
+#: **Declared as a BOUND and never claimed as an optimum.** §6c forbids an estimator throttling
+#: against a host-RSS model nobody has built, and a fixed cap on what the encoder ASKS FOR is not
+#: that model: it refuses nothing, downgrades nothing and predicts nothing.
+X265_POOLS = 16
+X265_FRAME_THREADS = 1
+X265_RC_LOOKAHEAD = 10
+
+
 def area_row(delivered_pixels):
     """Which of §6d's two rows a frame takes. **`<=` the boundary is the small row.**
 
@@ -153,7 +197,7 @@ def area_row(delivered_pixels):
             else AREA_ROW_LARGE)
 
 
-def resolve_defaults(delivered_pixels, threads=None, sliced_threads=None,
+def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=None,
                      rc_lookahead=None):
     """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
 
@@ -172,7 +216,46 @@ def resolve_defaults(delivered_pixels, threads=None, sliced_threads=None,
 
     So `validation` now hands these three through as `None` when unset, having range-checked
     whatever WAS sent, and this is the only place a default is chosen for them.
+
+    **UNDER h265 THERE IS NO TABLE AND NO SETTINGS** (contract §6e, `docs/instrumentation.md`
+    §15a). §6d's three fields are x264's vocabulary — `threads` and `sliced_threads` have no x265
+    spelling at all, and `sliced-threads` is ABSENT rather than renamed — so this returns an EMPTY
+    settings dict and a basis that says the table was skipped. *An empty dict rather than the row's
+    values is what stops the caller writing x264's numbers onto an h265 row, which §15a calls the
+    corpus telling a reader something untrue in a field they have no reason to doubt.*
+
+    `codec` of `None` means the caller named none, which is `envelope.DEFAULT_CODEC` — resolved
+    here rather than at the call site so the default has one home.
     """
+    codec = envelope.DEFAULT_CODEC if codec is None else codec
+    if codec not in CODEC_LIBRARIES:
+        raise WorkerError(INTERNAL, (
+            "the encoder was asked to resolve defaults for codec {!r}, which this worker does "
+            "not implement. `validation` refuses everything but {} at the door, so reaching here "
+            "is a plumbing defect and not a request.").format(
+                codec, ", ".join(sorted(CODEC_LIBRARIES))))
+    if codec == "h265":
+        # **§6e ruling 2 refuses these three at the door under h265, so a value here is a
+        # PLUMBING defect and not a caller's.** Checked rather than ignored: dropping them
+        # silently is the exact shape ruling 2 refused — a bound the caller believes is in force
+        # and the encoder never saw — and it would arrive here wearing the same face.
+        sent = {name: value for name, value in
+                (("threads", threads), ("sliced_threads", sliced_threads),
+                 ("rc_lookahead", rc_lookahead)) if value is not None}
+        if sent:
+            raise WorkerError(INTERNAL, (
+                "codec h265 reached the encoder carrying {} — contract §6e ruling 2 refuses "
+                "these at the door because x265 has no such parameters, so a value here would "
+                "be recorded beside an encode that never saw it.").format(
+                    ", ".join("{}={!r}".format(k, v) for k, v in sorted(sent.items()))))
+        return {}, {
+            "basis": BASIS_CODEC_H265,
+            # **Still carried, and it is not the boundary that decided anything here.** §13a
+            # wants the integer the branch compared against as it stood in the image that ran;
+            # under h265 nothing was compared, and omitting the field would make this block a
+            # different shape from every other row for a reason no reader could see.
+            "boundary": AREA_BOUNDARY_DELIVERED_PIXELS,
+        }
     row = area_row(delivered_pixels)
     sent = {"threads": threads, "sliced_threads": sliced_threads, "rc_lookahead": rc_lookahead}
     chosen = {name: value for name, value in sent.items() if value is not None}
@@ -213,6 +296,31 @@ def x264_params(threads=DEFAULT_THREADS, sliced_threads=DEFAULT_SLICED_THREADS,
     """
     return "sliced-threads={}:threads={}:rc-lookahead={}".format(
         1 if sliced_threads else 0, int(threads), int(rc_lookahead))
+
+
+def x265_params(pools=X265_POOLS, frame_threads=X265_FRAME_THREADS,
+                rc_lookahead=X265_RC_LOOKAHEAD):
+    """Build the `-x265-params` string from named fields. **Assembled, never accepted** — and
+    here the rule has teeth the x264 side does not.
+
+    **x265 VALIDATES VALUES AND SILENTLY DISCARDS UNKNOWN NAMES** (`docs/gate-findings.md`
+    F-2026-08-28-7, measured 2026-08-28). `frame-threads=999` refuses with exit 183 and no
+    output; `frame-thread=1` — one character short — is accepted, thrown away, and the encode
+    succeeds. **So "the job succeeded" is not evidence that a bound was applied**, and a typo
+    disables the whole of this string with no error, no non-zero exit, a plausible byte count and
+    a passing witness.
+
+    *§6a already forbids a pass-through options string on the x264 side for a resource reason.
+    This is that reason arriving on the x265 side with the error reporting removed*, which is why
+    the names live here as identifiers rather than in a literal a request or an edit could reach:
+    **a name this contract has not enumerated cannot get onto the command line.**
+
+    **VERIFIED TO TAKE EFFECT AND NOT MERELY TO BE ACCEPTED**, which the paragraph above shows is
+    a distinction with teeth: `pools=1:frame-threads=1` and `pools=16:frame-threads=4` produce
+    `frame threads / pool features : 1 / wpp` and `: 4 / wpp` respectively in x265's own banner.
+    """
+    return "pools={}:frame-threads={}:rc-lookahead={}".format(
+        int(pools), int(frame_threads), int(rc_lookahead))
 
 
 def _identity_tags(identity):
@@ -301,9 +409,8 @@ class MasterWriter:
 
     def __init__(self, path, width, height, fps, identity,
                  audio_source=None, audio_codec=None, audio_limit_s=None,
-                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET,
-                 threads=DEFAULT_THREADS, sliced_threads=DEFAULT_SLICED_THREADS,
-                 rc_lookahead=DEFAULT_RC_LOOKAHEAD):
+                 crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None,
+                 threads=None, sliced_threads=None, rc_lookahead=None):
         self.path = path
         self.width = width
         self.height = height
@@ -360,14 +467,63 @@ class MasterWriter:
         #: **Public, because the record has to carry what actually ran.** §6c's campaign attributes
         #: a difference between two arms to the settings that differed, and a corpus that recorded
         #: the DEFAULTS while the run used something else would attribute it to the wrong thing.
-        self.x264_params = x264_params(threads=threads, sliced_threads=sliced_threads,
-                                       rc_lookahead=rc_lookahead)
-        #: Kept individually as well as in the assembled string, so the record can report a field
-        #: without anyone parsing the string back apart. **The string is what ran; these are what
-        #: was asked for**, and they cannot disagree because one is built from the other.
-        self.threads = int(threads)
-        self.sliced_threads = bool(sliced_threads)
-        self.rc_lookahead = int(rc_lookahead)
+        #: **The codec this master is encoded with** (contract §6e), and `None` means the caller
+        #: named none — resolved through `envelope` so the default has one home.
+        #:
+        #: **Public for the same reason the five settings below are: the record has to carry what
+        #: RAN.** `docs/instrumentation.md` §15 makes the codec a second vocabulary, and a corpus
+        #: that cannot exclude a population includes it — `compute_s` per megapixel, the encoder
+        #: arm and the estimator's corpus are each a fit over rows, and two encoders averaged
+        #: together is not a noisier corpus but one wrong in a direction that changes with the job.
+        self.codec = envelope.DEFAULT_CODEC if codec is None else codec
+        if self.codec not in CODEC_LIBRARIES:
+            raise WorkerError(INTERNAL, (
+                "the master writer was constructed for codec {!r}, which this worker does not "
+                "implement. `validation` refuses everything but {} at the door.").format(
+                    self.codec, ", ".join(sorted(CODEC_LIBRARIES))))
+        #: **THE THREE ARE ABSENT UNDER h265, NOT ZERO AND NOT DEFAULTED** (§6e ruling 2, §15a).
+        #: They are x264's vocabulary: `sliced-threads` has no x265 equivalent at all — it is
+        #: absent rather than renamed — so a value here beside `codec: h265` would assert that a
+        #: parameter x265 does not have took effect. **`None` is what the record then files as an
+        #: absent field**, and with ruling 2's refusal at the door `sliced_threads` present on a
+        #: row implies h264 by construction.
+        #:
+        #: **The two parameter strings are the pair, and each is null under the other's codec.**
+        #: The column exists on every row either way, which is what lets a reader ask "what
+        #: bounded this encode" without first knowing which codec answered.
+        if self.codec == "h265":
+            if threads is not None or sliced_threads is not None or rc_lookahead is not None:
+                raise WorkerError(INTERNAL, (
+                    "codec h265 reached the master writer carrying x264's thread settings; §6e "
+                    "ruling 2 refuses them at the door precisely so they cannot be recorded "
+                    "beside an encode that never saw them."))
+            self.x264_params = None
+            #: **Assembled from named fields for a reason sharper than §6a's** — see
+            #: `x265_params`: x265 discards an unknown NAME without a word, so a bound is not in
+            #: force merely because the job succeeded.
+            self.x265_params = x265_params()
+            self.threads = None
+            self.sliced_threads = None
+            self.rc_lookahead = None
+        else:
+            #: The module constants stand in only where nothing was passed. **The production
+            #: path never reaches them** — `routec` resolves all three through §6d's table before
+            #: constructing this — so they are the answer for a direct caller and not a second
+            #: site that chooses encoder settings.
+            threads = DEFAULT_THREADS if threads is None else threads
+            sliced_threads = (DEFAULT_SLICED_THREADS if sliced_threads is None
+                              else sliced_threads)
+            rc_lookahead = DEFAULT_RC_LOOKAHEAD if rc_lookahead is None else rc_lookahead
+            self.x264_params = x264_params(threads=threads, sliced_threads=sliced_threads,
+                                           rc_lookahead=rc_lookahead)
+            self.x265_params = None
+            #: Kept individually as well as in the assembled string, so the record can report a
+            #: field without anyone parsing the string back apart. **The string is what ran;
+            #: these are what was asked for**, and they cannot disagree because one is built from
+            #: the other.
+            self.threads = int(threads)
+            self.sliced_threads = bool(sliced_threads)
+            self.rc_lookahead = int(rc_lookahead)
 
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
@@ -405,13 +561,28 @@ class MasterWriter:
                 command += ["-t", "{:.6f}".format(float(self._audio_limit_s))]
             command += ["-i", audio_source]
 
-        command += ["-map", "0:v:0", "-c:v", "libx264",
+        command += ["-map", "0:v:0", "-c:v", CODEC_LIBRARIES[self.codec],
                     "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
-        # `-x264-params` rather than more `-preset` flags: the preset stays the caller's and
-        # these are the specific knobs §6a names, so a reader can see which of the two moved.
-        # **Unconditional now** — there is one route, it always bounds the encoder, and the branch
-        # that made the bound optional had no caller that took it.
-        command += ["-x264-params", self.x264_params]
+        # `-x26N-params` rather than more `-preset` flags: the preset stays the caller's and
+        # these are the specific knobs §6a and §6e name, so a reader can see which of the two
+        # moved.
+        #
+        # **CONDITIONAL, AND IT IS NOT PREVENTING A CRASH — IT IS PREVENTING A SILENT UNBOUNDED
+        # ENCODE.** §6e originally held that `-x264-params` under `libx265` kills ffmpeg before
+        # the first frame, so a naive port would fail every h265 job loudly. **Measured, and it
+        # is false** (`docs/gate-findings.md` F-2026-08-28-7): ffmpeg emits *"Codec AVOption
+        # x264-params ... has not been used for any stream"* at WARNING level and carries on,
+        # exit 0, master written. **This worker encodes at `-loglevel error`, where that line
+        # does not appear at all.**
+        #
+        # *So the failure this branch prevents is a delivered 8K master encoded with NO BOUND and
+        # nothing anywhere saying so — no error, no non-zero exit, a plausible byte count, a
+        # passing witness — on the one path §6e's ruling 1 exists to protect. A crash is loud,
+        # cheap, and caught by the first h265 job anybody runs; this is not.*
+        if self.codec == "h265":
+            command += ["-x265-params", self.x265_params]
+        else:
+            command += ["-x264-params", self.x264_params]
 
         if carry_audio:
             # `?` makes the mapping optional, so a source whose audio stream vanished between the
