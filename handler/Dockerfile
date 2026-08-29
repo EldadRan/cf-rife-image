@@ -136,7 +136,24 @@ RUN curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 6
 #
 # **The two sources DIFFER on purpose.** Identical inputs give infinite PSNR, and `inf` is not
 # valid JSON — an assertion that wrote a log nothing could parse would fail for the wrong reason.
-# 128x128 rather than smaller because CAMBI's default window is 63 pixels wide.
+#
+# **AND THE SIZE IS A REAL FRAME SIZE, WHICH IS THE CORRECTION.** This first read `128x128` on the
+# reasoning that CAMBI's window is 63 pixels wide, and **the build failed on it** — libvmaf exits
+# `-22` inside `vmaf_read_pictures` with *"problem reading pictures"*. Measured against a local
+# libvmaf 3.2.0 rather than guessed at:
+#
+#     208x208  FAIL      212x212  FAIL      216x216  OK      1920x1080  OK
+#     640x120  OK        120x640  OK        216x208  OK      208x216    OK
+#
+# **So it is not a per-side minimum and not an area threshold** — 216x208 passes at 44,928 pixels
+# while 212x212 fails at 44,944 — it is the LONGER side needing roughly 216. *A rule that shape is
+# one nobody should be deriving from a comment, so the assertion uses a frame size the worker
+# actually delivers and stays nowhere near it.* Two frames of 1080p cost 0.13 s.
+#
+# **THE FAILURE WAS THIS SIZE AND NOT THE SPELLING.** `feature=name=cambi|name=psnr|name=float_ssim`
+# PARSED — no "Option not found" — so the option surface neither session could establish by probing
+# a binary is now established by a build that ran it. *The assertion caught a defect in itself,
+# which is the only kind of check worth having.*
 #
 # **`libx265` IS ASSERTED BESIDE IT ON A RULED EXCEPTION, AND THE EXCEPTION IS RECORDED RATHER
 # THAN ABSORBED.** The gap is real — §6e made x265 a shipping path and nothing anywhere asserted
@@ -160,8 +177,8 @@ RUN set -eux; \
     grep -q libx265 /tmp/encoders.txt; \
     grep -q use_metadata_tags /tmp/mp4muxer.txt; \
     ffmpeg -hide_banner -loglevel error \
-      -f lavfi -i "testsrc2=size=128x128:rate=1:duration=2,format=yuv420p" \
-      -f lavfi -i "testsrc=size=128x128:rate=1:duration=2,format=yuv420p" \
+      -f lavfi -i "testsrc2=size=1920x1080:rate=1:duration=2,format=yuv420p" \
+      -f lavfi -i "testsrc=size=1920x1080:rate=1:duration=2,format=yuv420p" \
       -lavfi "[0:v][1:v]libvmaf=feature=name=cambi|name=psnr|name=float_ssim:log_path=/tmp/vmaf.json:log_fmt=json" \
       -f null -; \
     python3 -c "import json,sys; K=('cambi','psnr_y','float_ssim'); f=json.load(open('/tmp/vmaf.json'))['frames']; assert len(f)==2, 'scored %d frames, expected 2' % len(f); [ (lambda m: [ (k in m) or sys.exit('frames[%d].metrics lacks %s; it reports %s' % (i,k,sorted(m))) for k in K ] + [ float(m[k]) for k in K ])(e['metrics']) for i,e in enumerate(f) ]; [ e.get('frameNum') in (None,i) or sys.exit('frameNum %r at position %d; the parser needs zero-based contiguous' % (e.get('frameNum'),i)) for i,e in enumerate(f) ]; print('libvmaf ok: %d frames, %s' % (len(f), sorted(f[0]['metrics'])))"; \
