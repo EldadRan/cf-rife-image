@@ -31,6 +31,7 @@ lease.
 """
 
 import contextlib
+import math
 import threading
 import time
 
@@ -218,7 +219,26 @@ class Progress:
         if not exhausted:
             eta = self.eta_s()
             if eta is not None:
-                payload["eta_s"] = int(eta)
+                # **ROUNDED UP, NEVER TRUNCATED** (§18d-2). `int()` rounds toward zero, so every
+                # ETA under a second published `0` — the strongest possible claim of completion —
+                # on a run with a 47-257 s tail still ahead. This module forbids exactly that
+                # direction in its own words at `eta_s`'s docstring: an ETA that runs short tells
+                # CF a job is nearly done when it is not. *Truncation is not a rounding choice
+                # here, it is a systematic bias toward the one answer the module rules out.*
+                #
+                # **`max(1, ...)` and not `ceil` alone**, because `ceil(0.0)` is `0` and the
+                # invariant §18d-1 and this section buy together is that `eta_s: 0` is
+                # UNREACHABLE: a payload either carries no `eta_s`, or carries one of at least 1.
+                # A zero is reachable without this — `eta_s()`'s candidate arithmetic returns
+                # `0.0` when `_work_fraction` hits 1.0 while `_frames_done` has not, which is a
+                # state `exhausted` above does not catch because they are different quantities.
+                # *Rounding a computed 0.0 up to 1 is the pessimistic direction, which is the one
+                # this module is allowed to err in.*
+                #
+                # **`gate_scripts/record_witness.py:589` already refuses a zero `eta.first_s`**
+                # — "neither may be zero". A value the grader calls illegitimate should not be
+                # constructible by the publisher.
+                payload["eta_s"] = max(1, int(math.ceil(eta)))
                 payload["eta_basis"] = self._eta_basis
         if expected_s is not None:
             half = float(expected_s) / 2.0
