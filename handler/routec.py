@@ -1022,8 +1022,27 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # it here would be reasoning by adjacency, which is the §6d-1 defect exactly: a
             # quantity borrowed because it was the nearest one to hand rather than because it
             # describes this.*
+            #
+            # **WRAPPED, like the drain and the upload, and NOT because a raise was found.** The
+            # surface was read and is empty today: `_emit` swallows both the sampler and the POST
+            # (`progress.py:530-560`), which leaves `eta_s()` and `_next_poll_s()`, and both are
+            # clamped float arithmetic whose one division is guarded at `progress.py:476`. The
+            # tie in `max(candidates)` at `progress.py:479` — reachable, because `_work_fraction`
+            # is `min(1.0, ...)` and both candidates are exactly 0.0 once it reaches 1.0 — falls
+            # through to comparing two BASIS STRINGS, never a `None`, because `_expected_basis`
+            # is assigned inside the same `if` as the rate it labels (`progress.py:129-136`).
+            #
+            # **That is an argument about another module's current implementation, and it is the
+            # wrong thing for a delivered master to depend on.** One line costs nothing; the
+            # reasoning being wrong once costs a 4K master after ~500 s of paid compute, on the
+            # armed run this phase exists to narrate. The line below already says a score must
+            # never displace a master — this is the same rule, one statement earlier.
             if progress is not None:
-                progress.phase("scoring", force=True)
+                try:
+                    progress.phase("scoring", force=True)
+                except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                    print("[progress] scoring phase not emitted ({}: {})".format(
+                        type(exc).__name__, exc), flush=True)
             try:
                 reference_block = reference.score(
                     master_path, reference_path, width, height, float(target_fps),
