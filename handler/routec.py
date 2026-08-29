@@ -919,14 +919,35 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # `finally`: a write that raised is a run that is ending, and re-arming the
                     # buffer on the way out would say the frame was accepted when it was not.
                     staging.released()
-                    # **Every frame, and the rate limiter decides what is SENT.** progress._emit
-                    # drops anything inside MIN_INTERVAL_S, so calling per frame costs a
-                    # comparison and publishes at the module's own cadence rather than at one this
-                    # loop would have to invent. `boundary=True` because in a one-frame-at-a-time
-                    # stream every written frame IS a completed unit of work — there are no chunks
-                    # whose mid-flight count would make `elapsed/done` lie.
+                    # **THE RATE LIMITER DOES NOT RUN HERE, AND THIS COMMENT USED TO SAY IT
+                    # DID.** It claimed `_emit` drops anything inside `MIN_INTERVAL_S` so a
+                    # per-frame call costs only a comparison. It does not: `frames()` passes
+                    # `force=boundary` (`progress.py:254-255`), `boundary` defaults to True, this
+                    # call passes none, and `progress.py:535` is `if not force and ...`. **So
+                    # every delivered frame forces a full emit** — a payload appended to an
+                    # unbounded list, a `LoadStrip` sample, and a RunPod POST.
+                    #
+                    # *The false comment was the load-bearing part.* It is the reason this call
+                    # was left unwrapped while the wave wrapped three emits that fire ONCE: a
+                    # reader who believes the limiter is running believes this is cheap and rare.
+                    # It is neither, it is the only emit inside the encode loop, and its raise
+                    # surface is a SUPERSET of `phase()`'s because it calls `phase()`.
+                    #
+                    # **`encoder.__exit__` drains before it looks at `exc_type`**, so a raise on
+                    # the last frame leaves a complete, valid master finalised on disk and then
+                    # propagates out of the `with` — past `except WorkerError`, out of `retime`,
+                    # to `handler`'s bare `except Exception`, whose `rmtree` deletes it. *The
+                    # wave's own rule, one emit late.*
+                    #
+                    # `boundary=True` because in a one-frame-at-a-time stream every written frame
+                    # IS a completed unit of work — there are no chunks whose mid-flight count
+                    # would make `elapsed/done` lie. That part was right.
                     if progress is not None:
-                        progress.frames(writer.frames_written, phase="interpolate")
+                        try:
+                            progress.frames(writer.frames_written, phase="interpolate")
+                        except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                            print("[progress] frame emit failed at {} ({}: {})".format(
+                                writer.frames_written, type(exc).__name__, exc), flush=True)
                 # ── §18's FIRST COARSE PHASE, and it is the last thing said inside the `with` ──
                 #
                 # **HERE, because `__exit__` is where the drain happens and nothing can speak from
@@ -1161,7 +1182,20 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                 print("[reference] could not remove {}: {}".format(reference_path, exc),
                       flush=True)
         if capture is not None:
-            capture.release()
+            # **WRAPPED, which the comment at the top of this block declined to do.** That
+            # reasoning was about ordering WITHIN the `finally` — put the reference deletion
+            # first so a wedged release cannot strand it — and it is still right and still why
+            # the order is what it is. What it missed is the SUCCESS path: this `finally` runs
+            # after `retime`'s return value is built, so a `cv2.error` here discards a completed
+            # delivery, reaches `handler`'s bare `except Exception`, and the `rmtree` deletes a
+            # master that was encoded, verified and about to be uploaded. *An exception raised in
+            # a `finally` replaces whatever the function was returning, and there is nothing
+            # about releasing a capture that is worth a master.*
+            try:
+                capture.release()
+            except Exception as exc:  # noqa: BLE001 — a release must never displace a delivery
+                print("[decode] capture.release() failed ({}: {})".format(
+                    type(exc).__name__, exc), flush=True)
 
 
 def _encode_fields(writer):

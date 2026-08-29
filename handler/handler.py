@@ -607,6 +607,29 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
     _note(trace, "transfer", "upload_bytes", upload_bytes)
 
+    # **THE KEY IS BANKED THE INSTANT THE OBJECT EXISTS, AND EVERYTHING ELSE FILLS IN LATER.**
+    # `master_key` lived in exactly two places — the assignment above and `output_entry`, which
+    # was built a hundred lines below out of `probe.probe_output(...)` on its first line. So a
+    # raise anywhere in between returned `internal` with a ~140 MB master sitting in the bucket,
+    # ~500 s of GPU paid, and nothing in the response or the run record naming where it went.
+    # **Not the armed path — every delivery.** *Found in review; the gate filed it as
+    # F-2026-08-29-11.*
+    #
+    # **Banked HERE rather than merely wrapping the three reads that were named.** Between this
+    # line and where `output_entry` used to be built sit the §6g PNG uploads and §11's decode
+    # probe — three full re-decodes at a half-hour timeout each. Guarding only the probe reads
+    # would have left the same defect behind the slowest thing on the path. *The dict is mutated
+    # in place below, so this is the same object the record files.*
+    output_entry = {
+        "key": master_key,
+        # The same reading the transfer block banked, not a second one: two `getsize` calls on
+        # one file are two chances to report two numbers for one fact.
+        "bytes": upload_bytes,
+        "channels": 3,
+    }
+    if trace is not None:
+        trace["output"] = output_entry
+
     # ── contract §6g's worst-frame PNGs, uploaded beside the master ──────────────────────────
     #
     # **§17b: the PNG is not a formality.** *An aggregate nobody can look behind is the state
@@ -686,26 +709,43 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # output contract, which route C has no reason to differ from and every reason to satisfy —
     # the variant runs are the ones whose numbers matter, and a wave that banks nulls is a wave
     # measured by hand.
-    delivered = probe.probe_output(master_path)
-    output_entry = dict(delivered)
-    output_entry.update({
-        "key": master_key,
-        # The same reading the transfer block banked, not a second one: two `getsize` calls on
-        # one file are two chances to report two numbers for one fact.
-        "bytes": upload_bytes,
-        "content_type": keys.content_type(master),
-        "faststart": probe.is_faststart(master_path),
-        "channels": 3,
-        # Measured on the far side of the encode, which is the only frame count worth reading
-        # from a container — and on this path it is also the one the witness compares.
-        "frames": probe.written_frame_count(master_path),
-    })
+    # **Each read guarded SEPARATELY**, because they fail independently and a measurement that
+    # survived should not be discarded by one that did not. A missing field is a gap; a delivery
+    # reported as `internal` is a lie about where the master is.
+    for field, read in (("content_type", lambda: keys.content_type(master)),
+                        ("faststart", lambda: probe.is_faststart(master_path)),
+                        # Measured on the far side of the encode, which is the only frame count
+                        # worth reading from a container — and on this path it is also the one
+                        # the witness compares.
+                        ("frames", lambda: probe.written_frame_count(master_path))):
+        try:
+            output_entry[field] = read()
+        except Exception as exc:  # noqa: BLE001 — a measurement must never displace a delivery
+            warnings.append("{} could not be measured on the delivered master ({}: {})".format(
+                field, type(exc).__name__, exc))
+    try:
+        delivered = probe.probe_output(master_path)
+    except Exception as exc:  # noqa: BLE001 — same rule, and this one is the whole container read
+        warnings.append("the delivered master could not be probed ({}: {})".format(
+            type(exc).__name__, exc))
+        delivered = {}
+    # **`setdefault`, which preserves the precedence the previous shape had.** `dict(delivered)`
+    # then `.update({...})` meant the explicit fields above won over the probe's; filling only
+    # what is absent is the same rule stated the other way round, and it keeps `bytes` the
+    # transfer's reading rather than a second `getsize`.
+    for field, value in delivered.items():
+        output_entry.setdefault(field, value)
 
     # **The stats and what they were measured on, and nothing shaped like a plan.** A
     # `configuration` block here would look, to anything reading the envelope, exactly like a
     # planned upscale — and there is no plan, because there is no model to plan for.
     _note(trace, "estimate", "time", stats.get("estimate"))
     if trace is not None:
+        # **Deliberately left, and it is a no-op.** `output_entry` was banked into the trace the
+        # instant the upload returned, and this is the same dict object mutated in place — so
+        # this line rebinds what is already there. It stays because deleting it would leave the
+        # one place a reader looks for "where does output reach the record" empty, and a fact
+        # with no visible home is how the next reader concludes there isn't one.
         trace["output"] = output_entry
         # **The retime stats have NO honest slot in `runrecord.build`.** `plan` and `rationale`
         # are the estimator's fields and route C has no estimator, so putting them there would
