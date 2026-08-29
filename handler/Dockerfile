@@ -289,4 +289,18 @@ COPY *.py ./
 # ffmpeg argument lists, and it is not evidence about any of them.
 RUN python3 -c "import handler, decodeprobe; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler + decodeprobe import OK, torch still lazy')"
 
+# **THE LINE ABOVE'S OWN SCOPE LIMIT, CLOSED BY ONE STDLIB PASS** (`docs/gate-findings.md`
+# `F-2026-08-29-4`). An import proves a module parses and that its module-scope imports resolve;
+# **it does not enter a single function.** `routec.py` shipped with five uses of `os` and no
+# `import os` — the module imported cleanly, the line above passed, CI was green on three jobs,
+# and the wave's most expensive instrument had never executed once. **It cost a 4K GPU dispatch to
+# find, and this finds it in under a second.**
+#
+# **IT IS `F-2026-08-28-15` APPLIED TO THE HALF IT WAS NEVER APPLIED TO.** That finding changed the
+# libvmaf assertion in this file from grepping a NAME to running the INVOCATION. The Python
+# assertion still imported a MODULE and never ran a PATH; this does not run a path either, but it
+# answers the one question a `NameError` is the answer to. *`name_check.py` states plainly what it
+# does not do — no attribute resolution, no execution — so nobody reads it as more than it is.*
+RUN python3 name_check.py
+
 CMD ["python3", "-u", "handler.py"]
