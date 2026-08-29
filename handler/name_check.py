@@ -36,10 +36,27 @@ import sys
 #: an ordinary line — would have failed a good build, and the check would have looked right doing
 #: it because four of the five dunders happened to be there.* Found in review; no module here uses
 #: `__file__` today, which is exactly why it would have waited for one that did.
-MODULE_DUNDERS = frozenset((
-    "__file__", "__builtins__", "__name__", "__doc__", "__package__", "__spec__",
-    "__loader__", "__debug__", "__path__", "__all__",
-))
+#:
+#: **MEASURED FROM A REAL MODULE'S NAMESPACE, NOT ENUMERATED FROM MEMORY — and the first draft of
+#: this fix was enumerated and was WRONG.** It listed nine names and missed `__cached__`, which
+#: Python binds in every module and which `dir(builtins)` also lacks, so `print(__cached__)` would
+#: have failed a good build for the identical reason `__file__` would have. *Correcting a list
+#: recalled from memory by writing a better list from memory is the same move that produced the
+#: defect.*
+#:
+#: **TWO MODULES INTERSECTED, BECAUSE ONE MODULE'S NAMESPACE IS CONTAMINATED BY ITS OWN
+#: DEFINITIONS.** Deriving from `ast` alone also exempts `__getattr__`, which `ast` defines and
+#: Python does not bind; deriving from `glob` alone also exempts `__all__`. **The intersection is
+#: what the IMPORT SYSTEM put there**, and on this interpreter it is exactly the eight names a
+#: freshly imported module carries — verified against one rather than assumed.
+#:
+#: *Both are already imported by this file, both are file-backed stdlib modules, and the check
+#: stays right if the image's Python moves.* `__path__` is added because packages have it and a
+#: plain module does not.
+MODULE_DUNDERS = frozenset(
+    ({name for name in vars(ast) if name.startswith("__") and name.endswith("__")}
+     & {name for name in vars(glob) if name.startswith("__") and name.endswith("__")})
+    | {"__path__"})
 
 BUILTINS = set(dir(builtins)) | MODULE_DUNDERS
 
