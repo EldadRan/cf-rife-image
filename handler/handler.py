@@ -613,7 +613,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # raise anywhere in between returned `internal` with a ~140 MB master sitting in the bucket,
     # ~500 s of GPU paid, and nothing in the response or the run record naming where it went.
     # **Not the armed path — every delivery.** *Found in review; the gate filed it as
-    # F-2026-08-29-11.*
+    # F-2026-08-29-12.*
+    #
+    # **This line said `F-2026-08-29-11` when it was committed, and that was already false.** 11
+    # is a different defect belonging to the gate; 12 is this one. The number was taken from a
+    # peer's message rather than from the document that owns it — and it landed inside the fix
+    # for a wave of findings about comments that decay. *It shows the decay needs no time at all:
+    # a citation can be false in the commit that introduces it, and nothing tests a comment.*
     #
     # **Banked HERE rather than merely wrapping the three reads that were named.** Between this
     # line and where `output_entry` used to be built sit the §6g PNG uploads and §11's decode
