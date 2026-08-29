@@ -61,9 +61,16 @@ MAX_POLL_S = 90
 #: ruled that an absence meaning two things is a question rather than a state, and each time the
 #: remedy was the other field that already answered it.*
 #:
-#: **Named here rather than flagged at the call sites.** A `coarse=True` argument would put the
-#: answer in three places and let a fourth phase be added without one; this is the one home for
-#: "which phases are §18's", and §18d names exactly these three.
+#: **THIS IS NOT THE ETA'S GATE AND WAS ONLY EVER A PROXY FOR IT** (§18d-1). The rule is the
+#: exhausted frame count, not the name — see `phase()`. A fourth tail phase already existed when
+#: §18d was written (`handler.py:674`, before §11's re-decodes), added by someone with no reason
+#: to know a list existed, and it published `eta_s: 0` exactly as these three did. *A name list
+#: needs maintaining by whoever adds the fifth; a state test needs nothing.*
+#:
+#: **Kept because it answers a different question with a closed answer** — which emissions are
+#: §18a's three coarse phases. **It has NO consumer in code today**, and that is said out loud
+#: rather than left for someone to discover: the two questions looked like one only because
+#: §18d's three examples happened to all be coarse.
 COARSE_PHASES = ("draining", "scoring", "uploading")
 
 
@@ -197,8 +204,18 @@ class Progress:
         # `eta` stays bound to `None` because `_next_poll_s` below takes it. That is the right
         # answer too: with no ETA, the cadence falls to the measured pass rate if there is one and
         # to the floor if there is not, which is `MIN_POLL_S`'s actual meaning — no information.
+        # **THE PREDICATE IS THE EXHAUSTED COUNT, NOT THE PHASE'S NAME** (§18d-1). §18d gave its
+        # reason in the property's language — the quantity this ETA measures is complete — and
+        # then scoped it to three strings, which is `F-2026-08-25-4`: a property stated beside an
+        # enumeration is how the enumeration was CHOSEN, not what it means.
+        #
+        # **`_estimated_frames` must be truthy, and that is not defensive.** Before `plan_frames`
+        # it is `None` and `0 >= None` is not even comparable; more to the point, a run that has
+        # not yet been sized SHOULD still publish the seeded prediction, which is the whole of
+        # F-2026-08-19-29's fix. Suppressing there would restore the 1,061-second silence.
+        exhausted = bool(self._estimated_frames) and self._frames_done >= self._estimated_frames
         eta = None
-        if name not in COARSE_PHASES:
+        if not exhausted:
             eta = self.eta_s()
             if eta is not None:
                 payload["eta_s"] = int(eta)
