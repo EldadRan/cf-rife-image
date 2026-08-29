@@ -17,6 +17,13 @@ does not resolve attributes — `os.pathh.join` passes, because `os` is bound. I
 names injected at runtime. **It answers exactly one question: is there a name this module reads and
 never binds**, which is the question a `NameError` at frame 783 was the answer to.
 
+**AND `bound` IS FLAT, SO A NAME BOUND ANYWHERE COVERS A USE ANYWHERE — demonstrated, not
+theorised.** Deleting a module-level `import hashlib` from the harness's `run_one.py` leaves this
+kind of pass GREEN, because two of its functions import that module locally while a third relied on
+the module-level one. *A real `NameError`, invisible here.* **Modelling scope would close it at the
+price of false positives, and a check that fails a good build gets deleted rather than repaired** —
+so the trade is deliberate and the limit is written down instead of implied.
+
 **Stdlib only and no new dependency**, so it costs a fraction of a second and cannot fail the build
 for a reason of its own.
 
