@@ -219,27 +219,36 @@ class Progress:
         if not exhausted:
             eta = self.eta_s()
             if eta is not None:
-                # **ROUNDED UP, NEVER TRUNCATED** (§18d-2). `int()` rounds toward zero, so every
-                # ETA under a second published `0` — the strongest possible claim of completion —
-                # on a run with a 47-257 s tail still ahead. This module forbids exactly that
-                # direction in its own words at `eta_s`'s docstring: an ETA that runs short tells
-                # CF a job is nearly done when it is not. *Truncation is not a rounding choice
-                # here, it is a systematic bias toward the one answer the module rules out.*
+                # **PUBLISHED ONLY WHEN IT IS AT LEAST 1, AND A ZERO IS AN ABSENCE** (§18d-3).
                 #
-                # **`max(1, ...)` and not `ceil` alone**, because `ceil(0.0)` is `0` and the
-                # invariant §18d-1 and this section buy together is that `eta_s: 0` is
-                # UNREACHABLE: a payload either carries no `eta_s`, or carries one of at least 1.
-                # A zero is reachable without this — `eta_s()`'s candidate arithmetic returns
-                # `0.0` when `_work_fraction` hits 1.0 while `_frames_done` has not, which is a
-                # state `exhausted` above does not catch because they are different quantities.
-                # *Rounding a computed 0.0 up to 1 is the pessimistic direction, which is the one
-                # this module is allowed to err in.*
+                # **`ceil` and not `int()`**, because `int()` rounds toward zero: every ETA under
+                # a second published `0`, the strongest possible claim of completion, on a run
+                # with a 47-257 s tail still ahead. `eta_s`'s own docstring forbids that
+                # direction — an ETA that runs short tells CF a job is nearly done when it is not.
                 #
-                # **`gate_scripts/record_witness.py:589` already refuses a zero `eta.first_s`**
-                # — "neither may be zero". A value the grader calls illegitimate should not be
-                # constructible by the publisher.
-                payload["eta_s"] = max(1, int(math.ceil(eta)))
-                payload["eta_basis"] = self._eta_basis
+                # **AND A COMPUTED ZERO IS SUPPRESSED RATHER THAN RAISED TO 1**, which is the
+                # ruling that went against the obvious fix. Rounding a NUMBER up is pessimistic;
+                # publishing `1` is optimistic about the JOB — it says a second remains on a run
+                # that can have hundreds of frames still to write. *The two directions point
+                # opposite ways here and the rule protects completion.* The module already says
+                # the answer in the same paragraph: "`None` rather than a guess still holds when
+                # there is nothing at all to compute from", and a computed zero while work
+                # remains is nothing to compute from — the arithmetic has lost its subject.
+                #
+                # **A zero is genuinely reachable and `exhausted` above does not catch it.** The
+                # `measured` branch cannot be zero while frames remain, but the candidates path
+                # scales BOTH candidates by `(1 - _work_fraction)`, and `_work_fraction` carries
+                # `ahead`, so it reaches 1.0 while `_frames_done` has not. *Found by building the
+                # previous version of this line, not by reading it.*
+                #
+                # So exhaustion, sub-second truncation and a computed zero are three routes to
+                # one state with one answer. **`gate_scripts/record_witness.py:589` refuses a
+                # zero `eta.first_s` — "neither may be zero" — and a value the grader calls
+                # illegitimate is now not constructible by the publisher.**
+                seconds = int(math.ceil(eta))
+                if seconds >= 1:
+                    payload["eta_s"] = seconds
+                    payload["eta_basis"] = self._eta_basis
         if expected_s is not None:
             half = float(expected_s) / 2.0
             payload["next_poll_s"] = int(max(MIN_POLL_S, min(MAX_POLL_S, half)))
