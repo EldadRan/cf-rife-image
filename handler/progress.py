@@ -214,6 +214,17 @@ class Progress:
         # it is `None` and `0 >= None` is not even comparable; more to the point, a run that has
         # not yet been sized SHOULD still publish the seeded prediction, which is the whole of
         # F-2026-08-19-29's fix. Suppressing there would restore the 1,061-second silence.
+        # **THIS TEST CHANGES NO PAYLOAD, AND DELETING IT WOULD STILL BE WRONG.** Read it against
+        # its own output and it does nothing: at exhaustion the arithmetic below reaches `0.0` by
+        # both branches and the publish gate suppresses it anyway. **Its work is the SIDE EFFECT
+        # it avoids** — `eta_s()` mutates `_eta_basis` at `:445` before returning, so asking and
+        # discarding leaves a stale label for the next payload that does publish one.
+        #
+        # *Said here because its necessity is invisible where anyone would check for it.* A
+        # reader who removes it will find every test still passing and every payload identical,
+        # and will be right about all of that and wrong about the change. **Collapsing it into
+        # the publish gate is possible and needs the mutation moved out of `eta_s()` first —
+        # a change to the estimator, not to this function, and not ordered.**
         exhausted = bool(self._estimated_frames) and self._frames_done >= self._estimated_frames
         eta = None
         if not exhausted:
@@ -245,6 +256,14 @@ class Progress:
                 # one state with one answer. **`gate_scripts/record_witness.py:589` refuses a
                 # zero `eta.first_s` — "neither may be zero" — and a value the grader calls
                 # illegitimate is now not constructible by the publisher.**
+                # **`>= 1` AND NOT `!= 0`, WHICH ALSO COVERS A NEGATIVE.** §18d-4 enumerates
+                # `eta_s()`'s domain as `[0, inf)` from three clamps; there is a fourth write to
+                # `_work_fraction` at `:329` — `max(_work_fraction, done/estimated)` — with no
+                # upper bound, so a `done` above `_estimated_frames` puts it over 1.0 and the
+                # observed candidate at `:556` goes negative. *Every route I could construct is
+                # outranked by the clamped candidate at `:550` or short-circuited by the measured
+                # branch at `:524`, so I could not make a negative reach here — but this gate
+                # does not depend on that being true.*
                 seconds = int(math.ceil(eta))
                 if seconds >= 1:
                     payload["eta_s"] = seconds
