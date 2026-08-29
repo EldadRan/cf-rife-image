@@ -567,6 +567,38 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # ABOUT, and reading it from the local file is the only reading that cannot have been
     # truncated by the very failure the number would be explaining.
     upload_bytes = os.path.getsize(master_path)
+    # ── §18's THIRD PHASE, AND THE ONLY ONE WITH AN HONEST FIGURE ───────────────────────────
+    #
+    # **DERIVED FROM THIS JOB'S OWN FETCH, NOT FROM THE CORPUS.** `estimator` carries
+    # `TIME_TRANSFER_PER_MP`, but it was fitted against fetch AND upload together and is a rate
+    # per MEGAPIXEL, not per byte — using it for one direction of one transfer would be a fitted
+    # aggregate spent on something it does not describe.
+    #
+    # **The fetch that already happened on THIS job, over THIS link, to THIS worker is the better
+    # instrument**, and it is `_next_poll_s`'s own argument: *"the worker is the only party that
+    # knows the answer, and it knows it by measurement."* Bytes per second observed inbound,
+    # applied to the bytes about to go out.
+    #
+    # **`None` WHENEVER THAT DIVISION IS NOT AVAILABLE** — a reused source transfers nothing, a
+    # zero-second fetch measures nothing — and then §18b's floor is the answer. *A rate computed
+    # from a zero denominator is precisely the nearly-right quantity §2b refuses.*
+    # **The whole derivation is wrapped, because it runs AFTER the master exists.** `float()` on
+    # a trace value that is not a number raises, and `.get` on a `timings` that is not a mapping
+    # raises — either would kill a job between writing the product and uploading it, for a poll
+    # interval. *A support computation for an emit inherits the emit's rule: it must not be able
+    # to cost a delivery.*
+    try:
+        _fetch_s = float(((trace or {}).get("timings") or {}).get("fetch_s") or 0.0)
+        _fetch_bytes = float(((trace or {}).get("transfer") or {}).get("fetch_bytes") or 0.0)
+        _upload_expected = ((upload_bytes / (_fetch_bytes / _fetch_s))
+                            if _fetch_s > 0 and _fetch_bytes > 0 else None)
+    except Exception:  # noqa: BLE001 — no figure is a state §18b already rules honest
+        _upload_expected = None
+    try:
+        progress.phase("uploading", force=True, expected_s=_upload_expected)
+    except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
+        print("[progress] uploading phase not emitted ({}: {})".format(
+            type(exc).__name__, exc), flush=True)
     upload_started = time.time()
     try:
         master_key = storage.upload(client, request["output"], master, master_path,

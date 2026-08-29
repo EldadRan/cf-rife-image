@@ -148,7 +148,22 @@ class Progress:
         if count:
             self._estimated_frames = int(count)
 
-    def phase(self, name, pct=None, force=False, **facts):
+    def phase(self, name, pct=None, force=False, expected_s=None, **facts):
+        """One coarse phase. **`expected_s` is how long THIS STRETCH is expected to take, and it
+        sets the poll interval; it is never published as an ETA** (`docs/instrumentation.md` §18).
+
+        **The tail is where this matters.** Progress is frame-based by `contract.md` §1, so the
+        frame count runs out before the job does — and `_next_poll_s` then answers from a
+        `_pass_cadence_s` measured on frames that stopped arriving, or falls to `MIN_POLL_S`, the
+        floor designed for having NO information. *On a 4K armed run that is ~250 s of silence at
+        five-second polls, on a stretch where the worker knows exactly what it is doing.*
+
+        **HALF THE EXPECTED DURATION, WHICH IS `_pass_cadence_s`'s OWN RULE ONE LEVEL UP.** That
+        promise is half a pass so a client sees every payload at least once; here the next payload
+        is the NEXT phase's, so half the stretch is the same property. **`None` means no figure
+        exists and the floor is the answer** — which §18b rules is honest, and honest for a
+        different reason than it is today: not a stale cadence, but a stretch nobody has measured.
+        """
         payload = {"phase": name}
         if pct is not None:
             payload["pct"] = int(max(0, min(100, pct)))
@@ -156,7 +171,22 @@ class Progress:
         if eta is not None:
             payload["eta_s"] = int(eta)
             payload["eta_basis"] = self._eta_basis
-        payload["next_poll_s"] = self._next_poll_s(eta)
+        if expected_s is not None:
+            half = float(expected_s) / 2.0
+            payload["next_poll_s"] = int(max(MIN_POLL_S, min(MAX_POLL_S, half)))
+            # **The basis of the promise, published beside it**, exactly as `pass_cadence_s` is
+            # below and for CF's 2026-08-20 reason: a client that can see what the worker measured
+            # can CHECK the promise rather than trust it.
+            #
+            # **AND THE CLAMP IS NAMED WHEN IT BITES, OR THE CHECK FAILS ON ITS OWN TERMS.** A
+            # 500,000-second expectation publishes `next_poll_s: 90`, and a client dividing the
+            # basis by two would find the worker's arithmetic wrong when it is the bound that
+            # moved. *A basis that cannot explain the number beside it is not a basis.*
+            payload["poll_basis"] = "phase:{}{}".format(
+                name, "" if MIN_POLL_S <= half <= MAX_POLL_S else " (clamped)")
+            payload["phase_expected_s"] = round(float(expected_s), 1)
+        else:
+            payload["next_poll_s"] = self._next_poll_s(eta)
         # **The basis of the promise, published beside it** (CF ruling, 2026-08-20). A client that
         # can see the cadence the worker measured can check the promise rather than trust it, and
         # the whole cadence investigation had to be run from outside precisely because the

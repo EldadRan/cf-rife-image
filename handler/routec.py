@@ -927,6 +927,33 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # whose mid-flight count would make `elapsed/done` lie.
                     if progress is not None:
                         progress.frames(writer.frames_written, phase="interpolate")
+                # ── §18's FIRST COARSE PHASE, and it is the last thing said inside the `with` ──
+                #
+                # **HERE, because `__exit__` is where the drain happens and nothing can speak from
+                # inside it.** The frames are handed over; what follows is `stdin.close()` and
+                # `wait()`, which at 8K with a lookahead can be tens of 50 MiB frames settling —
+                # 38 s on the banked h265 row and every second of it silent today.
+                #
+                # **`expected_s` IS NOT SUPPLIED AND THAT IS THE HONEST ANSWER** (§18b). The drain
+                # has never been instrumented per-job before it happens: `drain_s` is measured by
+                # `__exit__` and known only afterwards, and nothing in `estimator`'s corpus carries
+                # a figure for it. *The floor is what a stretch with no measurement deserves — and
+                # unlike today it is the floor for that reason rather than because a frame cadence
+                # went stale.* **The phase NAME is the news; the interval is not pretending.**
+                #
+                # **WRAPPED, AND THIS IS THE ONE EMIT IN THE WAVE THAT NEEDS IT.** It is the last
+                # statement inside the writer's own `with`, so anything it raised would arrive in
+                # `__exit__` as an exception. *`encoder.__exit__` drains BEFORE it looks at
+                # `exc_type` — `close()`, `wait()`, `drain_s`, and only then `if exc_type is not
+                # None` — so the master is not at risk either way.* **But a progress emit that
+                # failed a finished job would still be a diagnostic costing a delivery**, which is
+                # this module's standing rule, and one line removes the question entirely.
+                if progress is not None:
+                    try:
+                        progress.phase("draining", force=True)
+                    except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                        print("[progress] draining phase not emitted ({}: {})".format(
+                            type(exc).__name__, exc), flush=True)
         except WorkerError as exc:
             peak = writer_cm.encoder_peak_rss_gb
             if peak is None:
@@ -984,6 +1011,19 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # rules is the honest shape. *The exception is swallowed with its text printed, exactly as
         # `_print_write_distribution` is, and for the same reason.*
         if reference_path is not None:
+            # **§18's SECOND PHASE, and the tail it covers is the worst one.** `docs/test-plan.md`
+            # §40a measures the armed 4K tail at 181-257 s against 47-57 s unarmed — so this is
+            # where a caller is most likely to conclude the job has hung, and it is entirely
+            # silent today.
+            #
+            # **No `expected_s`, for the drain's reason and one more.** Nothing has ever timed a
+            # libvmaf pass per-job, `estimator`'s corpus carries no figure, and the nearest
+            # constant it does carry — `TIME_TRANSFER_PER_MP` — is a TRANSFER term. *Reaching for
+            # it here would be reasoning by adjacency, which is the §6d-1 defect exactly: a
+            # quantity borrowed because it was the nearest one to hand rather than because it
+            # describes this.*
+            if progress is not None:
+                progress.phase("scoring", force=True)
             try:
                 reference_block = reference.score(
                     master_path, reference_path, width, height, float(target_fps),
