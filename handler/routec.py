@@ -14,6 +14,15 @@ did was the one-cv2-per-process property, which is a statement about a process t
 SeedVR2 — this one has no vendored tree to import and no second cv2 to be one of. `decode` owns
 the import and `open_source` no longer takes a CLI it never used for anything else.
 """
+# **`os` IS USED BY §6g's REFERENCE PATHS AND WAS NOT IMPORTED**, which made every armed
+# `reference_score` run raise `NameError` at the disk-bound site before a frame was read
+# (`F-2026-08-29-4`). **Nothing in the wave could have caught it**: `py_compile` does not resolve
+# names, the image's import assertion imports the MODULE and a NameError is a run-time event, the
+# reviewer was given a diff and imports are not in a hunk, and this module needs `numpy` so it
+# cannot be imported on the tree where the rest of §6g was exercised. *Stdlib, and the first
+# import in the file for that reason: it is the one this module cannot be read without.*
+import os
+
 import numpy as np
 
 import stages
