@@ -46,6 +46,26 @@ MIN_POLL_S = 5
 MIN_PASS_GAP_S = 1.0
 MAX_POLL_S = 90
 
+#: **§18's coarse phases, and inside one of them `eta_s` and `eta_basis` are ABSENT**
+#: (`docs/instrumentation.md` §18d). *Not zero, not null, not a guess.*
+#:
+#: The frame ETA measures a quantity that is COMPLETE by the time these run — `_frames_done`
+#: equals `_estimated_frames`, so `remaining` is 0 and the number published was `0` carrying the
+#: basis `measured`, the strongest provenance this class can issue, for 181-257 s of an armed
+#: 4K tail. §18c-1's refusal to invent a scoring constant stands, so there is nothing honest to
+#: put in its place, and absence is how this module ALREADY says "no ETA is computable".
+#:
+#: **The absence is not ambiguous, and the field that disambiguates it is `phase` itself**: no
+#: `eta_s` with no phase means nothing can be computed yet, and no `eta_s` inside a named coarse
+#: phase means the frames are done and this stretch is not modelled. *§13a, §15c and §17a each
+#: ruled that an absence meaning two things is a question rather than a state, and each time the
+#: remedy was the other field that already answered it.*
+#:
+#: **Named here rather than flagged at the call sites.** A `coarse=True` argument would put the
+#: answer in three places and let a fourth phase be added without one; this is the one home for
+#: "which phases are §18's", and §18d names exactly these three.
+COARSE_PHASES = ("draining", "scoring", "uploading")
+
 
 class Progress:
     """Phase, percentage and a self-calibrating ETA.
@@ -167,10 +187,22 @@ class Progress:
         payload = {"phase": name}
         if pct is not None:
             payload["pct"] = int(max(0, min(100, pct)))
-        eta = self.eta_s()
-        if eta is not None:
-            payload["eta_s"] = int(eta)
-            payload["eta_basis"] = self._eta_basis
+        # **NOT ASKED, rather than asked and suppressed** (§18d). `eta_s()` MUTATES
+        # `self._eta_basis` at `progress.py:445` before it returns, so computing the number and
+        # then declining to publish it would leave the basis set from a call whose value was
+        # discarded — a stale label waiting for the next payload that does publish one. Skipping
+        # the call is the only route that cannot leave that behind, and it is also the honest
+        # shape: the question is not being asked, because the quantity it measures is complete.
+        #
+        # `eta` stays bound to `None` because `_next_poll_s` below takes it. That is the right
+        # answer too: with no ETA, the cadence falls to the measured pass rate if there is one and
+        # to the floor if there is not, which is `MIN_POLL_S`'s actual meaning — no information.
+        eta = None
+        if name not in COARSE_PHASES:
+            eta = self.eta_s()
+            if eta is not None:
+                payload["eta_s"] = int(eta)
+                payload["eta_basis"] = self._eta_basis
         if expected_s is not None:
             half = float(expected_s) / 2.0
             payload["next_poll_s"] = int(max(MIN_POLL_S, min(MAX_POLL_S, half)))
