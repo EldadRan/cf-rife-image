@@ -690,6 +690,17 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
     arithmetic while the request records that nobody chose.
     """
     import encoder  # noqa: PLC0415 — imported here so this module stays importable without one
+
+    # **THE CODEC IS RESOLVED ONCE, HERE, AND EVERY TEST BELOW READS THE RESOLVED NAME.** It was
+    # resolved inside `resolve_defaults` and again inside `MasterWriter.__init__`, neither writing
+    # back — so this function held the RAW value while both consumers held the real one, and
+    # `codec == "h265"` at the arm and the log line took the wrong branch for `codec=None`.
+    # *Latent while the default is h264 and live the moment it is not: a one-line change to a
+    # constant in another file would silently un-do §6i's arm fix, with the arm still present and
+    # plausible and no test able to see it.* **A default resolved in two places that do not write
+    # back is a value with two truths**, which is the shape this file has spent the week removing.
+    # Found in review.
+    codec = encoder.resolve_codec(codec)
     import reference  # noqa: PLC0415 — contract §6g, and stdlib-only like the rest of this pair
     import variants  # noqa: PLC0415
 
@@ -893,6 +904,17 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # **Read off `encode_arm`'s own names**, which is what makes the estimate's declared
             # arm and the encode's actual settings impossible to disagree — the same argument the
             # record already makes by reading all five off the writer that ran, one step earlier.
+            #
+            # **THAT IS TRUE OF THE FIVE AND NOT OF §6i's TWO, AND THE DIFFERENCE IS WORTH
+            # STATING.** `frame_threads` and `pools` reach the writer as the RAW parameters below,
+            # and the writer derives its own values from them — so the arm's copy and the encode's
+            # come from two calls to `x265_threading` rather than from one dict. *They cannot
+            # disagree, because that function is pure, reads only its arguments and two module
+            # constants, and both sites pass names this function never rebinds — but the property
+            # is held by ARGUMENT and not by construction, which is a weaker thing and a reader
+            # should not be told otherwise.* **The raw values must stay raw on the way in**: the
+            # writer needs to see `None` to know the caller sent nothing, which is what makes
+            # `frame_threads_basis` say `default` rather than `caller`. Found in review.
             # **The codec goes to the ONE place that maps a name to a library**, and the
             # writer is then the single object that knows what ran — which is what the record
             # reads it off, exactly as it already does for the five settings.

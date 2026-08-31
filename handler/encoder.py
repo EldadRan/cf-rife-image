@@ -273,6 +273,17 @@ def x265_threading(frame_threads=None, pools=None):
     return values, basis
 
 
+def resolve_codec(codec):
+    """`None` -> the default, anything else unchanged. **The one place that answer is made.**
+
+    *It was made in two places that never wrote back — `resolve_defaults` and
+    `MasterWriter.__init__` each resolved internally — so a caller passing `None` held a name that
+    was already false for the encode about to happen, and any test it did against `"h265"` took
+    the wrong branch while both consumers took the right one.* Found in review.
+    """
+    return envelope.DEFAULT_CODEC if codec is None else codec
+
+
 def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=None,
                      rc_lookahead=None):
     """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
@@ -303,7 +314,7 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
     `codec` of `None` means the caller named none, which is `envelope.DEFAULT_CODEC` — resolved
     here rather than at the call site so the default has one home.
     """
-    codec = envelope.DEFAULT_CODEC if codec is None else codec
+    codec = resolve_codec(codec)
     if codec not in CODEC_LIBRARIES:
         raise WorkerError(INTERNAL, (
             "the encoder was asked to resolve defaults for codec {!r}, which this worker does "
@@ -602,7 +613,7 @@ class MasterWriter:
                 "the master writer was constructed for bit depth {!r}; `envelope` enumerates {} "
                 "and `validation` refuses the rest at the door.").format(
                     self.bit_depth, ", ".join(str(d) for d in sorted(PIXEL_FORMATS))))
-        self.codec = envelope.DEFAULT_CODEC if codec is None else codec
+        self.codec = resolve_codec(codec)
         if self.codec not in CODEC_LIBRARIES:
             raise WorkerError(INTERNAL, (
                 "the master writer was constructed for codec {!r}, which this worker does not "
