@@ -1,6 +1,6 @@
-"""The CPU/CUDA rounding sweep — `docs/conversion-wave.md` §2e prerequisite 2 and §2g.
+"""The CPU/CUDA rounding sweep — `docs/archive/conversion-wave-archive.md` §2e prerequisite 2 and §2g.
 
-**`docs/conversion-wave.md` §5 claims the outbound wave carries ZERO quality risk, and that claim
+**`docs/archive/conversion-wave-archive.md` §5 claims the outbound wave carries ZERO quality risk, and that claim
 rests entirely on one unverified premise: that the rounding on the device breaks ties the way the
 rounding on the host does.** Both document half-to-even. Nobody has ever checked it on a card, and
 neither session has torch or numpy on the machine where the documents are written. **This module is

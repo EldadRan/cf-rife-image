@@ -338,7 +338,7 @@ def _runpod_identity(job):
 #: described a request nobody sent.
 #:
 #: Now route C's scalars: the things that change what the worker computes.
-#: **`convert_check` is here so a record SAYS the gate was armed** (`docs/conversion-wave.md`
+#: **`convert_check` is here so a record SAYS the gate was armed** (`docs/archive/conversion-wave-archive.md`
 #: §5-0). Without it, an armed run that died before the checker could publish is
 #: indistinguishable from one nobody asked — and an armed run's `convert_out_s` is inflated by
 #: the reference arm's own host work, so a corpus row that cannot say which kind it is cannot be

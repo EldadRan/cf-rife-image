@@ -56,7 +56,7 @@ import interp_plan
 #:
 #: **The estimator REFUSES JOBS against this line**, so under-predicting is the one direction
 #: that fails silently — and it under-predicted worst at the resolution with the least headroom.
-#: `docs/conversion-wave.md` §2f required this re-certification in advance rather than leaving it
+#: `docs/archive/conversion-wave-archive.md` §2f required this re-certification in advance rather than leaving it
 #: to be noticed.
 #:
 #: **FITTED ON THE WORST DEVICE-ERA READING AT EACH AREA, NOT THE MEAN, AND THAT IS DELIBERATE.**

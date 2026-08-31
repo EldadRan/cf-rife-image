@@ -225,7 +225,7 @@ PARAMS_FIELDS = {
     # here. Raised to the gate as a claim.
     "output",
     # ── the conversion wave's gate ───────────────────────────────────────────────────────────
-    # **`docs/conversion-wave.md` §5-0, and A REQUEST FIELD RATHER THAN AN ENVIRONMENT VARIABLE
+    # **`docs/archive/conversion-wave-archive.md` §5-0, and A REQUEST FIELD RATHER THAN AN ENVIRONMENT VARIABLE
     # BY CF'S RULING.** The tie check took an env var and §2g-1 granted that exception explicitly
     # for one errand on a no-traffic endpoint; it does not carry. **An environment variable is
     # deployment-scoped configuration, and one left set silently taxes every later job** — this
@@ -755,7 +755,7 @@ def validate(job_input):
     if sliced_threads is not None:
         sliced_threads = _as_bool(sliced_threads, "sliced_threads")
 
-    # **`docs/conversion-wave.md` §5-0. Default FALSE and there is no other reachable default.**
+    # **`docs/archive/conversion-wave-archive.md` §5-0. Default FALSE and there is no other reachable default.**
     # The gate doubles the outbound conversion for every delivered frame, so it is opt-in per
     # job, asked for by the run that wants the evidence and by nothing else.
     convert_check = params.get("convert_check")

@@ -227,14 +227,14 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         "attempts": attempts or [],
         "warnings": list(warnings or []),
     }
-    # **`docs/conversion-wave.md` §2g-2, and OMITTED rather than nulled when it did not run.**
+    # **`docs/archive/conversion-wave-archive.md` §2g-2, and OMITTED rather than nulled when it did not run.**
     # Every ordinary job is a job that did not sweep, so a `null` here would be a field on every
     # record in the corpus saying nothing. The kit's `--tie-check` REQUIRES the block and grades
     # its absence, which is the behaviour that makes "the sweep did not happen" distinguishable
     # from "the sweep found nothing" — the distinction `F-2026-08-25-2` is about.
     if tie_check:
         body["tie_check"] = tie_check
-    # **`docs/conversion-wave.md` §5-0, omitted rather than nulled**, exactly as `tie_check` is:
+    # **`docs/archive/conversion-wave-archive.md` §5-0, omitted rather than nulled**, exactly as `tie_check` is:
     # every ordinary job is a job that did not run the gate, and the kit's `--convert-check`
     # grades the absence so "did not run" stays distinguishable from "ran and found nothing".
     if convert_check:

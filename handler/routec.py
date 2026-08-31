@@ -453,7 +453,7 @@ def _to_rgb24_device(tensor, staging=None):
     of four**, which is the whole of the saving — the device-to-host copy shrinks by 4x and the
     arithmetic stops being a host bottleneck.
 
-    **OUT-OF-PLACE, AND IT IS A REQUIREMENT RATHER THAN A STYLE NOTE** (`docs/conversion-wave.md`
+    **OUT-OF-PLACE, AND IT IS A REQUIREMENT RATHER THAN A STYLE NOTE** (`docs/archive/conversion-wave-archive.md`
     §2f, §3a). `clamp_`, `mul_` or `round_` would write through to the caller's own tensor, and
     `interpolate.stream` ends both its copy and its hold branch with `yield held[i]` — **the same
     tensor object, emitted twice.** A held frame converted in place would be CLAMPED back into
@@ -980,7 +980,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # **`convert_out_s` is §10's whole subject.** It was `convert_s` until §10a
                     # split that name three ways, and it is the OUTBOUND step: the device-to-host
                     # copy as float32 inside `_to_rgb24`, then the single-threaded host
-                    # arithmetic after it. `docs/conversion-wave.md` is sized entirely against
+                    # arithmetic after it. `docs/archive/conversion-wave-archive.md` is sized entirely against
                     # this field's share and that share has never been measured — the 61-74% was
                     # attributed here in a draft and the attribution was assumption. This is the
                     # number that arms that wave or retires it.
@@ -1212,7 +1212,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # absent key and a `KeyError` — which is the distinction `build_identity`'s docstring
         # already argues for every field it reports.
         return dict(stats, scale=scale, peak_vram_gb=_read_peak(peak_reset),
-                    # **`docs/conversion-wave.md` §3b-0 item 2, and it is FRAMES DECODED.**
+                    # **`docs/archive/conversion-wave-archive.md` §3b-0 item 2, and it is FRAMES DECODED.**
                     # The record carried `n_out`, `n_copy`, `n_hold` and `n_synth` and never the
                     # count they were all derived from — invisible until the inbound gate needed
                     # grading against it, since that conversion runs once per SOURCE frame and
@@ -1542,7 +1542,7 @@ def _tensors(frames, device, clock=None, checker=None):
     negative-stride BGR view, on the host. §9a had it and `_to_rgb24` sharing one `convert_s` on
     the grounds that they were one activity; **§10a overruled that**, because the two sit on
     opposite sides of the model and only one of them is what
-    `docs/conversion-wave.md` proposes to change. One field covering both is the defect §9
+    `docs/archive/conversion-wave-archive.md` proposes to change. One field covering both is the defect §9
     complains about — a boundary nobody can read — wearing the opposite sign.
     """
     import torch  # noqa: PLC0415 — the interpolator has already imported it by the time we run
