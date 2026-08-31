@@ -212,19 +212,32 @@ X265_RC_LOOKAHEAD = 10
 #: x264 settings fields precisely so a bound on the encoder could not be handed to the caller.
 #: §6d already settled this shape one surface over.
 #:
-#: **BOTH ROWS ARE `X265_FRAME_THREADS` AND THAT IS DELIBERATE, NOT A PLACEHOLDER I FORGOT.**
-#: §6h rules the SHAPE and rules NO VALUE: *"`frame-threads` 2 or 4, the area boundary, and
-#: whether `pools` moves with it are what a calibration determines"*, and it instructs that a
-#: default forced before the sweep exists must be the CURRENT behaviour so the first build changes
-#: no output. **So this table is the mechanism, wired and recorded, resolving to what already
-#: ran.** *Picking a number here would be inventing the measurement the section exists to make
-#: room for, which is the move this project has been wrong about all week.*
+#: **THE ROWS NOW DIFFER, AND `area:small` IS UNDER CALIBRATION** (`docs/test-plan.md` §57,
+#: arm 1). *Until 2026-08-31 both rows held `X265_FRAME_THREADS` so §6h's first build changed no
+#: output — that was the right way to ship a mechanism whose values were not ruled, and this
+#: comment used to say so. It is no longer true and saying it would be worse than saying nothing.*
 #:
-#: The memory headroom §6h banks, for whoever does calibrate: 0.64 GiB at 1080p, 3.98 at 4K and
-#: 5.63 at 8K against a 46.57 GiB ceiling, with the h264 path already running 7.19 at 8K
-#: unguarded. *1080p and 4K carry almost no memory risk; 8K is a separate decision.*
+#: **`area:small` IS 1080p AND EXACTLY 4K; `area:large` IS 8K AND DOES NOT MOVE.** The advisor's
+#: brief is to measure 1080p and 4K first and read RSS before touching 8K, and §6h's boundary
+#: already draws that line — so one row is the whole gate and there is no second decision here.
+#: *8K stays at 1 until a run says otherwise.*
+#:
+#: **THIS IS THE FIRST BUILD IN THIS PROJECT MEANT TO CHANGE THE OUTPUT BITSTREAM**, so the
+#: identity check that certified §6h is now the WRONG check and must not be re-run looking for a
+#: pass. What must still hold is that `area:large` is untouched and that nothing outside this
+#: path moved — CRF and preset are excluded by the brief, and quality is first.
+#:
+#: **THE VALUE IS AN ARM OF AN EXPERIMENT AND NOT A RULING.** §6h rules no value; §57 is what
+#: rules them, and its own prediction is that this DOES cost compression — `output.bytes` has a
+#: measured noise floor of 0.0018% on the target clip, so the first record answers it either way.
+#: *If it costs bytes, this row goes back to `X265_FRAME_THREADS` and the constant is what makes
+#: that a one-line revert.*
+#:
+#: The memory headroom §6h banks: 0.64 GiB at 1080p, 3.98 at 4K and 5.63 at 8K against a 46.57
+#: GiB ceiling, with the h264 path already running 7.19 at 8K unguarded. *1080p and 4K carry
+#: almost no memory risk; 8K is a separate decision and is why the large row is not in this arm.*
 X265_FRAME_THREADS_BY_AREA = {
-    AREA_ROW_SMALL: X265_FRAME_THREADS,
+    AREA_ROW_SMALL: 2,
     AREA_ROW_LARGE: X265_FRAME_THREADS,
 }
 
