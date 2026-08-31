@@ -118,6 +118,10 @@ class Progress:
         #: rate on the real card at the real size, and nothing gives a better second estimate.
         self._expected_seconds_per_frame = None
         self._expected_basis = None
+        #: §19b. The estimator's spread as a FRACTION, so it can be applied to a live `eta_s`
+        #: rather than published as the static `low_s`/`high_s` pair fixed at seed time. `None`
+        #: until `expect()` supplies it, and on an unpriced run it stays `None` — see `phase()`.
+        self._band_frac = None
         #: Fraction of the clip's *work* completed, phase-weighted — the measure that moves while
         #: a whole-clip chunk is in the model and no frame has been written yet.
         self._work_fraction = 0.0
@@ -142,7 +146,7 @@ class Progress:
         #: no history and CF's only account of how the estimate behaved is what is returned.
         self.emitted = []
 
-    def expect(self, seconds_per_frame, basis=None):
+    def expect(self, seconds_per_frame, basis=None, band_frac=None):
         """Seed the rate the planner already predicted, before any work has been done.
 
         **So that an ETA exists during the model stretch** (F-2026-08-19-29). `eta_s` answered
@@ -163,6 +167,21 @@ class Progress:
             # obtained, so it says so, and keeps the provenance as a suffix rather than losing it.
             self._expected_basis = ("predicted" if basis in (None, "measured")
                                     else "predicted_{}".format(basis))
+        # **Taken independently of the rate**, because they fail independently: an estimate can
+        # carry a usable `seconds_per_frame` and a malformed band, and losing the seed over the
+        # band would restore the 1,061-second silence F-2026-08-19-29 closed. *Outside the `if`
+        # above for the same reason — the band is not the rate's passenger.*
+        #
+        # **A band outside `[0, 1)` is DROPPED, not clamped.** At `band_frac >= 1` the low edge
+        # is zero or negative, which §18d-3 just ruled is not an estimate; a negative one inverts
+        # the pair. Neither is a spread, and silently repairing a malformed number would publish
+        # a band nobody computed. *No band is a state §19a already has a meaning for; a wrong one
+        # is not.*
+        try:
+            if band_frac is not None and 0.0 <= float(band_frac) < 1.0:
+                self._band_frac = float(band_frac)
+        except (TypeError, ValueError):
+            pass
 
     def plan_frames(self, count):
         """Name the planned output count once it is known, rather than at construction.
@@ -268,6 +287,23 @@ class Progress:
                 if seconds >= 1:
                     payload["eta_s"] = seconds
                     payload["eta_basis"] = self._eta_basis
+                    # **§19a/§19b: the spread, applied to the LIVE point and not the seed's.**
+                    # `contract.md` §9b has required a point and a spread since the estimator was
+                    # ruled; the estimator honours it in the record and this channel discarded it.
+                    # The estimator's own `low_s`/`high_s` are fixed at seed time while `eta_s` is
+                    # recomputed every payload, so publishing that pair would have them disagree
+                    # more with every frame — at 90% done, `eta_s` 20 against a static 111-271.
+                    # The fraction travels; the edges are derived here.
+                    #
+                    # **Only when a band is actually known.** On an unpriced run `expect()` is
+                    # never called — `routec.py`'s estimate path returns before it — so `eta_s`
+                    # can be published from the MEASURED rate with no band behind it. §19a words
+                    # the rule as a biconditional; this is the case where it cannot hold, and the
+                    # honest answer is no band rather than one this worker invented. *Reported to
+                    # the gate rather than resolved here.*
+                    if self._band_frac is not None:
+                        payload["eta_low_s"] = int(seconds * (1.0 - self._band_frac))
+                        payload["eta_high_s"] = int(seconds * (1.0 + self._band_frac))
         if expected_s is not None:
             half = float(expected_s) / 2.0
             payload["next_poll_s"] = int(max(MIN_POLL_S, min(MAX_POLL_S, half)))

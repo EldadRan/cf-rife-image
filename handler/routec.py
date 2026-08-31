@@ -1376,7 +1376,13 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # key would raise here, `expect` would never be called, and the run would fall back to
         # `observed` — rebuilding §8d's 11,553-second failure that this very line exists to
         # prevent. **The seed is the valuable half and it must survive a malformed label.**
-        progress.expect(per_frame, basis=(estimate or {}).get("basis") or estimator.BASIS)
+        # **`band_frac` rides the same `.get`-with-fallback discipline as `basis`** (§19b). It
+        # is one key away in the dict this line already reads, and it was the only field of the
+        # estimate the progress channel could not see. A malformed estimate must not cost the
+        # seed, so a missing or unusable band arrives as `None` and `expect()` drops it there.
+        progress.expect(per_frame,
+                        basis=(estimate or {}).get("basis") or estimator.BASIS,
+                        band_frac=(estimate or {}).get("band_frac"))
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's
