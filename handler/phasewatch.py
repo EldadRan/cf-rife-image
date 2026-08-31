@@ -377,8 +377,8 @@ def build_banner():
     # correctly and a 404ing tag reads as fact — the guess is worse than the admission. The
     # commit still leads, since it is what a person types and what the ledger sorts by.
     #
-    # The full sha as well as the short form: read beside a registry digest and a
-    # `docs/deployment.md` lineage row, an abbreviation is one collision away from another commit.
+    # The full sha as well as the short form: read beside a registry digest and a deployment
+    # lineage row, an abbreviation is one collision away from another commit.
     reference = _os.environ.get(IMAGE_TAG_ENV)
     return "[host] boot: build {} (sha-{}) image {}".format(
         commit[:7], commit,

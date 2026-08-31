@@ -102,8 +102,7 @@ def master_name(is_still, width=None, height=None, name=None):
     written before this existed is untouched and nothing certified moves.
 
     CF records the prefix rather than the keys and reads the manifest for names, so this stays
-    within the worker's remit — but it is a visible change to what a job writes, and
-    `docs/questions-for-cf.md` says so rather than letting CF find out from an object listing.
+    within the worker's remit — but it is a visible change to what a job writes.
     """
     stem = sanitize_stem(name) or DEFAULT_STEM
     if not is_still:
