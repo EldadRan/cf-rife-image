@@ -845,6 +845,38 @@ def validate(job_input):
             "refusal. Send 'output.codec: h265' with it, or drop the field for 8-bit."
             .format(release_3["bit_depth"], release_3["codec"]))
 
+    # ── §6i — x265's TWO FIELDS ARE REFUSED UNDER h264, THE MIRROR OF §6e RULING 2 ──────
+    #
+    # **`pools` and `frame-threads` have no x264 spelling**, exactly as `sliced-threads` has no
+    # x265 one. x264 parallelises by slices and by its own `threads`; these two are x265's
+    # wavefront controls and mean nothing to it.
+    #
+    # **Refused rather than dropped, and the reason is the one the block below already gives:** a
+    # dropped bound leaves the caller believing a bound is in force and the record would carry
+    # their value beside an encode that never saw it. *§6b's surviving clause is the same rule
+    # one step out.*
+    #
+    # **AND IT KEEPS THE CORPUS SELF-KEYING.** With the refusal, `frame_threads` on a row implies
+    # h265 by construction — the property `instrumentation.md` §15a already relies on for
+    # `sliced_threads` implying h264, now holding in both directions.
+    if release_3["codec"] != "h265":
+        crossed_265 = [name for name in ("frame_threads", "pools")
+                       if release_3.get(name) is not None]
+        if crossed_265:
+            raise WorkerError(
+                FIELD_NOT_SUPPORTED,
+                "'output.codec: {}' was sent together with {}, which {} x265's wavefront "
+                "threading control{} and {} no x264 spelling: x264 parallelises by slices and by "
+                "its own 'threads'. Refused rather than accepted and dropped, because a dropped "
+                "bound leaves you believing a bound is in force and the record would carry your "
+                "value beside an encode that never saw it. Send these with 'output.codec: h265', "
+                "or send h264 with 'threads' and 'sliced_threads' instead.".format(
+                    release_3["codec"],
+                    _english_list(["'{}'".format(name) for name in crossed_265]),
+                    "is" if len(crossed_265) == 1 else "are",
+                    "" if len(crossed_265) == 1 else "s",
+                    "has" if len(crossed_265) == 1 else "have"))
+
     # ── §6e RULING 2 — x264's THREE FIELDS ARE REFUSED UNDER h265, NOT DROPPED ──────────
     #
     # **CF's ruling, 2026-08-28: *"It's the wrong shape."*** A request carrying `threads`,

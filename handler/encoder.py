@@ -129,6 +129,11 @@ AREA_FIELDS = ("threads", "sliced_threads", "rc_lookahead")
 #: would be three columns answering one question; a single field that could not express the
 #: partial case would file that job under whichever half it happened to check first.
 BASIS_CALLER = "caller"
+
+#: §6i: the other half of a per-field basis. **`caller` or `default`, per field, because the two
+#: levers are independently optional** — one sent and one defaulted is a legal request that a
+#: single basis cannot describe, which is `BASIS_MIXED`'s defect re-made one surface over.
+BASIS_DEFAULT = "default"
 BASIS_MIXED = "mixed"
 
 
@@ -206,27 +211,16 @@ X265_FRAME_THREADS = 1
 
 X265_RC_LOOKAHEAD = 10
 
-#: §6h: **frame-level parallelism is DERIVED FROM PADDED AREA and is not a caller-facing field.**
-#: *A caller sending h265 at 4K has no basis to choose 2 over 4 — it is a function of cores, frame
-#: size and the container's memory ceiling, none of which is caller knowledge* — and §6a made the
-#: x264 settings fields precisely so a bound on the encoder could not be handed to the caller.
-#: §6d already settled this shape one surface over.
+#: **§6i: THE x265 THREADING PATH IS NO LONGER KEYED ON AREA.** *`X265_FRAME_THREADS_BY_AREA`
+#: lived here from §6h until CF ruled §6i the same day. It is gone rather than left holding one
+#: value: `area` is not under the requester's control, so it is neither a field nor something a
+#: caller sees, and it stops selecting x265 threading.* **`area_row` is untouched and still drives
+#: the x264 defaults row**, which is where it always belonged.
 #:
-#: **BOTH ROWS ARE `X265_FRAME_THREADS` AND THAT IS DELIBERATE, NOT A PLACEHOLDER I FORGOT.**
-#: §6h rules the SHAPE and rules NO VALUE: *"`frame-threads` 2 or 4, the area boundary, and
-#: whether `pools` moves with it are what a calibration determines"*, and it instructs that a
-#: default forced before the sweep exists must be the CURRENT behaviour so the first build changes
-#: no output. **So this table is the mechanism, wired and recorded, resolving to what already
-#: ran.** *Picking a number here would be inventing the measurement the section exists to make
-#: room for, which is the move this project has been wrong about all week.*
-#:
-#: The memory headroom §6h banks, for whoever does calibrate: 0.64 GiB at 1080p, 3.98 at 4K and
-#: 5.63 at 8K against a 46.57 GiB ceiling, with the h264 path already running 7.19 at 8K
-#: unguarded. *1080p and 4K carry almost no memory risk; 8K is a separate decision.*
-X265_FRAME_THREADS_BY_AREA = {
-    AREA_ROW_SMALL: X265_FRAME_THREADS,
-    AREA_ROW_LARGE: X265_FRAME_THREADS,
-}
+#: `X265_FRAME_THREADS` and `X265_POOLS` are now DEFAULTS ONLY — what a request naming neither
+#: field receives, and the same two numbers `envelope.DEFAULT_FRAME_THREADS` and
+#: `envelope.DEFAULT_POOLS` state caller-facing. `x265_threading` is the one place the fallback
+#: happens.
 
 
 def area_row(delivered_pixels):
@@ -251,32 +245,35 @@ def area_row(delivered_pixels):
             else AREA_ROW_LARGE)
 
 
-def x265_frame_threads(delivered_pixels, frame_threads=None):
-    """§6h's derivation: `(value, basis)` for x265's frame-level parallelism.
+def x265_threading(frame_threads=None, pools=None):
+    """§6i's two levers resolved: `(values, basis)`, each field independently.
 
-    **`basis` is the branch that fired**, `"codec:h265/area:small"` or `.../area:large`, and it
-    reaches the record so a corpus row can say which threading it ran at. *Without it §15's
-    two-populations-one-field defect arrives on the axis §6h is about — rows at 1 and rows at 4
-    averaged into one number nobody can separate afterwards.*
+    **`None` MEANS THE CALLER SENT NOTHING, AND THAT IS THE WHOLE MECHANISM** — §6d's rule, which
+    `validation` preserves by handing these through as `None` when unset rather than resolving
+    them early. A branch that cannot tell *"the caller asked for 1"* from *"the caller asked for
+    nothing"* silently overwrites an explicit value, and `§6b`'s surviving clause is that a knob a
+    caller sets and the worker quietly ignores is worse than no knob.
 
-    **AN EXPLICIT VALUE IS OBEYED AND NEVER SILENTLY OVERRIDDEN**, which is §6b's surviving clause
-    and the one §6d calls load-bearing: *a knob a caller sets and the worker quietly ignores is
-    worse than no knob.* It exists so calibrating 1/2/4 costs one build rather than a build and a
-    pin per value, and the basis says `override` so a swept row is never mistaken for a derived
-    one — a calibration whose rows look like production rows is a corpus that lies later.
+    **A BASIS PER FIELD, NEVER ONE FOR BOTH.** One sent and one defaulted is a legal request —
+    §6i: *optional, and independently so* — and a single basis cannot describe it. That is
+    `BASIS_MIXED`'s defect re-made: a row saying `caller` about a number the caller never sent.
 
-    **NOT REACHABLE FROM A REQUEST.** §6h rules it a direct-caller guard, §6d's *"a guard for
-    direct callers a test makes, resolving to the same constants"*. Nothing in `validation` or
-    `envelope` names it and nothing should: CF refused the request-field shape, correctly.
+    **NOT KEYED ON AREA.** §6h derived this from the delivered frame; §6i struck that, because
+    `area` is not the requester's to set and so is not theirs to read either.
     """
-    if frame_threads is not None:
-        return int(frame_threads), "{}/override".format(BASIS_CODEC_H265)
-    row = area_row(delivered_pixels)
-    return X265_FRAME_THREADS_BY_AREA[row], "{}/{}".format(BASIS_CODEC_H265, row)
+    values = {
+        "frame_threads": X265_FRAME_THREADS if frame_threads is None else int(frame_threads),
+        "pools": X265_POOLS if pools is None else int(pools),
+    }
+    basis = {
+        "frame_threads_basis": BASIS_DEFAULT if frame_threads is None else BASIS_CALLER,
+        "pools_basis": BASIS_DEFAULT if pools is None else BASIS_CALLER,
+    }
+    return values, basis
 
 
 def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=None,
-                     rc_lookahead=None, frame_threads=None):
+                     rc_lookahead=None):
     """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
 
     Returns `(settings, provenance)` — the three resolved values, and the
@@ -326,22 +323,15 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
                 "these at the door because x265 has no such parameters, so a value here would "
                 "be recorded beside an encode that never saw it.").format(
                     ", ".join("{}={!r}".format(k, v) for k, v in sorted(sent.items()))))
-        # **§6h: the basis names the THREADING branch too, not just the codec.** It read
-        # `"codec:h265"` and said nothing about frame-level parallelism, so a corpus row could
-        # not say which threading it ran at — §15's two-populations-one-field defect on the exact
-        # axis §6h exists to calibrate. The settings dict stays EMPTY: `frame_threads` is derived
-        # rather than filled in from the caller's absence, so it is not one of §6d's three fields
-        # and must not appear beside them.
-        # **ONLY THE BASIS IS TAKEN HERE, AND THE VALUE IS `MasterWriter`'s.** Two derivations of
-        # one fact can disagree; these cannot, because they call one function on one input —
-        # §6d-1 pins `delivered_pixels` to the size the writer is constructed with, so both read
-        # the same number. **The override is the case that COULD split them**, which is one more
-        # reason it is a direct-caller guard: the production path passes it to neither, and a
-        # calibration that passed it to one artefact and not the other would file a record whose
-        # `encode_defaults.basis` and `retime.x265_params` describe different encodes.
-        basis = x265_frame_threads(delivered_pixels, frame_threads)[1]
+        # **§6i: THE BASIS IS BARE AGAIN.** §6h had made it `"codec:h265/area:small"` so a row
+        # could say which threading it ran at; with `frame_threads` and `pools` on the record AS
+        # VALUES the basis does not need to carry a branch, and `area` is not the caller's to see.
+        # *`sha-88fec73` shipped that suffix while `record_version` stayed 2, so its h265 rows
+        # label the same encode differently from every row before them. Going back closes the seam
+        # rather than papering over it with a version bump, and the discriminator for the rows that
+        # image did write is `retime.frame_threads` being present at all.*
         return {}, {
-            "basis": basis,
+            "basis": BASIS_CODEC_H265,
             # **Still carried, and it is not the boundary that decided anything here.** §13a
             # wants the integer the branch compared against as it stood in the image that ran;
             # under h265 nothing was compared, and omitting the field would make this block a
@@ -407,8 +397,7 @@ def pixel_format(bit_depth=None):
     return PIXEL_FORMATS[depth]
 
 
-def x265_params(pools=X265_POOLS, frame_threads=X265_FRAME_THREADS,
-                rc_lookahead=X265_RC_LOOKAHEAD):
+def x265_params(frame_threads, pools, rc_lookahead=X265_RC_LOOKAHEAD):
     """Build the `-x265-params` string from named fields. **Assembled, never accepted** — and
     here the rule has teeth the x264 side does not.
 
@@ -423,6 +412,14 @@ def x265_params(pools=X265_POOLS, frame_threads=X265_FRAME_THREADS,
     This is that reason arriving on the x265 side with the error reporting removed*, which is why
     the names live here as identifiers rather than in a literal a request or an edit could reach:
     **a name this contract has not enumerated cannot get onto the command line.**
+
+    **`frame_threads` AND `pools` ARE REQUIRED AND HAVE NO DEFAULTS, WHICH THEY USED TO.** Both
+    defaulted to the module constants, and that agreed with what shipped for every input until §6i
+    made them caller-settable — so a bare `x265_params()` returns the DEFAULT string and is
+    silently wrong for any request naming either field. *A caller wanting "what this worker emits"
+    must say for which request, because there is no longer one answer.* **Removing the defaults
+    turns a wrong string into a `TypeError` at the call site**, which is the failure worth having:
+    the silent version passes on exactly the requests that send nothing.
 
     **VERIFIED TO TAKE EFFECT AND NOT MERELY TO BE ACCEPTED**, which the paragraph above shows is
     a distinction with teeth: `pools=1:frame-threads=1` and `pools=16:frame-threads=4` produce
@@ -520,7 +517,7 @@ class MasterWriter:
                  audio_source=None, audio_codec=None, audio_limit_s=None,
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None, bit_depth=None,
                  threads=None, sliced_threads=None, rc_lookahead=None,
-                 reference_path=None, frame_threads=None):
+                 reference_path=None, frame_threads=None, pools=None):
         self.path = path
         #: **Where ffmpeg writes contract §6g's raw reference, or None for an unarmed run.**
         #: A SECOND OUTPUT of this same command rather than a copy of what crossed the pipe: the
@@ -642,16 +639,23 @@ class MasterWriter:
             #: never the source's probed size. *`resolve_defaults` derives the same value from the
             #: same input for the record's basis; deriving it there and passing it here would put
             #: the number in the request path, which §6h refuses. Both call one function.*
-            #: **Derived through `_derive_frame_threads` so `set_frame_size` can redo it.**
-            #: Computing it here from the CONSTRUCTOR's width and height armed a value that
-            #: nothing reset: `set_frame_size` exists to adopt the size the model actually
-            #: produced, rewrites `self.width`/`self.height`, and `_build_command` reads those —
-            #: so a resize across the area boundary would put `-s` describing one frame beside an
-            #: `-x265-params` and a basis derived for another. *Harmless today because both rows
-            #: hold the same value, and a live defect the moment §6h's calibration makes them
-            #: differ — which is precisely when nobody would be looking.* Found in review.
-            self._override_frame_threads = frame_threads
-            self._derive_frame_threads()
+            #: **§6i's two levers, resolved HERE and only here.** `None` from the caller means
+            #: absent; `x265_threading` applies the default and says per field which it was.
+            #:
+            #: *§6h derived `frame-threads` from the delivered frame, so this had to be re-derived
+            #: whenever `set_frame_size` moved the size. §6i struck the area keying, so the values
+            #: no longer depend on the frame at all and there is nothing for a resize to
+            #: invalidate.* **That removes a whole class of staleness rather than guarding it**,
+            #: which is why the re-derivation hook is gone rather than kept pointing at a constant.
+            values, basis = x265_threading(frame_threads, pools)
+            self.frame_threads = values["frame_threads"]
+            self.pools = values["pools"]
+            self.frame_threads_basis = basis["frame_threads_basis"]
+            self.pools_basis = basis["pools_basis"]
+            #: **Assembled from named fields for a reason sharper than §6a's** — see
+            #: `x265_params`: x265 discards an unknown NAME without a word, so a bound is not in
+            #: force merely because the job succeeded.
+            self.x265_params = x265_params(frame_threads=self.frame_threads, pools=self.pools)
             self.threads = None
             self.sliced_threads = None
             self.rc_lookahead = None
@@ -674,7 +678,8 @@ class MasterWriter:
             #: encode — the shape `band` failed at four hours ago, one file over.
             self.frame_threads = None
             self.frame_threads_basis = None
-            self._override_frame_threads = None
+            self.pools = None
+            self.pools_basis = None
             #: Kept individually as well as in the assembled string, so the record can report a
             #: field without anyone parsing the string back apart. **The string is what ran;
             #: these are what was asked for**, and they cannot disagree because one is built from
@@ -696,25 +701,6 @@ class MasterWriter:
             raise WorkerError(INTERNAL, "the master's frame size was changed after ffmpeg started")
         self.width, self.height = int(width), int(height)
         self._identity["cf_output"] = "{}x{}".format(self.width, self.height)
-        # **The area-keyed bound is re-derived here or it describes the old frame.** `-s` below
-        # takes the new size and `-x265-params` would have kept the old one.
-        self._derive_frame_threads()
-
-    def _derive_frame_threads(self):
-        """§6h's derivation, from the size THIS WRITER WILL ACTUALLY ENCODE.
-
-        **One home, two entry points.** `__init__` and `set_frame_size` both call it, so the
-        parameter string and the basis can never describe a frame other than `self.width` x
-        `self.height` — which is the number `_build_command` puts after `-s`.
-
-        A no-op under x264: the pair stays null there, because an attribute that exists only
-        under one codec crashes a reader on the other.
-        """
-        if self.codec != "h265":
-            return
-        self.frame_threads, self.frame_threads_basis = x265_frame_threads(
-            self.width * self.height, self._override_frame_threads)
-        self.x265_params = x265_params(frame_threads=self.frame_threads)
 
     def _build_command(self):
         width, height, fps = self.width, self.height, self.fps

@@ -681,7 +681,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
            variant="direct", scale=None, preset=None, threads=None,
            sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False,
            input_check=False, armed=None, encode_defaults=None, codec=None,
-           bit_depth=None, reference_score=False):
+           bit_depth=None, reference_score=False, frame_threads=None, pools=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -871,6 +871,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # §6f. Passed by name beside the codec, and the writer refuses the pair `validation`
             # already refused — a second guard on a path a request cannot reach.
             bit_depth=bit_depth,
+            # **§6i's two levers, `None` when the caller sent nothing.** The default is applied
+            # in `x265_threading` and nowhere else, so the writer can say per field whether the
+            # number came from the caller or from this worker.
+            frame_threads=frame_threads,
+            pools=pools,
             # §6g. None on an unarmed run, which is what leaves the command a single output.
             reference_path=reference_path,
             crf=encode_crf, preset=encode_preset, **encode_settings)
@@ -1291,7 +1296,8 @@ def _encode_fields(writer):
                       sliced_threads=writer.sliced_threads,
                       rc_lookahead=writer.rc_lookahead)
     else:
-        # **§6h's derived bound, READ OFF THE WRITER THAT RAN IT — this function's whole rule.**
+        # **§6i's two levers and their per-field provenance, READ OFF THE WRITER THAT RAN THEM —
+        # this function's whole rule.**
         # Without it the writer's derivation reached no artefact: the record carried
         # `resolve_defaults`' independently-derived basis and the value survived only as a
         # substring inside `x265_params`. *Two derivations of one fact, and the record showed the
@@ -1305,7 +1311,9 @@ def _encode_fields(writer):
         # `codec: "h264"` asserts that an x265 parameter took no value, when it has no such
         # parameter at all.
         fields.update(frame_threads=writer.frame_threads,
-                      frame_threads_basis=writer.frame_threads_basis)
+                      frame_threads_basis=writer.frame_threads_basis,
+                      pools=writer.pools,
+                      pools_basis=writer.pools_basis)
     return fields
 
 

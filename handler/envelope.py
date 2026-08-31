@@ -21,6 +21,26 @@ CODECS = ("h264", "h265", "source")
 #: today and must still encode h264 after this ships — `default_off_identity` is the assertion.
 DEFAULT_CODEC = "h264"
 
+#: **contract §6i: x265's two threading levers, optional and independently so.** *Either sent is
+#: used, either absent takes its default, any combination is legal — and a request sending NEITHER
+#: behaves exactly as `sha-88fec73` does, which is what makes the field shippable before any
+#: calibration has happened.*
+#:
+#: **These are an OVERRIDE ON TOP OF A DEFAULT, not a decision moved to the caller**, which is why
+#: §6i is not the request-field shape CF refused earlier the same day. *What was refused was
+#: handing the caller a BOUND — a knob deciding what the worker does when the caller has no basis
+#: to choose. Here the default still governs and a caller who says nothing gets the worker's
+#: answer.*
+DEFAULT_FRAME_THREADS = 1
+DEFAULT_POOLS = 16
+
+#: The ranges. **Bounded rather than open**, for §6a's reason one codec over: these settings decide
+#: how much the encoder allocates on a path §1 says has no host guard, so an unbounded value is a
+#: memory bound handed to the caller. *`frame-threads` above a small number multiplies the frames
+#: in flight; `pools` above the visible core count buys nothing and costs scheduling.*
+FRAME_THREADS_RANGE = (1, 16)
+POOLS_RANGE = (1, 64)
+
 #: **`main10` IS A PROFILE AND NOT A CODEC NAME** (contract §6f). CF's ruling was *"we can switch
 #: main10 on and off as needed"*, and a switch is a field — folding it into `CODECS` as a third
 #: value would make one enumeration answer two questions, which encoder and at what precision.
@@ -50,6 +70,27 @@ SIZING_FIELDS = ("target_short_edge_px", "output_size")
 INTERPOLATE_FIELDS = ("target_fps", "snap_tolerance", "route")
 
 
+def _threading_lever(output, name, bounds):
+    """One of §6i's two x265 threading fields: `None` when absent, a bounded int when sent.
+
+    **The type is checked before the range, and a range test alone would not do it.** `True == 1`
+    and `2.0 == 2` in Python, so a bool or a float satisfies a numeric comparison and reaches the
+    record wearing a type the field does not have — which is `bit_depth`'s reasoning three fields
+    up, and the shared law's float-identity clause arriving where nobody would check.
+    """
+    if name not in output:
+        return None
+    value = output[name]
+    low, high = bounds
+    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'output.{}' must be an integer in {}..{}; got {!r}. It is an x265 threading "
+            "lever and it is bounded because these settings decide what the encoder allocates on "
+            "a path with no host guard.".format(name, low, high, value))
+    return value
+
+
 def derive(params):
     """`params` in, a normalised release-3 config out, or `WorkerError`.
 
@@ -67,6 +108,18 @@ def derive(params):
         raise WorkerError(
             INVALID_FIELD_VALUE,
             "field 'output.codec' must be one of {}; got {!r}".format(CODECS, codec))
+
+    # **§6i's two levers, parsed here beside `codec` and `bit_depth` and range-checked here too.**
+    # *The CROSS-FIELD rule — both are h265-only — is `validation`'s, exactly as `bit_depth`'s
+    # 10-is-h265-only is: this file enumerates and ranges, that one refuses combinations.*
+    #
+    # **`None` when absent, and the DEFAULT is applied in the encoder rather than here.** That is
+    # §6d's rule and the one §6b's surviving clause rests on: absence must stay distinguishable
+    # from a value all the way to the branch, or the branch cannot tell "the caller asked for 1"
+    # from "the caller asked for nothing". *Resolving to 16 here would make `pools_basis` a
+    # guess.*
+    frame_threads = _threading_lever(output, "frame_threads", FRAME_THREADS_RANGE)
+    pools = _threading_lever(output, "pools", POOLS_RANGE)
 
     # **The enumeration only. Contract §6f's cross-field rule — 10 is h265-only — is
     # `validation`'s**, exactly as `codec: source` is enumerable here and refused there.
@@ -124,13 +177,24 @@ def derive(params):
                 raise WorkerError(
                     INVALID_FIELD_VALUE,
                     "field '{}' has no meaning without 'interpolate'".format(orphan))
+        # **Both §6i levers are on THIS return too, and that is not tidiness.** A config key that
+        # exists on one return path and not the other makes every reader of it correct on one
+        # path and a `KeyError` on the other — the shape that cost a live job earlier today, one
+        # repository over. *They are `None` here for the same reason they are `None` anywhere the
+        # caller said nothing: absence stays absence until the encoder resolves it.*
         return {"codec": codec, "bit_depth": bit_depth, "interpolate": None, "upscale": True,
+                "frame_threads": frame_threads, "pools": pools,
                 # **`bit_depth` joins the equivalence test rather than riding beside it.** A
                 # 10-bit request is not what a release-2 caller sends, and `default_off_identity`
                 # asserts that the DEFAULT path is unmoved — which stays true, because an omitted
                 # field is 8.
+                #
+                # **And the two threading levers join it for the same reason**: a request naming
+                # either is not a release-2 request, and an omitted field is `None`, so the
+                # default path is still unmoved.
                 "release_2_equivalent": (codec == DEFAULT_CODEC
-                                         and bit_depth == DEFAULT_BIT_DEPTH)}
+                                         and bit_depth == DEFAULT_BIT_DEPTH
+                                         and frame_threads is None and pools is None)}
 
     if not isinstance(interpolate, dict):
         raise WorkerError(INVALID_FIELD_VALUE, "field 'interpolate' must be an object")
@@ -173,6 +237,8 @@ def derive(params):
     return {
         "codec": codec,
         "bit_depth": bit_depth,
+        "frame_threads": frame_threads,
+        "pools": pools,
         "interpolate": {"target_fps": float(target_fps), "snap_tolerance": tolerance,
                         "route": route},
         "upscale": upscale is not False,

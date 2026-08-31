@@ -528,6 +528,12 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # what moved is the refusal. Passed through by name so the library is chosen in exactly
         # one place, `encoder.CODEC_LIBRARIES`.
         codec=request["release_3"]["codec"],
+        # **§6i's two x265 levers, read from the same release-3 block as `codec` and passed
+        # through as `None` where the caller sent nothing** — §6d's mandatory property, applied
+        # to two more fields. `envelope.derive` puts them on both of its return paths, so this
+        # `.get` cannot be the reason one is missing.
+        frame_threads=request["release_3"].get("frame_threads"),
+        pools=request["release_3"].get("pools"),
         # §6f, travelling beside the codec because they are refused as a PAIR at the door.
         bit_depth=request["release_3"]["bit_depth"],
         # **contract §6g's fifth gate.** `retime` computes the disk bound from the delivered
