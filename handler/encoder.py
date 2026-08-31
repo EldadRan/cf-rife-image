@@ -183,9 +183,50 @@ BASIS_CODEC_H265 = "codec:h265"
 #: record carries `bit_depth` rather than a quality assertion.*
 PIXEL_FORMATS = {8: "yuv420p", 10: "yuv420p10le"}
 
+#: **x265's threading, and until 2026-08-31 these three were bare integers with no comment in a
+#: file where every other constant carries a paragraph** (contract §6h). *Nothing in the contract,
+#: in `docs/gate-findings.md` or in any commit message said why `frame-threads` was 1, and the
+#: 46 GiB incident everyone reaches for is x264's `threads=0` auto resolving to 128 at
+#: `encoder.py:64-70` — a different codec and a different field.* **A value whose justification
+#: exists only in someone's memory is indistinguishable from one that was never justified**, which
+#: is `F-2026-08-29-7`'s remedy and `F-2026-08-29-13`'s, so the reason is written here now.
+#:
+#: **WHAT IS ACTUALLY KNOWN, and it is a measurement rather than a rationale**
+#: (`docs/test-plan.md` §55): `write_wait_s` is 80% of an h265 wall at 1080p and 4% of an h264
+#: one — 148.9 s against 5.2 s on comparable clips — while `model_s` is flat to 1.5% across all of
+#: it. The handoff is a synchronous `stdin.write` of a 6-25 MB frame into a 64 KB pipe, so that
+#: figure is the encoder's throughput seen through a small window and not a queueing artefact.
+#: **x265 throughput varies 1.74x ACROSS hosts and reproduces to 1.1% WITHIN one**, which §6h
+#: rules is host contention and an infrastructure ask rather than anything this file can fix.
 X265_POOLS = 16
+
+#: **`frame-threads=1` IS THE VALUE THAT HAS ALWAYS RUN, AND NO CALIBRATION HAS EVER PRICED IT.**
+#: Kept as the entry for both rows below so the first build carrying §6h changes no output.
 X265_FRAME_THREADS = 1
+
 X265_RC_LOOKAHEAD = 10
+
+#: §6h: **frame-level parallelism is DERIVED FROM PADDED AREA and is not a caller-facing field.**
+#: *A caller sending h265 at 4K has no basis to choose 2 over 4 — it is a function of cores, frame
+#: size and the container's memory ceiling, none of which is caller knowledge* — and §6a made the
+#: x264 settings fields precisely so a bound on the encoder could not be handed to the caller.
+#: §6d already settled this shape one surface over.
+#:
+#: **BOTH ROWS ARE `X265_FRAME_THREADS` AND THAT IS DELIBERATE, NOT A PLACEHOLDER I FORGOT.**
+#: §6h rules the SHAPE and rules NO VALUE: *"`frame-threads` 2 or 4, the area boundary, and
+#: whether `pools` moves with it are what a calibration determines"*, and it instructs that a
+#: default forced before the sweep exists must be the CURRENT behaviour so the first build changes
+#: no output. **So this table is the mechanism, wired and recorded, resolving to what already
+#: ran.** *Picking a number here would be inventing the measurement the section exists to make
+#: room for, which is the move this project has been wrong about all week.*
+#:
+#: The memory headroom §6h banks, for whoever does calibrate: 0.64 GiB at 1080p, 3.98 at 4K and
+#: 5.63 at 8K against a 46.57 GiB ceiling, with the h264 path already running 7.19 at 8K
+#: unguarded. *1080p and 4K carry almost no memory risk; 8K is a separate decision.*
+X265_FRAME_THREADS_BY_AREA = {
+    AREA_ROW_SMALL: X265_FRAME_THREADS,
+    AREA_ROW_LARGE: X265_FRAME_THREADS,
+}
 
 
 def area_row(delivered_pixels):
@@ -210,8 +251,32 @@ def area_row(delivered_pixels):
             else AREA_ROW_LARGE)
 
 
+def x265_frame_threads(delivered_pixels, frame_threads=None):
+    """§6h's derivation: `(value, basis)` for x265's frame-level parallelism.
+
+    **`basis` is the branch that fired**, `"codec:h265/area:small"` or `.../area:large`, and it
+    reaches the record so a corpus row can say which threading it ran at. *Without it §15's
+    two-populations-one-field defect arrives on the axis §6h is about — rows at 1 and rows at 4
+    averaged into one number nobody can separate afterwards.*
+
+    **AN EXPLICIT VALUE IS OBEYED AND NEVER SILENTLY OVERRIDDEN**, which is §6b's surviving clause
+    and the one §6d calls load-bearing: *a knob a caller sets and the worker quietly ignores is
+    worse than no knob.* It exists so calibrating 1/2/4 costs one build rather than a build and a
+    pin per value, and the basis says `override` so a swept row is never mistaken for a derived
+    one — a calibration whose rows look like production rows is a corpus that lies later.
+
+    **NOT REACHABLE FROM A REQUEST.** §6h rules it a direct-caller guard, §6d's *"a guard for
+    direct callers a test makes, resolving to the same constants"*. Nothing in `validation` or
+    `envelope` names it and nothing should: CF refused the request-field shape, correctly.
+    """
+    if frame_threads is not None:
+        return int(frame_threads), "{}/override".format(BASIS_CODEC_H265)
+    row = area_row(delivered_pixels)
+    return X265_FRAME_THREADS_BY_AREA[row], "{}/{}".format(BASIS_CODEC_H265, row)
+
+
 def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=None,
-                     rc_lookahead=None):
+                     rc_lookahead=None, frame_threads=None):
     """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
 
     Returns `(settings, provenance)` — the three resolved values, and the
@@ -261,8 +326,22 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
                 "these at the door because x265 has no such parameters, so a value here would "
                 "be recorded beside an encode that never saw it.").format(
                     ", ".join("{}={!r}".format(k, v) for k, v in sorted(sent.items()))))
+        # **§6h: the basis names the THREADING branch too, not just the codec.** It read
+        # `"codec:h265"` and said nothing about frame-level parallelism, so a corpus row could
+        # not say which threading it ran at — §15's two-populations-one-field defect on the exact
+        # axis §6h exists to calibrate. The settings dict stays EMPTY: `frame_threads` is derived
+        # rather than filled in from the caller's absence, so it is not one of §6d's three fields
+        # and must not appear beside them.
+        # **ONLY THE BASIS IS TAKEN HERE, AND THE VALUE IS `MasterWriter`'s.** Two derivations of
+        # one fact can disagree; these cannot, because they call one function on one input —
+        # §6d-1 pins `delivered_pixels` to the size the writer is constructed with, so both read
+        # the same number. **The override is the case that COULD split them**, which is one more
+        # reason it is a direct-caller guard: the production path passes it to neither, and a
+        # calibration that passed it to one artefact and not the other would file a record whose
+        # `encode_defaults.basis` and `retime.x265_params` describe different encodes.
+        basis = x265_frame_threads(delivered_pixels, frame_threads)[1]
         return {}, {
-            "basis": BASIS_CODEC_H265,
+            "basis": basis,
             # **Still carried, and it is not the boundary that decided anything here.** §13a
             # wants the integer the branch compared against as it stood in the image that ran;
             # under h265 nothing was compared, and omitting the field would make this block a
@@ -441,7 +520,7 @@ class MasterWriter:
                  audio_source=None, audio_codec=None, audio_limit_s=None,
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None, bit_depth=None,
                  threads=None, sliced_threads=None, rc_lookahead=None,
-                 reference_path=None):
+                 reference_path=None, frame_threads=None):
         self.path = path
         #: **Where ffmpeg writes contract §6g's raw reference, or None for an unarmed run.**
         #: A SECOND OUTPUT of this same command rather than a copy of what crossed the pipe: the
@@ -557,7 +636,15 @@ class MasterWriter:
             #: **Assembled from named fields for a reason sharper than §6a's** — see
             #: `x265_params`: x265 discards an unknown NAME without a word, so a bound is not in
             #: force merely because the job succeeded.
-            self.x265_params = x265_params()
+            #:
+            #: **§6h: `frame-threads` is DERIVED from the frame this writer was constructed
+            #: with**, which is §6d-1's rule for the area branch — the size handed to the encoder,
+            #: never the source's probed size. *`resolve_defaults` derives the same value from the
+            #: same input for the record's basis; deriving it there and passing it here would put
+            #: the number in the request path, which §6h refuses. Both call one function.*
+            self.frame_threads, self.frame_threads_basis = x265_frame_threads(
+                int(width) * int(height), frame_threads)
+            self.x265_params = x265_params(frame_threads=self.frame_threads)
             self.threads = None
             self.sliced_threads = None
             self.rc_lookahead = None
@@ -573,6 +660,13 @@ class MasterWriter:
             self.x264_params = x264_params(threads=threads, sliced_threads=sliced_threads,
                                            rc_lookahead=rc_lookahead)
             self.x265_params = None
+            #: **Null on the x264 path, and defined rather than absent.** The two parameter
+            #: strings above are already a pair where each is null under the other's codec, for
+            #: the stated reason that the column exists on every row either way. A `frame_threads`
+            #: that existed only under h265 would make a reader of the attribute crash on an h264
+            #: encode — the shape `band` failed at four hours ago, one file over.
+            self.frame_threads = None
+            self.frame_threads_basis = None
             #: Kept individually as well as in the assembled string, so the record can report a
             #: field without anyone parsing the string back apart. **The string is what ran;
             #: these are what was asked for**, and they cannot disagree because one is built from
