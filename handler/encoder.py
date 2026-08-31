@@ -159,18 +159,21 @@ CODEC_LIBRARIES = {"h264": "libx264", "h265": "libx265"}
 #: reusing it would make provenance inferable from silence.
 BASIS_CODEC_H265 = "codec:h265"
 
-#: **x265's memory bound, and every value in it is DECLARED rather than fitted** (contract §6e
-#: ruling 1, outcome B — CF, 2026-08-28). *This project has zero x265 measurements; the reading
-#: arrives as a side effect of §6e's certification, and until it does the encoder is capped at
-#: the door rather than trusted.*
+#: **x265's settings, DECLARED rather than fitted** (contract §6e ruling 1, outcome B — CF,
+#: 2026-08-28). *This project has zero x265 measurements and the reading arrives as a side effect
+#: of §6e's certification.*
 #:
-#: **IT IS A MAPPING OF §6d's LARGE ROW ONTO x265's OWN MECHANISMS, NOT A TRANSLATION OF ITS
-#: NAMES.** `frame-threads` is what multiplies frames-in-flight and therefore the working set —
-#: the role `threads` plays in x264 — so it is pinned to 1 for the same reason the large row sets
-#: `sliced-threads=1`: parallelism comes from INSIDE the frame rather than from more frames at
-#: once. x265's wavefront (`wpp`) is on by default and is that inside-the-frame parallelism, so
-#: the bound does not have to choose between being cheap and being parallel. `pools` caps the
-#: worker threads; `rc-lookahead` mirrors §6a's value rather than inventing a second one.
+#: **THEY ARE NO LONGER A BOUND "CAPPED AT THE DOOR", AND THIS BLOCK SAID THEY WERE.** *Under §6i
+#: `frame_threads` and `pools` are optional request fields with ranges — 1..16 and 1..64 in
+#: `envelope` — so nothing here is pinned and the cap is the caller's within those bounds. The
+#: DEFAULTS are still this worker's, and a request naming neither field still receives them.*
+#: Found in review.
+#:
+#: **WHAT `frame-threads` DOES, which is why it is the lever §57 sweeps:** it multiplies
+#: frames-in-flight and therefore the working set — the role `threads` plays in x264 — and the
+#: default of 1 takes parallelism from INSIDE the frame instead, through x265's wavefront (`wpp`),
+#: which is on by default. `pools` sizes the worker pool; `rc-lookahead` mirrors §6a's value
+#: rather than inventing a second one and is NOT caller-settable.
 #:
 #: **Declared as a BOUND and never claimed as an optimum.** §6c forbids an estimator throttling
 #: against a host-RSS model nobody has built, and a fixed cap on what the encoder ASKS FOR is not
@@ -203,12 +206,11 @@ PIXEL_FORMATS = {8: "yuv420p", 10: "yuv420p10le"}
 #: figure is the encoder's throughput seen through a small window and not a queueing artefact.
 #: **x265 throughput varies 1.74x ACROSS hosts and reproduces to 1.1% WITHIN one**, which §6h
 #: rules is host contention and an infrastructure ask rather than anything this file can fix.
-X265_POOLS = 16
-
-#: **`frame-threads=1` IS THE VALUE THAT HAS ALWAYS RUN, AND NO CALIBRATION HAS EVER PRICED IT.**
-#: Kept as the entry for both rows below so the first build carrying §6h changes no output.
-X265_FRAME_THREADS = 1
-
+#: *`X265_POOLS` and `X265_FRAME_THREADS` used to sit here. They are gone rather than left as
+#: unread copies: the defaults now have ONE home, `envelope.DEFAULT_POOLS` and
+#: `envelope.DEFAULT_FRAME_THREADS`, which is where a caller-facing default belongs and which
+#: `x265_threading` reads. Keeping a second pair with a comment asserting the two agreed is the
+#: drift this file has been fixing all week.* Found in review.
 X265_RC_LOOKAHEAD = 10
 
 #: **§6i: THE x265 THREADING PATH IS NO LONGER KEYED ON AREA.** *`X265_FRAME_THREADS_BY_AREA`
@@ -217,10 +219,8 @@ X265_RC_LOOKAHEAD = 10
 #: caller sees, and it stops selecting x265 threading.* **`area_row` is untouched and still drives
 #: the x264 defaults row**, which is where it always belonged.
 #:
-#: `X265_FRAME_THREADS` and `X265_POOLS` are now DEFAULTS ONLY — what a request naming neither
-#: field receives, and the same two numbers `envelope.DEFAULT_FRAME_THREADS` and
-#: `envelope.DEFAULT_POOLS` state caller-facing. `x265_threading` is the one place the fallback
-#: happens.
+#: The defaults a request naming neither field receives are `envelope.DEFAULT_FRAME_THREADS` and
+#: `envelope.DEFAULT_POOLS`, and `x265_threading` is the one place the fallback happens.
 
 
 def area_row(delivered_pixels):
@@ -262,8 +262,9 @@ def x265_threading(frame_threads=None, pools=None):
     `area` is not the requester's to set and so is not theirs to read either.
     """
     values = {
-        "frame_threads": X265_FRAME_THREADS if frame_threads is None else int(frame_threads),
-        "pools": X265_POOLS if pools is None else int(pools),
+        "frame_threads": (envelope.DEFAULT_FRAME_THREADS if frame_threads is None
+                          else int(frame_threads)),
+        "pools": envelope.DEFAULT_POOLS if pools is None else int(pools),
     }
     basis = {
         "frame_threads_basis": BASIS_DEFAULT if frame_threads is None else BASIS_CALLER,
@@ -634,11 +635,6 @@ class MasterWriter:
             #: `x265_params`: x265 discards an unknown NAME without a word, so a bound is not in
             #: force merely because the job succeeded.
             #:
-            #: **§6h: `frame-threads` is DERIVED from the frame this writer was constructed
-            #: with**, which is §6d-1's rule for the area branch — the size handed to the encoder,
-            #: never the source's probed size. *`resolve_defaults` derives the same value from the
-            #: same input for the record's basis; deriving it there and passing it here would put
-            #: the number in the request path, which §6h refuses. Both call one function.*
             #: **§6i's two levers, resolved HERE and only here.** `None` from the caller means
             #: absent; `x265_threading` applies the default and says per field which it was.
             #:
@@ -676,6 +672,24 @@ class MasterWriter:
             #: the stated reason that the column exists on every row either way. A `frame_threads`
             #: that existed only under h265 would make a reader of the attribute crash on an h264
             #: encode — the shape `band` failed at four hours ago, one file over.
+            # **§6i's mirror of §6e ruling 2, and it was missing.** The h265 branch above
+            # REFUSES x264's three fields reaching this writer, with the stated reason that
+            # dropping them silently is the exact shape ruling 2 refused — a bound the caller
+            # believes is in force and the encoder never saw. The h264 branch took x265's two and
+            # discarded them without a word, so the guard existed in one direction only.
+            # *`validation` closes the request path; this closes the direct-caller one, which is
+            # where §6h's calibration was meant to live and where nothing else would notice.*
+            # Found in review.
+            crossed = {name: value for name, value in
+                       (("frame_threads", frame_threads), ("pools", pools)) if value is not None}
+            if crossed:
+                raise WorkerError(INTERNAL, (
+                    "codec {} reached the master writer carrying {} — contract §6i refuses "
+                    "x265's threading levers under x264 at the door because x264 has no such "
+                    "parameters, so a value here would be recorded beside an encode that never "
+                    "saw it.").format(
+                        self.codec, ", ".join("{}={!r}".format(k, v)
+                                              for k, v in sorted(crossed.items()))))
             self.frame_threads = None
             self.frame_threads_basis = None
             self.pools = None

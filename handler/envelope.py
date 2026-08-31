@@ -31,6 +31,10 @@ DEFAULT_CODEC = "h264"
 #: handing the caller a BOUND — a knob deciding what the worker does when the caller has no basis
 #: to choose. Here the default still governs and a caller who says nothing gets the worker's
 #: answer.*
+#: **THE ONE HOME FOR BOTH NUMBERS.** `encoder.x265_threading` reads these rather than keeping
+#: its own copies — the pattern `validation` already uses for `encoder.DEFAULT_CRF`, "imported
+#: rather than repeated". *They lived in both files for one commit and nothing kept them equal;
+#: a second home for one fact is how the copies drift and the comment claiming they agree stays.*
 DEFAULT_FRAME_THREADS = 1
 DEFAULT_POOLS = 16
 
@@ -38,6 +42,10 @@ DEFAULT_POOLS = 16
 #: how much the encoder allocates on a path §1 says has no host guard, so an unbounded value is a
 #: memory bound handed to the caller. *`frame-threads` above a small number multiplies the frames
 #: in flight; `pools` above the visible core count buys nothing and costs scheduling.*
+#: Every key `params.output` may carry. **One home, and the refusal above reads it** — a field
+#: added without joining this tuple is refused by name, which is the outcome a caller can act on.
+OUTPUT_FIELDS = ("codec", "bit_depth", "frame_threads", "pools")
+
 FRAME_THREADS_RANGE = (1, 16)
 POOLS_RANGE = (1, 64)
 
@@ -101,6 +109,26 @@ def derive(params):
     interpolate = params.get("interpolate")
     upscale = params.get("upscale")
     output = dict(params.get("output") or {})
+    # **UNKNOWN KEYS IN `params.output` ARE REFUSED BY NAME**, exactly as `interpolate`'s are
+    # below and as `validation._refuse_unknown` does for `params` and the destination block.
+    # Nothing checked this sub-object until §6i, and the gap was invisible while its only fields
+    # were enums a typo turned into a refusal anyway.
+    #
+    # **§6i PUT TWO NUMBERS BEHIND IT AND THAT CHANGES THE FAILURE.** The x265 spelling is
+    # `frame-threads`, hyphenated, in every comment and document in this tree — so the natural
+    # typo is `"frame-threads": 4`, which would have validated, encoded at the default, and filed
+    # `frame_threads: 1, frame_threads_basis: "default"`. No error, a plausible byte count, a
+    # passing witness, and a swept arm recorded as a production default. *That is verbatim the
+    # failure `validation`'s h264 refusal says it exists to prevent — "a dropped bound leaves you
+    # believing a bound is in force" — and `x265_params`' own F-2026-08-28-7 hazard, where x265
+    # discards an unknown NAME without a word, re-made one layer up at the request.* Found in
+    # review.
+    unknown_output = sorted(set(output) - set(OUTPUT_FIELDS))
+    if unknown_output:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "unknown field(s) in 'params.output': {}. Known: {}.".format(
+                unknown_output, sorted(OUTPUT_FIELDS)))
     has_size = any(params.get(field) is not None for field in SIZING_FIELDS)
 
     codec = output.get("codec", DEFAULT_CODEC)

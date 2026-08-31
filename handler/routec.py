@@ -789,6 +789,18 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             " ".join("{}={}".format(name, encode_settings[name])
                      for name in encoder.AREA_FIELDS if name in encode_settings)
             or "no x264 thread settings — this codec has no such table"), flush=True)
+        # **§6i's arm, named on the log line, because the record was the only place it appeared.**
+        # Under h265 the line above prints "no x264 thread settings" and the levers that ARE in
+        # force reached the console only inside the `-x265-params` string, which nothing prints —
+        # so on a sweep every arm's log looked identical, on the one codec where "the job
+        # succeeded" is explicitly not evidence that a bound applied. *The record carries it
+        # either way; an instrument that exists to say which arm ran should not under-report the
+        # arm.* Found in review.
+        if codec == "h265":
+            threading, threading_basis = encoder.x265_threading(frame_threads, pools)
+            print("[encode] x265 threading: {}".format(" ".join(
+                "{}={} ({})".format(name, threading[name], threading_basis[name + "_basis"])
+                for name in ("frame_threads", "pools"))), flush=True)
 
         # **`crf` and `preset` are NOT §6d's and still resolve to constants here.** The table
         # decides three fields and says nothing about either. **Their substitution is REPORTED**
