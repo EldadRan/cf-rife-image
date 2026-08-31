@@ -1290,6 +1290,22 @@ def _encode_fields(writer):
         fields.update(threads=writer.threads,
                       sliced_threads=writer.sliced_threads,
                       rc_lookahead=writer.rc_lookahead)
+    else:
+        # **§6h's derived bound, READ OFF THE WRITER THAT RAN IT — this function's whole rule.**
+        # Without it the writer's derivation reached no artefact: the record carried
+        # `resolve_defaults`' independently-derived basis and the value survived only as a
+        # substring inside `x265_params`. *Two derivations of one fact, and the record showed the
+        # one that did not build the command line.* **The override is why that matters** — a
+        # direct caller sweeping `frame_threads=4` moved the command line and not the record, so
+        # a swept row wore a production row's basis, which is the exact thing the `/override`
+        # suffix exists to prevent. Found in review.
+        #
+        # **Omitted entirely under h264 rather than nulled**, which is §15a's rule for the three
+        # fields above and for the same reason: a row reading `frame_threads: null` beside
+        # `codec: "h264"` asserts that an x265 parameter took no value, when it has no such
+        # parameter at all.
+        fields.update(frame_threads=writer.frame_threads,
+                      frame_threads_basis=writer.frame_threads_basis)
     return fields
 
 

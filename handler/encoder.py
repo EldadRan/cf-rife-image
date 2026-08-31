@@ -642,9 +642,16 @@ class MasterWriter:
             #: never the source's probed size. *`resolve_defaults` derives the same value from the
             #: same input for the record's basis; deriving it there and passing it here would put
             #: the number in the request path, which §6h refuses. Both call one function.*
-            self.frame_threads, self.frame_threads_basis = x265_frame_threads(
-                int(width) * int(height), frame_threads)
-            self.x265_params = x265_params(frame_threads=self.frame_threads)
+            #: **Derived through `_derive_frame_threads` so `set_frame_size` can redo it.**
+            #: Computing it here from the CONSTRUCTOR's width and height armed a value that
+            #: nothing reset: `set_frame_size` exists to adopt the size the model actually
+            #: produced, rewrites `self.width`/`self.height`, and `_build_command` reads those —
+            #: so a resize across the area boundary would put `-s` describing one frame beside an
+            #: `-x265-params` and a basis derived for another. *Harmless today because both rows
+            #: hold the same value, and a live defect the moment §6h's calibration makes them
+            #: differ — which is precisely when nobody would be looking.* Found in review.
+            self._override_frame_threads = frame_threads
+            self._derive_frame_threads()
             self.threads = None
             self.sliced_threads = None
             self.rc_lookahead = None
@@ -667,6 +674,7 @@ class MasterWriter:
             #: encode — the shape `band` failed at four hours ago, one file over.
             self.frame_threads = None
             self.frame_threads_basis = None
+            self._override_frame_threads = None
             #: Kept individually as well as in the assembled string, so the record can report a
             #: field without anyone parsing the string back apart. **The string is what ran;
             #: these are what was asked for**, and they cannot disagree because one is built from
@@ -688,6 +696,25 @@ class MasterWriter:
             raise WorkerError(INTERNAL, "the master's frame size was changed after ffmpeg started")
         self.width, self.height = int(width), int(height)
         self._identity["cf_output"] = "{}x{}".format(self.width, self.height)
+        # **The area-keyed bound is re-derived here or it describes the old frame.** `-s` below
+        # takes the new size and `-x265-params` would have kept the old one.
+        self._derive_frame_threads()
+
+    def _derive_frame_threads(self):
+        """§6h's derivation, from the size THIS WRITER WILL ACTUALLY ENCODE.
+
+        **One home, two entry points.** `__init__` and `set_frame_size` both call it, so the
+        parameter string and the basis can never describe a frame other than `self.width` x
+        `self.height` — which is the number `_build_command` puts after `-s`.
+
+        A no-op under x264: the pair stays null there, because an attribute that exists only
+        under one codec crashes a reader on the other.
+        """
+        if self.codec != "h265":
+            return
+        self.frame_threads, self.frame_threads_basis = x265_frame_threads(
+            self.width * self.height, self._override_frame_threads)
+        self.x265_params = x265_params(frame_threads=self.frame_threads)
 
     def _build_command(self):
         width, height, fps = self.width, self.height, self.fps
