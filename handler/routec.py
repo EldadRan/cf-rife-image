@@ -21,6 +21,7 @@ the import and `open_source` no longer takes a CLI it never used for anything el
 # reviewer was given a diff and imports are not in a hunk, and this module needs `numpy` so it
 # cannot be imported on the tree where the rest of §6g was exercised. *Stdlib, and the first
 # import in the file for that reason: it is the one this module cannot be read without.*
+import contextlib
 import os
 
 import numpy as np
@@ -84,6 +85,39 @@ def source_frame_count(source):
             "a retime needs at least two source frames and this container's duration ({}s) at "
             "{} fps implies {}".format(duration, fps, count))
     return count
+
+
+@contextlib.contextmanager
+def _held_alive(progress):
+    """`progress.keeping_the_promise()`, or nothing at all when there is no progress channel.
+
+    **§42i.** Two stretches on this path publish once and then go quiet for minutes — the drain
+    inside `encoder.__exit__` and the libvmaf pass in `reference.score`. Run B measured the second
+    directly: 38 retained payloads across 190.2 s carrying ONE distinct worker `at`, with the
+    harness's own quiet detector firing twice. **§18c's named phase tells a caller WHAT is
+    happening and a frozen `at` still cannot tell them the worker is ALIVE**, which
+    `progress.py:214` calls out by name — a payload that stops being replaced keeps being served.
+
+    **This is liveness, not cadence, and the boundary matters because the cadence half is CF's
+    and was ruled LEAVE IT** (§18c-1). `heartbeat()` re-mints the standing payload and moves only
+    `at`; `next_poll_s` is copied unchanged, so nothing here alters how often anyone polls.
+    *Measured on a local driver, not reasoned: across a 12 s subprocess wait the payload's
+    `next_poll_s` stayed 5 and only `at` moved.*
+
+    **It cannot re-mint an ETA into a tail payload either**, which was the hazard worth checking
+    before wiring it at all: `heartbeat` is `dict(self.last)` with one field replaced, and during
+    these stretches `self.last` carries no `eta_s` because §18d removed it. *Confirmed by reading
+    `progress.py:401-402` rather than taken from the order that said so.*
+
+    **A null context when `progress` is None**, because every other progress call on this path is
+    guarded that way and a second spelling of "there may be no channel" is a second thing to keep
+    true.
+    """
+    if progress is None:
+        yield
+        return
+    with progress.keeping_the_promise():
+        yield
 
 
 def _to_tensor(frame_bgr, torch):
@@ -870,7 +904,16 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         checker = convert_check if isinstance(convert_check, ConvertCheck) else (
             ConvertCheck() if convert_check else None)
         try:
-            with writer_cm as writer:
+            # **OUTSIDE the writer's `with`, because the drain is `__exit__`** — `close()`,
+            # `wait()`, `drain_s` — and a heartbeat scoped inside the block stops at exactly the
+            # moment the silence starts. *38 s on the banked h265 8K row, every second of it
+            # currently serving a payload nobody has touched.*
+            #
+            # **Spanning the encode as well costs nothing and is not an accident of placement.**
+            # `heartbeat()` publishes only when `next_poll_s` has elapsed since the last emit, and
+            # the per-frame emits inside the loop reset that on every frame — so it is dormant
+            # while frames flow and wakes exactly where they stop.
+            with _held_alive(progress), writer_cm as writer:
                 for frame in stream:
                     # **`convert_out_s` and `write_wait_s` split what used to be one
                     # expression** (§9a). `write_wait_s` is the producer BLOCKED in `write` — the
@@ -1065,9 +1108,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     print("[progress] scoring phase not emitted ({}: {})".format(
                         type(exc).__name__, exc), flush=True)
             try:
-                reference_block = reference.score(
-                    master_path, reference_path, width, height, float(target_fps),
-                    reference_format, stats.get("n_out"), os.path.dirname(master_path) or ".")
+                # **The stretch §42i measured**: one payload, 190.2 s, one distinct `at`. The
+                # heartbeat is inside the existing guard rather than around it, so a failure to
+                # start one still cannot displace a master.
+                with _held_alive(progress):
+                    reference_block = reference.score(
+                        master_path, reference_path, width, height, float(target_fps),
+                        reference_format, stats.get("n_out"),
+                        os.path.dirname(master_path) or ".")
             except Exception as exc:  # noqa: BLE001 — a score must never displace a master
                 print("[reference] not scored ({}: {})".format(
                     type(exc).__name__, exc), flush=True)
