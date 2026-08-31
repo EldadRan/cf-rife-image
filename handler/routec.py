@@ -815,6 +815,23 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # under h264 and none of them under h265 — the same absence §15a requires of the record,
         # arriving from the same dict rather than from a second decision about what h265 has.
         encode_arm = dict(encode_settings, crf=encode_crf, preset=encode_preset)
+        # **§6i's two levers JOIN THE ARM, ruled by the gate after review.** `encode_settings` is
+        # `{}` under h265 — it is built for x264's three fields — so the arm named what the
+        # estimator priced for one codec and omitted the dominant term of the other. *A sweep at
+        # `frame_threads` 1 and 16 differs in what `write_wait_s` measures at 80% of an h265 wall
+        # and would have produced an identical `estimate.encoder_arm`: two populations under one
+        # label, §15's defect, and the one §6i's per-field basis was written to prevent one field
+        # over.* **It bites at FIT time, months out, when the rows cannot be re-run.**
+        #
+        # **NO COEFFICIENT MOVES AND NOTHING IS PRICED BY THIS.** `encoder_arm` feeds exactly two
+        # things in `estimator`: `outside_corpus`, which walks the FITTED arm and so cannot see a
+        # name the corpus lacks, and the echo onto the answer that reaches the record. Verified:
+        # the departure sentence for an h265 job is byte-identical with and without the levers.
+        # *`CORPUS["encoder_arm"]` is deliberately NOT extended — the corpus is h264 at
+        # `threads=4` and was never fitted over these, so claiming it was would be the
+        # fabrication §6c forbids.*
+        if codec == "h265":
+            encode_arm.update(encoder.x265_threading(frame_threads, pools)[0])
 
         # ── contract §6g's DISK BOUND, AND IT FIRES BEFORE THE FIRST FRAME ──────────────────
         #
