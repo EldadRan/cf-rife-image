@@ -52,7 +52,7 @@ def fetch_source(source_url, destination):
     """Stream the presigned GET to disk. No media ever arrives in the payload.
 
     **Returns the byte count, which it has always had and always discarded**
-    (`docs/instrumentation.md` §8a). `received` below is measured to check the transfer against
+    (`docs/archive/instrumentation-archive.md` §8a). `received` below is measured to check the transfer against
     its declared length and was then thrown away, so the 580 MB of an 8K source shared one wall
     figure with decode, RIFE and encode and nothing could say which was which. The number is the
     same one; only its fate changes.

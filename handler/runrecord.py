@@ -141,7 +141,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # that was not written yet. A corpus whose entries cannot say which shape they are is a
         # corpus that can only be parsed by the code that wrote it.
         # **BUMPED 1 -> 2 BY THIS WAVE, AND IT IS THE FIELD'S FIRST JOB**
-        # (`docs/instrumentation.md` §16b). It has been the literal `1` since the project began
+        # (`docs/archive/instrumentation-archive.md` §16b). It has been the literal `1` since the project began
         # and NOTHING READ IT — an eighth member of `F-2026-08-25-1`'s class, sitting in plain
         # sight on every row.
         #
@@ -186,7 +186,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # worse than one with a gap because the gap is visible. Null on any path that produces no
         # retime, which is every upscale path and every refusal before the loop.
         "retime": retime,
-        # **WHO CHOSE the three encoder-thread settings** (`docs/instrumentation.md` §13). The
+        # **WHO CHOSE the three encoder-thread settings** (`docs/archive/instrumentation-archive.md` §13). The
         # settings themselves are in `retime`, read off the writer that ran, and they always
         # were — what no existing field can say is which of §6d's two rows fired, or whether a
         # caller overrode it. **A row reading `threads=16 sliced_threads=1` is produced
@@ -209,7 +209,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         "load_strip": load_strip,
         "host": host_banners,
         "timings": timings,
-        # **Bytes beside the clocks, in their own block** (`docs/instrumentation.md` §8f).
+        # **Bytes beside the clocks, in their own block** (`docs/archive/instrumentation-archive.md` §8f).
         # Neither half is a rate on its own, and putting the counts in `timings` would file a
         # quantity in seconds beside one in bytes under a name that says seconds. §8f names two
         # blocks and this is the second.

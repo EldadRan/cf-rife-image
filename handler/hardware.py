@@ -167,7 +167,7 @@ CGROUP_V1_MEMORY_MAX = "sys/fs/cgroup/memory/memory.limit_in_bytes"
 CGROUP_V2_CPU_MAX = "sys/fs/cgroup/cpu.max"
 
 #: **CPU consumed by the whole container, encoder included**, for the load strip
-#: (`docs/instrumentation.md` §8c). `/proc/self/stat` counts this process; ffmpeg is a CHILD, and
+#: (`docs/archive/instrumentation-archive.md` §8c). `/proc/self/stat` counts this process; ffmpeg is a CHILD, and
 #: `cutime`/`cstime` only account for children that have already been REAPED — so a self-read
 #: reports near-idle for exactly the stretch the strip exists to measure. The cgroup counts every
 #: task in the container while it is still running, which is the reading that answers "is the
@@ -373,7 +373,7 @@ def cpu_usage_s(root="/"):
 
     v2 first, then v1, then the process's own — in decreasing order of how much of the container
     each can see. The last one cannot see the encoder and is a laptop's answer rather than a
-    worker's; it is here so the strip is not empty off-cgroup, and `docs/instrumentation.md` §8c
+    worker's; it is here so the strip is not empty off-cgroup, and `docs/archive/instrumentation-archive.md` §8c
     is about a container.
     """
     try:
@@ -515,7 +515,7 @@ def read(workdir="/"):
         # since 2.1 and its replacement pair is version-gated, so a measurement taken on one
         # minor does not transfer without this line beside it.
         "torch_version": _torch_version(),
-        # **The other two resolved versions** (`docs/instrumentation.md` §8e). `hardware`
+        # **The other two resolved versions** (`docs/archive/instrumentation-archive.md` §8e). `hardware`
         # describes what is INSTALLED in the image while `build` describes the image, and
         # `torch_version` has always been in the first — so these belong beside it rather than
         # in a new block. A 44% execution-time gap survived a day as an OpenCV hypothesis
@@ -535,7 +535,7 @@ def read(workdir="/"):
         "host_ram_physical_gb": _round(physical_ram_gb()),
         "host_ram_limit_gb": _round(memory_limit_gb()),
         # **ALL THREE CPU NUMBERS, IN THE SNAPSHOT THE RECORD IS BUILT FROM.**
-        # `instrumentation.md` §3 requires `usable_cores`, `cpu_quota` and `affinity_cores` on
+        # `docs/archive/instrumentation-archive.md` §3 requires `usable_cores`, `cpu_quota` and `affinity_cores` on
         # every run, never collapsed — a container throttled by `cpu.max` and one pinned by an
         # affinity mask are different machines that a single number reports identically
         # (`F-2026-08-19-37`). §3's restoration put two of them in `handler._decorate`, which

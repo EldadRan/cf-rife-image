@@ -104,7 +104,7 @@ RC_LOOKAHEAD_MIN, RC_LOOKAHEAD_MAX = 0, 250
 #: comparison at the exact point a real job sits on, and the shared law forbids it. Width and
 #: height are integers; multiply and compare them there.
 #:
-#: **Recorded on every row** (`docs/instrumentation.md` §13a) because it is a constant that will
+#: **Recorded on every row** (`docs/archive/instrumentation-archive.md` §13a) because it is a constant that will
 #: move. **It moved within hours of that argument being written and before a single row was
 #: banked**, which is the difference between a field argued for and a field guessed at.
 AREA_BOUNDARY_DELIVERED_PIXELS = 8_294_400
@@ -123,7 +123,7 @@ AREA_DEFAULTS = {
 #: neither still gets `DEFAULT_CRF` and `DEFAULT_PRESET`.
 AREA_FIELDS = ("threads", "sliced_threads", "rc_lookahead")
 
-#: What `encode_defaults.basis` may read (`docs/instrumentation.md` §13a). **One field and not
+#: What `encode_defaults.basis` may read (`docs/archive/instrumentation-archive.md` §13a). **One field and not
 #: three**, and `"mixed"` is why it needs a name: §6d keeps every setting individually
 #: overridable, so a caller may send `threads` and leave `sliced_threads` unset. A per-field basis
 #: would be three columns answering one question; a single field that could not express the
@@ -152,7 +152,7 @@ BASIS_MIXED = "mixed"
 #: silent encode. Neither is the true answer, and the refusal is.*
 CODEC_LIBRARIES = {"h264": "libx264", "h265": "libx265"}
 
-#: What `encode_defaults.basis` reads under h265 (`docs/instrumentation.md` §15a). **§6d's table
+#: What `encode_defaults.basis` reads under h265 (`docs/archive/instrumentation-archive.md` §15a). **§6d's table
 #: is x264's and cannot have resolved an h265 job**, so the honest reading is *"the table was not
 #: consulted because this codec has no such table"* — a state, and it needs a name because null
 #: was already taken: §13a reserves absent-or-null for a run that died before the branch, and
@@ -289,7 +289,7 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
     """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
 
     Returns `(settings, provenance)` — the three resolved values, and the
-    `docs/instrumentation.md` §13a block that says who chose them.
+    `docs/archive/instrumentation-archive.md` §13a block that says who chose them.
 
     **`None` MEANS THE CALLER SENT NOTHING, AND THAT IS THE WHOLE MECHANISM.** §6d states the
     requirement as a property rather than as an implementation: *absence must remain
@@ -304,7 +304,7 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
     So `validation` now hands these three through as `None` when unset, having range-checked
     whatever WAS sent, and this is the only place a default is chosen for them.
 
-    **UNDER h265 THERE IS NO TABLE AND NO SETTINGS** (contract §6e, `docs/instrumentation.md`
+    **UNDER h265 THERE IS NO TABLE AND NO SETTINGS** (contract §6e, `docs/archive/instrumentation-archive.md`
     §15a). §6d's three fields are x264's vocabulary — `threads` and `sliced_threads` have no x265
     spelling at all, and `sliced-threads` is ABSENT rather than renamed — so this returns an EMPTY
     settings dict and a basis that says the table was skipped. *An empty dict rather than the row's
@@ -597,14 +597,14 @@ class MasterWriter:
         #: named none — resolved through `envelope` so the default has one home.
         #:
         #: **Public for the same reason the five settings below are: the record has to carry what
-        #: RAN.** `docs/instrumentation.md` §15 makes the codec a second vocabulary, and a corpus
+        #: RAN.** `docs/archive/instrumentation-archive.md` §15 makes the codec a second vocabulary, and a corpus
         #: that cannot exclude a population includes it — `compute_s` per megapixel, the encoder
         #: arm and the estimator's corpus are each a fit over rows, and two encoders averaged
         #: together is not a noisier corpus but one wrong in a direction that changes with the job.
         #: **The master's bit depth** (contract §6f), and `None` means the caller named none —
         #: resolved through `envelope` so the default has one home, exactly as `codec` is.
         #:
-        #: **Public because the record carries it** (`docs/instrumentation.md` §15a), and it
+        #: **Public because the record carries it** (`docs/archive/instrumentation-archive.md` §15a), and it
         #: carries the same self-keying invariant the three x264 fields do: `bit_depth: 10`
         #: implies `codec: "h265"` by construction, because §6f refuses the pair at the door.
         self.bit_depth = envelope.DEFAULT_BIT_DEPTH if bit_depth is None else bit_depth

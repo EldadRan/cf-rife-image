@@ -170,7 +170,7 @@ def handle(job_input, job=None):
     # was, until now, only obtainable by someone thinking to run `nproc` on a live worker during
     # a tail. Now every log carries it.
     #
-    # **TAKEN EVERY JOB, PRINTED ONCE** (`docs/instrumentation.md` §8b). The banner was computed
+    # **TAKEN EVERY JOB, PRINTED ONCE** (`docs/archive/instrumentation-archive.md` §8b). The banner was computed
     # inside the print-once guard, so wiring the append there would have banked a banner on a
     # container's FIRST job and an empty list on every job after it — a record whose `host` field
     # depends on how many jobs the worker happened to have served, which is worse than the empty
@@ -211,12 +211,12 @@ def handle(job_input, job=None):
     # `output` and `load_strip` as null while `_retime` demonstrably had those numbers and
     # returned them in the envelope. `source`, `output` and `retime` were wired with the excision;
     # `load_strip`, the transfer split, the host banner and the ETA are this wave's, ruled by
-    # `docs/instrumentation.md` §8. `rationale` stays null and is honest: route C has no planner
+    # `docs/archive/instrumentation-archive.md` §8. `rationale` stays null and is honest: route C has no planner
     # to have reasoned.
     trace = {}
     workdir = tempfile.mkdtemp(prefix="cf-upscale-")
     # **The host-load series, sampled on the cadence `progress` already publishes at**
-    # (`docs/instrumentation.md` §8c). It is handed in as `Progress`'s sampler rather than given
+    # (`docs/archive/instrumentation-archive.md` §8c). It is handed in as `Progress`'s sampler rather than given
     # a thread: *a measurement whose cost is a new thread is a measurement that changes what it
     # measures*. `trace` holds the live list by reference, so whatever accumulated by the
     # `finally` is what the record files — including on a run that died mid-encode, which is the
@@ -324,7 +324,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     import routec  # noqa: PLC0415
 
     download = os.path.join(workdir, "source")
-    # **The download's own clock and its own byte count** (`docs/instrumentation.md` §8a). Both
+    # **The download's own clock and its own byte count** (`docs/archive/instrumentation-archive.md` §8a). Both
     # were inside `wall_s` with nothing separating them from decode, RIFE and encode: 580 MB in
     # and 742 MB up sharing one figure with the work, on the run whose 44% gap could not be
     # attributed to anything.
@@ -440,7 +440,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # the cast, which `progress.begin_phase` deliberately excludes from the per-frame rate and
     # which nothing has ever measured on its own. The clock is created here rather than in
     # `retime` so it spans the load as well as the loop, and it is a local handed down as an
-    # argument: contract §4b, and `docs/instrumentation.md` §9 says why an attribute would have
+    # argument: contract §4b, and `docs/archive/instrumentation-archive.md` §9 says why an attribute would have
     # been wrong on this particular object.
     # **Handed in by `handle`, which banked it in `trace` before anything could fail.** `trace`
     # is the dict a crashed run's numbers survive in, and a clock created down here would lose
@@ -540,7 +540,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # frame size and the planned count and REFUSES before the first frame, so an unaffordable
         # request costs nothing rather than the whole model pass.
         reference_score=request.get("reference_score"),
-        # **`docs/instrumentation.md` §8g-1's other half, and it is the half that makes the kit's
+        # **`docs/archive/instrumentation-archive.md` §8g-1's other half, and it is the half that makes the kit's
         # decline honest rather than convenient.** §8g-1 lets the acceptance kit DECLINE TO GRADE
         # an armed run's first ETA, because the instruments land in `wall_s` and §12 rules that
         # pollution not recoverable by subtraction. **A gate that looks away while the estimate
@@ -680,7 +680,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         if trace is not None:
             trace["reference"] = reference_block
 
-    # **`docs/instrumentation.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
+    # **`docs/archive/instrumentation-archive.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
     # It sat between the finished master and its upload, where three full re-decodes at a
     # half-hour timeout each put **up to 5400 seconds between a master existing on disk and
     # existing anywhere else.** The master lives in `workdir`, which `handle`'s `finally`
@@ -1063,7 +1063,7 @@ def _decorate(payload, machine, attempts, warnings, progress, started):
     # **THE THREE CPU NUMBERS MOVED INTO `hardware.read`, WHERE THE RECORD CAN SEE THEM.**
     # This block added `usable_cores` and `affinity_cores` to the RETURNED PAYLOAD, and the run
     # record is built from `hardware.read()` alone — so for the same job the envelope reported
-    # `usable_cores: 96` and the record filed null, on every run ever written. `instrumentation.md`
+    # `usable_cores: 96` and the record filed null, on every run ever written. `docs/archive/instrumentation-archive.md`
     # §3 asks a RUN to report all three, never collapsed (`F-2026-08-19-37`), and **the run record
     # is the artefact that has to answer without a client having been watching** — a caller using
     # their own front-end got one that could not answer §3 at all.

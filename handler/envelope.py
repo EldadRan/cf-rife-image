@@ -63,7 +63,7 @@ BIT_DEPTHS = (8, 10)
 
 #: **Unchanged, so an omitted field cannot move anything** — the reason `DEFAULT_CODEC` gives.
 #: Every record written before §6f was `yuv420p` from an unconditional literal, so absence is 8
-#: by construction (`docs/instrumentation.md` §15a).
+#: by construction (`docs/archive/instrumentation-archive.md` §15a).
 DEFAULT_BIT_DEPTH = 8
 
 #: CF: request-carried, default 60.

@@ -653,7 +653,7 @@ def frames_from(capture, expect=None, clock=None, count=None):
     """
     checked = False
     while True:
-        # **`decode_s` is the read and nothing else** (`docs/instrumentation.md` §9a). The shape
+        # **`decode_s` is the read and nothing else** (`docs/archive/instrumentation-archive.md` §9a). The shape
         # check below is ours and costs nothing; charging it to the decoder would be charging
         # cv2 for our own assertion.
         if clock is None:
@@ -777,7 +777,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # can tell an absence from a value; §6b's surviving clause is that an explicitly-sent
         # field is obeyed and never silently overridden.
         #
-        # **AND UNDER h265 THERE IS NO BRANCH TO TAKE** (contract §6e, `docs/instrumentation.md`
+        # **AND UNDER h265 THERE IS NO BRANCH TO TAKE** (contract §6e, `docs/archive/instrumentation-archive.md`
         # §15a). §6d's table is x264's vocabulary and cannot have resolved an h265 job, so
         # `resolve_defaults` returns NO settings and a basis that says the table was skipped —
         # and everything below reads off `encode_settings` rather than assuming three keys.
@@ -882,7 +882,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         estimate = None
         if progress is not None:
             progress.plan_frames(stats.get("n_out"))
-            # **The ETA gets something to plan from at last** (`docs/instrumentation.md` §8d,
+            # **The ETA gets something to plan from at last** (`docs/archive/instrumentation-archive.md` §8d,
             # contract §9b). `Progress.expect` has existed since it was written and route C had
             # nothing to seed it with, so the first ETA came from `observed` — elapsed against a
             # work fraction of nearly nothing — and at 8K opened at 11,553 s against an outturn
@@ -1308,14 +1308,14 @@ def _encode_fields(writer):
     **ALL FIVE SETTINGS, `crf` INCLUDED, AND THE RECORD IS WHY.** `crf` and `preset` used to be
     added to the ENVELOPE by `handler._retime` and never reached `stats` — so `trace["retime"]`,
     which is built from `stats`, filed both as null on every run ever written while the envelope
-    beside it said `crf: 12`. `instrumentation.md` §2 names them as the two missing settings and
+    beside it said `crf: 12`. `docs/archive/instrumentation-archive.md` §2 names them as the two missing settings and
     says why: *a corpus recording three of five cannot attribute a difference*. **The corpus is
     the RECORD.** Reading them off the writer is what puts them in both artefacts and makes them
     impossible to disagree — the module's defaults are not the same thing as what ran, now that
     the settings can move.
 
     **THE THREE x264 FIELDS ARE OMITTED ENTIRELY UNDER h265, WHICH IS NOT THE SAME AS NULL**
-    (`docs/instrumentation.md` §15a). *A row reading `sliced_threads: false` beside
+    (`docs/archive/instrumentation-archive.md` §15a). *A row reading `sliced_threads: false` beside
     `codec: "h265"` would assert that a parameter x265 does not have took a value* — the corpus
     telling a reader something untrue in a field they have no reason to doubt. With §6e ruling
     2's refusal at the door and this absence here, **`sliced_threads` present on a row implies

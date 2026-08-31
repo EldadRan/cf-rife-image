@@ -1,4 +1,4 @@
-"""Where `compute_s` actually goes — `docs/instrumentation.md` §9.
+"""Where `compute_s` actually goes — `docs/archive/instrumentation-archive.md` §9.
 
 **§8a split `wall_s` into transfer and compute and the 44% fell out in one run. This is the same
 split one layer down**, and the campaign has already spent an arm on not having it: sixteen
@@ -49,7 +49,7 @@ STAGES = ("load_s", "decode_s", "model_s",
 RESIDUAL = "stage_residual_s"
 
 #: **The encoder's end-of-stream drain, a TERM IN THE IDENTITY AND NOT AN EIGHTH STAGE**
-#: (`docs/instrumentation.md` §16, §16c). `stdin.close()` then `wait()`, after the last frame has
+#: (`docs/archive/instrumentation-archive.md` §16, §16c). `stdin.close()` then `wait()`, after the last frame has
 #: been handed over — the encoder's queued backlog, which at 8K with a lookahead can be tens of
 #: 50 MiB frames and settles entirely in that call.
 #:

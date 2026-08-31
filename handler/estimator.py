@@ -20,7 +20,7 @@ Worth stating plainly rather than leaving the original promise standing, because
 counterexample. The requirement bought what it was for — the LEVEL moved by editing four numbers
 — but the SHAPE moved too, and could not have been foreseen: the old model carried a fixed term
 and no transfer term because the corpus it was fitted from could not tell the two apart, every
-wall figure having the download and the upload inside it. `docs/instrumentation.md` §8a split
+wall figure having the download and the upload inside it. `docs/archive/instrumentation-archive.md` §8a split
 them, and **a quantity that becomes visible is a term that becomes fittable.** A model whose
 shape may never change in the light of a measurement it could not previously take is not a
 model; it is a constant with arithmetic attached.
@@ -83,7 +83,7 @@ VRAM_RESERVE_GB = 2.0
 #: **`transfer_s = TIME_TRANSFER_PER_MP x mp`**, and the answer is their sum, because the ETA is
 #: a promise to a caller who waits through the transfer too.
 #:
-#: **REFITTED 2026-08-28 — contract §9e, and the trigger was `docs/instrumentation.md` §8g.**
+#: **REFITTED 2026-08-28 — contract §9e, and the trigger was `docs/archive/instrumentation-archive.md` §8g.**
 #: The factor-of-two ETA gate had been failing at 2.3-2.7x, which is a LEVEL error and a refit
 #: trigger rather than a reason to widen the gate. `estimator_v2` was fitted on `sha-9672d42`,
 #: before both conversion waves and before the producer wave; on the three runs this refit is
@@ -115,7 +115,7 @@ VRAM_RESERVE_GB = 2.0
 #:
 #: **AND TWO 1080p ROWS WERE EXCLUDED FOR A REASON THAT IS NOT NOISE.** Both carry request gates —
 #: `convert_check` + `input_check` + `tie_check` on one, `convert_check` + `input_check` on the
-#: other — and `docs/instrumentation.md` §12 rules that `compute_s` and the shares never survive
+#: other — and `docs/archive/instrumentation-archive.md` §12 rules that `compute_s` and the shares never survive
 #: an armed run, with the pollution not recoverable by subtraction. Their 43.8 against 26.1 on
 #: identical work is three instruments against two, and it is evidence FOR §12 rather than a
 #: spread this model may carry.
@@ -355,7 +355,7 @@ def outside_corpus(crf=None, encoder_arm=None, armed=None, substituted=None):
     left = []
     try:
         # **THE ARMED INSTRUMENTS, AND THIS SENTENCE IS WHAT MAKES §8g-1 HONEST RATHER THAN
-        # CONVENIENT.** `docs/instrumentation.md` §8g-1 lets the kit DECLINE TO GRADE an armed
+        # CONVENIENT.** `docs/archive/instrumentation-archive.md` §8g-1 lets the kit DECLINE TO GRADE an armed
         # run's first ETA, because the instruments land in `wall_s` and §12 rules that pollution
         # unrecoverable by subtraction. **A gate that looks away without the estimate saying
         # anything would leave the caller of an armed run with a silently wrong ETA** — a worse
@@ -483,7 +483,7 @@ def estimate_seconds(width, height, n_in, n_synth, scale=1, crf=None, encoder_ar
     "corpus"}` — **the full key list, because the run record files this dict whole** and a caller
     sizing a schema from a partial one writes a partial schema. `compute_s` and `transfer_s` are
     published apart as well as summed, so a reader can grade each against the field
-    `docs/instrumentation.md` §8a created for it.
+    `docs/archive/instrumentation-archive.md` §8a created for it.
 
     The band is the larger of the corpus's measured repeatability and this fit's worst residual,
     so it can never claim to be tighter than the noise it was fitted through.

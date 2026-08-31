@@ -247,7 +247,7 @@ PARAMS_FIELDS = {
     # both would make a failed run ambiguous about which comparison failed, which is the
     # attribution problem §3b split the two waves to avoid in the first place.
     "input_check",
-    # **`docs/instrumentation.md` §11's decode decomposition.** Re-decodes the source three
+    # **`docs/archive/instrumentation-archive.md` §11's decode decomposition.** Re-decodes the source three
     # times beside the retime, so it is opt-in per job like every other probe in this surface.
     "decode_probe",
     # contract §6g's fifth gate. **Registered here or the door refuses it by name**, which is
@@ -781,7 +781,7 @@ def validate(job_input):
     # three filters over every delivered frame.
     #
     # **Opt-in per job for the reason the other four are, one order of magnitude louder.**
-    # `docs/instrumentation.md` §12 rules that request-gated instruments do not compose and that
+    # `docs/archive/instrumentation-archive.md` §12 rules that request-gated instruments do not compose and that
     # an armed run's `compute_s` is comparable to nothing; this one also makes the run's DISK
     # comparable to nothing. *A run carrying it must not bank a performance number.*
     reference_score = params.get("reference_score")
@@ -857,7 +857,7 @@ def validate(job_input):
     # one step out.*
     #
     # **AND IT KEEPS THE CORPUS SELF-KEYING.** With the refusal, `frame_threads` on a row implies
-    # h265 by construction — the property `instrumentation.md` §15a already relies on for
+    # h265 by construction — the property `docs/archive/instrumentation-archive.md` §15a already relies on for
     # `sliced_threads` implying h264, now holding in both directions.
     if release_3["codec"] != "h265":
         crossed_265 = [name for name in ("frame_threads", "pools")
@@ -899,7 +899,7 @@ def validate(job_input):
     # field applied to every job.*
     #
     # **AND IT KEEPS THE CORPUS HONEST.** With the refusal, `sliced_threads` on a row implies
-    # h264 by construction (`docs/instrumentation.md` §15a). Without it, the field could appear
+    # h264 by construction (`docs/archive/instrumentation-archive.md` §15a). Without it, the field could appear
     # on an h265 row having done nothing.
     #
     # **HERE, AFTER ALL THREE ARE PARSED, AND THAT ORDER IS DELIBERATE.** A caller who sent both

@@ -241,7 +241,7 @@ ENV IMAGE_TAG=${IMAGE_REF} \
     WORKER_VERSION=${WORKER_VERSION}
 
 # **`decode_s` IS 106.8 s AT 8K — 18.70% of `compute_s`, larger than the entire conversion
-# pipeline two waves were spent deleting** (`docs/instrumentation.md` §11). And the pointer that
+# pipeline two waves were spent deleting** (`docs/archive/instrumentation-archive.md` §11). And the pointer that
 # says this is worth trying: **the worker decodes at 0.556 s/frame where a laptop's
 # SINGLE-THREADED ffmpeg does the same file at 0.285** — so the capture backend is very likely
 # not threading at all.

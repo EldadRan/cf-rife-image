@@ -1,4 +1,4 @@
-"""Where `decode_s` actually goes — `docs/instrumentation.md` §11.
+"""Where `decode_s` actually goes — `docs/archive/instrumentation-archive.md` §11.
 
 **This is §8a, §9 and §10 for the FOURTH time, and by now the only new information is which
 number it is.** `decode_s` was 1.5 s at 4K and nobody looked; at 8K it is **106.8 s, 18.70% of

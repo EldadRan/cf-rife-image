@@ -5,7 +5,7 @@ no file and it decides no policy. It consumes frames in order, holds exactly one
 lookahead because RIFE synthesises from the pair `(i, i+1)`, and emits the frames the plan calls
 for. Wiring it to anything is somebody else's step.
 
-Spec: `release-3-contract.md` §5 (the frame plan, the tail hold, the snap tolerance), §5b (the
+Spec: `docs/archive/gate-findings-archive.md` §5 (the frame plan, the tail hold, the snap tolerance), §5b (the
 float defect), §9 (what is portable from the reference script) and §9b (what is forbidden).
 `fable/retime_oracle.py` is the same contract executable and is the authority: **if this file and
 that one disagree, one of them is a bug and it gets a decision entry rather than a patch.** The
@@ -356,7 +356,7 @@ class Interpolator:
 
     def _synthesise(self, cache, timestep, clock=None):
         """One synthesis. **Timed to an explicit synchronisation, never to the enqueue**
-        (`docs/instrumentation.md` §9b).
+        (`docs/archive/instrumentation-archive.md` §9b).
 
         Torch is asynchronous: a clock stopped at the `return` below measures how long it took to
         HAND the work to the GPU, and the real cost then lands at the caller's first
@@ -424,7 +424,7 @@ class Interpolator:
         """The generator half of `stream`. Its state is per-call and none of it lives on self.
 
         **`clock` is a PARAMETER and that is contract §4b rather than a style choice**
-        (`docs/instrumentation.md` §9). An accumulator on `self` would be shared by the two
+        (`docs/archive/instrumentation-archive.md` §9). An accumulator on `self` would be shared by the two
         `stream()` calls a cascade variant makes — a per-call result on an object that outlives
         the call, which is the exact defect §4b was written about after finding it on this class.
         `None` is a supported state: nothing is measured and nothing changes.

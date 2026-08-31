@@ -1,4 +1,4 @@
-"""The raw reference and the scores taken against it — contract §6g, `docs/instrumentation.md` §17.
+"""The raw reference and the scores taken against it — contract §6g, `docs/archive/instrumentation-archive.md` §17.
 
 **Every quality figure this project held before this module was measured against a DELIVERED h264
 master**, so x264 was re-encoding its own artefacts and x265 was not. The frames handed to the
@@ -39,7 +39,7 @@ BYTES_PER_PIXEL = {"yuv420p": 1.5, "yuv420p10le": 3.0}
 #: its own raw, and the number that matters is that the disk does not reach zero mid-encode.
 DISK_MARGIN_BYTES = 3 * 1000 ** 3
 
-#: How many worst frames come back as pictures. **`docs/contract.md` §6g rules the decision on
+#: How many worst frames come back as pictures. **`docs/archive/gate-findings-archive.md` §6g rules the decision on
 #: minima and percentiles and the artefacts on a human opening them**, so this is small on
 #: purpose: the PNGs are evidence for a claim the aggregates already made.
 WORST_N = 3

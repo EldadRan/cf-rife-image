@@ -172,7 +172,7 @@ def cuda_memory_gb():
 class LoadStrip:
     """The host-load time series, sampled on the timer `progress` already owns.
 
-    **`docs/instrumentation.md` §8c, and the constraint is as binding as the measurement.** A
+    **`docs/archive/instrumentation-archive.md` §8c, and the constraint is as binding as the measurement.** A
     host-load series is what separates a starved encode from a slow one, and it is the only
     quantity on §8f's list that no existing line already computes — but *"a measurement whose
     cost is a new thread is a measurement that changes what it measures"*. So this class owns no

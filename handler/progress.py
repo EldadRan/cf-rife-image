@@ -48,7 +48,7 @@ MIN_PASS_GAP_S = 1.0
 MAX_POLL_S = 90
 
 #: **§18's coarse phases, and inside one of them `eta_s` and `eta_basis` are ABSENT**
-#: (`docs/instrumentation.md` §18d). *Not zero, not null, not a guess.*
+#: (`docs/archive/instrumentation-archive.md` §18d). *Not zero, not null, not a guess.*
 #:
 #: The frame ETA measures a quantity that is COMPLETE by the time these run — `_frames_done`
 #: equals `_estimated_frames`, so `remaining` is 0 and the number published was `0` carrying the
@@ -84,7 +84,7 @@ class Progress:
 
     def __init__(self, job=None, estimated_frames=None, enabled=True, sampler=None):
         self._job = job
-        #: **Called once per PUBLISHED payload, and it is not a timer** (`instrumentation.md`
+        #: **Called once per PUBLISHED payload, and it is not a timer** (`docs/archive/instrumentation-archive.md`
         #: §8c). The load strip has to be sampled on a cadence and this class already owns one —
         #: `_emit`'s rate limiter — so the strip rides it rather than starting a thread of its
         #: own. Optional and never inspected: anything callable and cheap will do, and a caller
@@ -197,9 +197,9 @@ class Progress:
 
     def phase(self, name, pct=None, force=False, expected_s=None, **facts):
         """One coarse phase. **`expected_s` is how long THIS STRETCH is expected to take, and it
-        sets the poll interval; it is never published as an ETA** (`docs/instrumentation.md` §18).
+        sets the poll interval; it is never published as an ETA** (`docs/archive/instrumentation-archive.md` §18).
 
-        **The tail is where this matters.** Progress is frame-based by `contract.md` §1, so the
+        **The tail is where this matters.** Progress is frame-based by `docs/archive/gate-findings-archive.md` §1, so the
         frame count runs out before the job does — and `_next_poll_s` then answers from a
         `_pass_cadence_s` measured on frames that stopped arriving, or falls to `MIN_POLL_S`, the
         floor designed for having NO information. *On a 4K armed run that is ~250 s of silence at
@@ -288,7 +288,7 @@ class Progress:
                     payload["eta_s"] = seconds
                     payload["eta_basis"] = self._eta_basis
                     # **§19a/§19b: the spread, applied to the LIVE point and not the seed's.**
-                    # `contract.md` §9b has required a point and a spread since the estimator was
+                    # `docs/current.md` §9b has required a point and a spread since the estimator was
                     # ruled; the estimator honours it in the record and this channel discarded it.
                     # The estimator's own `low_s`/`high_s` are fixed at seed time while `eta_s` is
                     # recomputed every payload, so publishing that pair would have them disagree
