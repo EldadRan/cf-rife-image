@@ -414,8 +414,14 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     #
     # **Wrapped, because an emit must never cost a delivery** — the same rule every other emit on
     # this path already follows.
+    # **NO `pct`, AND THE FIRST DRAFT PASSED `pct=1`.** *That 1 was a marker for the phase and
+    # not a measure of work done — and wave 7's cadence keys on work done, so it answered
+    # `MAX_POLL_S`: the announcement written to end 176 seconds of silence told the client to
+    # come back in 90.* **A transfer's progress is bytes, and it is carried as bytes** — the
+    # cadence for these payloads comes from `expected_s`, or from the floor where no length was
+    # declared, which is the honest answer for a stretch nobody can size. *Found in review.*
     try:
-        progress.phase("fetching", pct=1, force=True)
+        progress.phase("fetching", force=True)
     except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
         print("[progress] fetching phase not emitted ({}: {})".format(
             type(exc).__name__, exc), flush=True)
@@ -423,7 +429,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     try:
         fetch_bytes = storage.fetch_source(
             request["source_url"], download,
-            on_bytes=_byte_reporter(progress, "fetching", pct=1,
+            on_bytes=_byte_reporter(progress, "fetching",
                                     bytes_per_s=ladder.FETCH_BYTES_PER_S))
     finally:
         _note(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))

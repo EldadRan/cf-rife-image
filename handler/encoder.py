@@ -799,6 +799,12 @@ class MasterWriter:
         # new frame without re-running this would encode at the pools count of a frame that was
         # never written, and the record would carry it.*
         if self.codec == "h265":
+            # **THE HEIGHT MOVES AND THE FRAME COUNT DOES NOT, AND THAT IS A REAL LIMIT.**
+            # *`_delivered_frames` is whatever the constructor was handed; a resize re-keys the
+            # new height against the old count, which is right only because a resize does not
+            # change how many frames are delivered.* **If a caller ever appears that changes
+            # both, it must pass the new count** — said here rather than guarded, because a
+            # guard against an uncalled setter is a guard nobody can test.
             self._resolve_x265()
 
     def _build_command(self):

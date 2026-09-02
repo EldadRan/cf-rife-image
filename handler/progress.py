@@ -709,9 +709,23 @@ class Progress:
             # cannot see it. *Implied progress is `elapsed / (elapsed + eta)` — where the job
             # would be if time had tracked work.*
             if eta is not None and eta > 0:
-                elapsed = max(0.0, time.time() - self._started)
+                # **`_phase_started` AND NOT `_started`, AND THE FIRST DRAFT USED THE WRONG
+                # CLOCK.** *`eta` is `remaining_frames * seconds_per_frame`, and that rate is
+                # measured from `_phase_started` — which `begin_phase` resets when frame work
+                # begins, precisely so the model load is not amortised into it.* **Against
+                # whole-job elapsed the two are different quantities**: the numerator carried the
+                # fetch, the probe and the load and the denominator did not, so `implied` was
+                # strictly greater than `pct` for the whole of any run with a preamble, the guard
+                # fired on every payload, and the ramp below could never execute. *Found in
+                # review, and the witness that would have missed it is the one that starts the
+                # clock at zero.*
+                elapsed = max(0.0, time.time() - self._phase_started)
                 implied = 100.0 * elapsed / (elapsed + float(eta))
-                if float(pct) < implied:
+                # **COMPARED AS THE PAYLOAD CARRIES IT.** *`pct` reaches here already floored to
+                # an int by `phase`; `implied` is a float. At a true 90.7% the payload says 90,
+                # `90 < 90.7`, and the guard fires on a job that is exactly on schedule* — half a
+                # per cent of rounding reading as "behind schedule" on every payload.
+                if float(pct) < int(implied):
                     return MAX_POLL_S
             # Linear in the work that remains: `MAX_POLL_S` at the threshold, the floor at the
             # last frame. **The span is the tightening band's own width**, so moving the

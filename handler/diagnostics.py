@@ -30,6 +30,8 @@ import sys
 import time
 import traceback
 
+import envelope
+
 #: A bounded tail also rides in the failure envelope, so CF can classify without fetching
 #: anything. **Bounded because the output payload limit is 10 MB and an inline log is exactly
 #: the sort of thing that grows until a job silently returns nothing** (playbook §1).
@@ -359,7 +361,7 @@ _REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale", "convert
 #: puts them. **They were one level deeper until the strict surface: `release_3["interpolate"]`
 #: was a sub-object distinguishing a retime from an upscale, and with one capability it
 #: discriminated nothing.**
-_RETIME_FIELDS = ("target_fps", "snap_tolerance")
+_RETIME_FIELDS = envelope.RETIME_FIELDS
 
 
 def _source_reference(request):

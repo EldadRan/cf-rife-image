@@ -1458,6 +1458,31 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
     # alternative was fishing it out of `locals()`, which works and is unreadable — and a
     # measurement whose control flow needs explaining is one nobody will touch correctly later.
     estimate = None
+    # ── THE RULED SEED GOES FIRST, AND IT IS NOT GATED ON THE FIT IT REPLACED ────────────────
+    #
+    # **THE FIRST DRAFT COMPUTED IT AFTER `estimator.seconds_per_frame` AND INSIDE THE SAME
+    # `try`.** *So any failure in the fit — a corpus key that moved, an arm the fit does not
+    # recognise — jumped past `progress.expect` and left the run with NO SEED AT ALL*, even
+    # though the ladder needed only the delivered height and the planned count, both of which
+    # were already in hand. **That is F-2026-08-19-29's 1,061-second silence, restored through
+    # the module this wave says is no longer the seed's source.** *Found in review.*
+    #
+    # **The ladder is a dict lookup and the fit is a model**, so the cheap, ruled, always-present
+    # answer is published first and the fit refines nothing that this already said.
+    seed, step = None, None
+    try:
+        seed, step = ladder.seconds_per_frame(
+            delivered_height, stats.get("n_out"), codec=codec)
+        if seed is not None:
+            progress.expect(seed, basis="measured", ladder=step)
+            print("[eta] seed {} s/frame from the {} step of CF's ruled table".format(
+                seed, step), flush=True)
+        else:
+            print("[eta] no ruled row for this frame ({}); the fit stands in if it "
+                  "prices".format(step), flush=True)
+    except Exception as exc:  # noqa: BLE001 — a seed must never cost a delivered master
+        print("[eta] the ruled table did not answer ({}: {})".format(
+            type(exc).__name__, str(exc)[:120]), flush=True)
     try:
         n_in = source_frame_count(source)
         # **§9e's two declared inputs.** `crf` because every row in the corpus is CRF 12 and a
@@ -1486,7 +1511,7 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # is one key away in the dict this line already reads, and it was the only field of the
         # estimate the progress channel could not see. A malformed estimate must not cost the
         # seed, so a missing or unusable band arrives as `None` and `expect()` drops it there.
-        # ── §11: THE SEED COMES FROM THE RULED TABLE AND NOT FROM THE FIT ──────────────────
+        # ── §11: THE RULED TABLE SEEDED THE ETA ABOVE; THIS IS WHAT THE FIT ADDS ───────────
         #
         # **THE FIT PUBLISHED 3663.9 s ON THE 8K h264 3000-FRAME RUN AGAINST AN ACTUAL 2803.3** —
         # above the platform's own 3600 s kill, for a job that finished with 797 s to spare.
@@ -1495,25 +1520,21 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         #
         # **THE ESTIMATE IS STILL COMPUTED AND STILL RIDES OUT ON THE STATS.** *It is the
         # record's `estimate` block and it carries the corpus, the reading count and the
-        # departure sentences — what changes is which number seeds the ETA the caller polls.*
-        # **A fit nobody refitted is not evidence and a ruled table is**, but deleting the fit
-        # would delete the only thing that says a job is outside its population.
+        # departure sentences.* **A fit nobody refitted is not evidence and a ruled table is**,
+        # but deleting the fit would delete the only thing that says a job is outside its
+        # population.
         #
-        # **`None` FROM THE LADDER FALLS BACK TO THE FIT RATHER THAN TO SILENCE.** *Above 8K the
-        # table has no row and CF has not ruled what to seed from* — so the estimator's answer,
-        # whatever it is, beats no ETA at all, and `eta_ladder` on the payload says the seed did
-        # not come from a ruled row. **`expect` drops a `None` rate on its own**, so a run with
-        # neither is the pre-seed behaviour F-2026-08-19-29 closed and not a new state.
-        seed, step = ladder.seconds_per_frame(
-            delivered_height, stats.get("n_out"), codec=codec)
+        # **THE BAND IS THE FIT'S AND THE POINT IS THE TABLE'S.** *§9b requires a spread beside
+        # every point and the ladder carries no per-row spread, so the seed above publishes the
+        # point and this republishes it with the fit's band attached* — same rate, so the ETA
+        # does not move, and `expect` keeps whichever `ladder` label it was already given.
+        #
+        # **WHERE THE TABLE HAD NO ROW, THIS IS THE ONLY SEED THERE IS.** *Above 8K CF has not
+        # ruled what to seed from, so the fit stands in and `eta_ladder` says `outside`.*
         progress.expect(seed if seed is not None else per_frame,
                         basis=(estimate or {}).get("basis") or estimator.BASIS,
                         band_frac=(estimate or {}).get("band_frac"),
                         ladder=step)
-        print("[eta] seed {} s/frame from the {} step of CF's table ({})".format(
-            seed if seed is not None else per_frame, step,
-            "ruled row" if seed is not None else "no ruled row — the fit is standing in"),
-            flush=True)
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's

@@ -44,7 +44,9 @@ DEFAULT_CODEC = "h264"
 #: strictness rule rests on.
 OUTPUT_PRODUCTION_FIELDS = ("codec", "bit_depth")
 OUTPUT_DEBUG_FIELDS = ("frame_threads", "pools")
-OUTPUT_FIELDS = OUTPUT_PRODUCTION_FIELDS + OUTPUT_DEBUG_FIELDS
+#: *The union used to be the one list `derive` checked against. It is gone rather than left as a
+#: third name for a fact the two lists above already hold* — nothing read it once the split
+#: landed, and an unread union is the copy that goes stale without anyone noticing.
 
 
 def refuse_field(name, where, gated):
@@ -118,6 +120,8 @@ DEFAULT_TARGET_FPS = 60.0
 #: RELATIVE TO THE UPSCALE, and the same argument that deletes the block deletes it. (CF,
 #: 2026-09-02.)
 RETIME_FIELDS = ("target_fps", "snap_tolerance")
+#: **`diagnostics` READS THIS RATHER THAN KEEPING ITS OWN COPY.** *It had one — two spellings of
+#: one tuple in two modules — which is the drift `ladder.py` argues against for the ruled table.*
 
 
 def _threading_lever(output, name, bounds):
@@ -162,7 +166,21 @@ def derive(params, debug=False):
     is the module that reads the flag off the top level.
     """
     params = dict(params or {})
-    output = dict(params.get("output") or {})
+    # **TYPE-CHECKED BEFORE IT IS WALKED, AND IT WAS NOT.** *`dict(params["output"])` on an `int`
+    # raises `TypeError` and on a string raises `ValueError` — neither is a `WorkerError`, so a
+    # malformed encode block left `validate` as an unhandled exception and `handle` reported a
+    # request-shape problem as a worker fault.* **This is the level the strict rule was strict
+    # about NAMES and silent about TYPE**, while the destination block one module over has
+    # type-checked itself all along. Found in review; pre-existing, and inside the item that
+    # claims strictness at every level.
+    raw_output = params.get("output")
+    if raw_output is not None and not isinstance(raw_output, dict):
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'params.output' must be an object holding the encode settings ({}); got "
+            "{!r}. The top-level 'output' is the DESTINATION and is a different object.".format(
+                ", ".join(OUTPUT_PRODUCTION_FIELDS), raw_output))
+    output = dict(raw_output or {})
     # **UNKNOWN KEYS IN `params.output` ARE REFUSED BY NAME, AND SO ARE DEBUG KEYS WITHOUT THE
     # FLAG.** Nothing checked this sub-object until §6i, and the gap was invisible while its only
     # fields were enums a typo turned into a refusal anyway.

@@ -76,7 +76,16 @@ UPLOAD_BAND_FRAC = 0.7
 FETCH_BAND_FRAC = 0.95
 
 #: What `step_for` says about a frame the table does not name.
-DERIVED = "derived"
+#:
+#: **`ROUNDED` IS A SUFFIX ON A STEP AND NOT A STEP OF ITS OWN, AND THE FIRST DRAFT HAD A THIRD
+#: BARE VALUE THAT NO INPUT COULD PRODUCE.** *`step_for` rounds every unnamed height UP to the
+#: step above it, so a `derived` return was unreachable — and a 1440p job then published
+#: `eta_ladder: "4K"` while its `pools_basis` said `derived`: two fields on one run disagreeing
+#: about whether CF's table names the frame, and the one a caller reads said it does.* **The seed
+#: really did come from 4K's row, so the step is 4K — what was missing is that the frame is not
+#: 4K.** *§11: a rule that is silent about being outside its population reads as being inside
+#: it.* Found in review.
+ROUNDED = ":rounded"
 OUTSIDE = "outside"
 
 
@@ -89,8 +98,9 @@ def step_for(delivered_height):
     prevents published 3663.9 s against an actual 2803.3. *A ladder that rounded down would
     reproduce it in the other direction.*
 
-    **`DERIVED` and `OUTSIDE` are different states.** *`DERIVED` is between or below the steps and
-    has a row above it to round up to; `OUTSIDE` is above the tallest step and has none.*
+    **A ROUNDED STEP AND `OUTSIDE` ARE DIFFERENT STATES.** *A rounded step is between or below
+    the steps and has a row above it to round up to, and says so with the `:rounded` suffix;
+    `OUTSIDE` is above the tallest step and has no row at all.*
     """
     height = int(delivered_height)
     if height in STEPS:
@@ -99,8 +109,11 @@ def step_for(delivered_height):
         return OUTSIDE
     for boundary in sorted(STEPS):
         if height < boundary:
-            return STEPS[boundary]
-    return DERIVED
+            return STEPS[boundary] + ROUNDED
+    # **Unreachable while `TALLEST` is the largest key of `STEPS`, and it is not an assertion of
+    # that.** *A step added above 4320 without moving `TALLEST` would land here, and returning
+    # `OUTSIDE` is the honest answer for a height no row was found for.*
+    return OUTSIDE
 
 
 def levers(delivered_height, delivered_frames, codec="h265"):
@@ -155,9 +168,8 @@ def seconds_per_frame(delivered_height, delivered_frames, codec="h265"):
     step = step_for(delivered_height)
     if step == OUTSIDE:
         return None, OUTSIDE
-    name = step if step != DERIVED else None
-    if name is None:
-        return None, DERIVED
+    # **The suffix is a label for the caller, not a key** — the seed comes from the row it names.
+    name = step[:-len(ROUNDED)] if step.endswith(ROUNDED) else step
     row = ROWS[name].get(codec or "h265")
     if row is None:
         # **An unimplemented codec is not an unmeasured frame.** The step is still named — the
