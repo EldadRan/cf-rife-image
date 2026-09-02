@@ -34,6 +34,7 @@ import estimator
 import hardware
 import interp_plan
 import keys
+import ladder
 import phasewatch
 import probe
 import progress as progress_module
@@ -168,7 +169,7 @@ _SAID_BOOT = []
 BYTE_REPORT_INTERVAL_S = 3.0
 
 
-def _byte_reporter(progress, phase_name, pct=None):
+def _byte_reporter(progress, phase_name, pct=None, bytes_per_s=None):
     """A throttled `on_bytes(done, expected)` that publishes `phase_name` with the byte counts.
 
     **`bytes_expected` MAY BE UNKNOWABLE AND THE PHASE MUST STILL EMIT.** *A name and an elapsed
@@ -181,18 +182,49 @@ def _byte_reporter(progress, phase_name, pct=None):
     callers treat a raising callback as a dead one and stop calling it, which is the same rule
     from the other side.
     """
-    state = {"last": 0.0}
+    #: `started` is set on the first report rather than at construction: the transfer begins when
+    #: bytes move, and a reporter built ahead of a connection would charge the handshake to the
+    #: measured rate.
+    state = {"last": 0.0, "started": None}
 
     def report(done, expected):
         now = time.time()
+        if state["started"] is None:
+            state["started"] = now
         if now - state["last"] < BYTE_REPORT_INTERVAL_S:
             return
+        first = state["last"] == 0.0
         state["last"] = now
         facts = {"bytes_done": int(done)}
+        expected_s = None
         if expected:
             facts["bytes_expected"] = int(expected)
+            # ── §11: THE SEED SURVIVES EXACTLY ONE EMISSION ────────────────────────────────
+            #
+            # **CF, 2026-09-02: the first status on fetch and upload may come from previous
+            # runs; the next one comes from real progress.** *No byte threshold* — a threshold
+            # would be a second thing to choose and would keep the corpus rate alive on exactly
+            # the transfers that are behaving unlike the corpus.
+            #
+            # **The measured rate needs both an elapsed time and bytes to divide**, and a
+            # zero denominator is the nearly-right quantity §2b refuses — so a report that
+            # arrives with neither falls back to the corpus rate rather than to a division.
+            elapsed = now - state["started"]
+            rate = None
+            if not first and elapsed > 0 and done > 0:
+                rate = float(done) / elapsed
+                facts["bytes_basis"] = "measured"
+            elif bytes_per_s:
+                rate = float(bytes_per_s)
+                facts["bytes_basis"] = "predicted"
+            if rate:
+                # **THE REMAINDER, NOT THE WHOLE.** *`expected_s` sets the poll interval and the
+                # rule one level up is half the stretch — so a transfer that is nearly finished
+                # must say so, or the client waits half of a transfer that has already
+                # happened.*
+                expected_s = max(0.0, (int(expected) - int(done))) / rate
         try:
-            progress.phase(phase_name, pct=pct, force=True, **facts)
+            progress.phase(phase_name, pct=pct, force=True, expected_s=expected_s, **facts)
         except Exception as exc:  # noqa: BLE001 — never at the cost of the transfer
             print("[progress] {} bytes not emitted ({}: {})".format(
                 phase_name, type(exc).__name__, exc), flush=True)
@@ -391,7 +423,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     try:
         fetch_bytes = storage.fetch_source(
             request["source_url"], download,
-            on_bytes=_byte_reporter(progress, "fetching", pct=1))
+            on_bytes=_byte_reporter(progress, "fetching", pct=1,
+                                    bytes_per_s=ladder.FETCH_BYTES_PER_S))
     finally:
         _note(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))
     _note(trace, "transfer", "fetch_bytes", fetch_bytes)
@@ -652,11 +685,18 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # raises — either would kill a job between writing the product and uploading it, for a poll
     # interval. *A support computation for an emit inherits the emit's rule: it must not be able
     # to cost a delivery.*
+    # ── §11: THE UPLOAD IS PRICED AT THE UPLOAD'S OWN CORPUS RATE ──────────────────────────
+    #
+    # **THIS WAS DERIVED FROM THE FETCH RATE AND WAS 6.7x LOW.** *A delivered 8K run published
+    # `phase_expected_s: 35.2` for an upload that took 236.4 s, so the client polled at 17 s
+    # through 200 seconds of silence and collected two quiet notices.* **The two directions are
+    # not one mechanism**: the corpus puts the fetch median at 54.5 MB/s and the upload's at 13.1,
+    # a factor of four before any per-run variation — *and the fetch spread is 35.5x against the
+    # upload's 3.3x, so the run's own fetch was the least reproducible number available to price
+    # it with.* **From the corpus rate it would have said 214 s against 236, a 9 per cent error.**
     try:
-        _fetch_s = float(((trace or {}).get("timings") or {}).get("fetch_s") or 0.0)
-        _fetch_bytes = float(((trace or {}).get("transfer") or {}).get("fetch_bytes") or 0.0)
-        _upload_expected = ((upload_bytes / (_fetch_bytes / _fetch_s))
-                            if _fetch_s > 0 and _fetch_bytes > 0 else None)
+        _upload_expected = (float(upload_bytes) / ladder.UPLOAD_BYTES_PER_S
+                            if upload_bytes else None)
     except Exception:  # noqa: BLE001 — no figure is a state §18b already rules honest
         _upload_expected = None
     try:
@@ -668,7 +708,9 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     try:
         master_key = storage.upload(client, request["output"], master, master_path,
                                     keys.content_type(master),
-                                    on_bytes=_byte_reporter(progress, "uploading"))
+                                    on_bytes=_byte_reporter(
+                                        progress, "uploading",
+                                        bytes_per_s=ladder.UPLOAD_BYTES_PER_S))
     finally:
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
     _note(trace, "transfer", "upload_bytes", upload_bytes)

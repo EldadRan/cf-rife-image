@@ -902,7 +902,10 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # which is what `begin_phase` below excludes from the rate rather than what the ETA
             # is priced from.
             estimate = _seed_estimate(progress, source, stats, scale, encode_arm, armed,
-                                      substituted)
+                                      # **THE DELIVERED HEIGHT AND THE CODEC, because §11's rows
+                                      # are keyed on both** — and it is the same `height` local
+                                      # the writer is built from, not the source's probed size.
+                                      substituted, delivered_height=int(height), codec=codec)
 
         writer_cm = encoder.MasterWriter(
             master_path, width, height, float(target_fps), identity,
@@ -1440,7 +1443,7 @@ def _print_write_distribution(writer):
 
 
 def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
-                   substituted=None):
+                   substituted=None, delivered_height=None, codec=None):
     """Price the job, seed the ETA with it, and hand the whole answer back. **Never raises.**
 
     Returns the §9b estimate — point, band, basis and corpus — or None where it could not be
@@ -1449,6 +1452,7 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
     behaviour it had before this line existed.
     """
     import estimator  # noqa: PLC0415 — pure-python, imported here like everything else on this path
+    import ladder  # noqa: PLC0415 — CF's ruled table, and the seed comes from it
 
     # **Bound BEFORE the `try`, so the `finally` below reads a name that always exists.** The
     # alternative was fishing it out of `locals()`, which works and is unreadable — and a
@@ -1482,9 +1486,34 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # is one key away in the dict this line already reads, and it was the only field of the
         # estimate the progress channel could not see. A malformed estimate must not cost the
         # seed, so a missing or unusable band arrives as `None` and `expect()` drops it there.
-        progress.expect(per_frame,
+        # ── §11: THE SEED COMES FROM THE RULED TABLE AND NOT FROM THE FIT ──────────────────
+        #
+        # **THE FIT PUBLISHED 3663.9 s ON THE 8K h264 3000-FRAME RUN AGAINST AN ACTUAL 2803.3** —
+        # above the platform's own 3600 s kill, for a job that finished with 797 s to spare.
+        # *`current.md` §9's provisional model was fitted over `padded_megapixels` and priced
+        # against VRAM; the table would have said 3000.* **CF closed §9 with this clause.**
+        #
+        # **THE ESTIMATE IS STILL COMPUTED AND STILL RIDES OUT ON THE STATS.** *It is the
+        # record's `estimate` block and it carries the corpus, the reading count and the
+        # departure sentences — what changes is which number seeds the ETA the caller polls.*
+        # **A fit nobody refitted is not evidence and a ruled table is**, but deleting the fit
+        # would delete the only thing that says a job is outside its population.
+        #
+        # **`None` FROM THE LADDER FALLS BACK TO THE FIT RATHER THAN TO SILENCE.** *Above 8K the
+        # table has no row and CF has not ruled what to seed from* — so the estimator's answer,
+        # whatever it is, beats no ETA at all, and `eta_ladder` on the payload says the seed did
+        # not come from a ruled row. **`expect` drops a `None` rate on its own**, so a run with
+        # neither is the pre-seed behaviour F-2026-08-19-29 closed and not a new state.
+        seed, step = ladder.seconds_per_frame(
+            delivered_height, stats.get("n_out"), codec=codec)
+        progress.expect(seed if seed is not None else per_frame,
                         basis=(estimate or {}).get("basis") or estimator.BASIS,
-                        band_frac=(estimate or {}).get("band_frac"))
+                        band_frac=(estimate or {}).get("band_frac"),
+                        ladder=step)
+        print("[eta] seed {} s/frame from the {} step of CF's table ({})".format(
+            seed if seed is not None else per_frame, step,
+            "ruled row" if seed is not None else "no ruled row — the fit is standing in"),
+            flush=True)
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's

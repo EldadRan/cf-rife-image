@@ -25,6 +25,7 @@ import subprocess
 import time
 
 import envelope
+import ladder
 import probe
 
 from errors import INTERNAL, WorkerError
@@ -242,28 +243,12 @@ X265_RC_LOOKAHEAD = 10
 #: starves it.* **A portrait 1080x1920 clip has 1080p's pixel count and 30 CTU rows** — an area
 #: bucket hands it 16 pools against 30 rows and starves the encoder, which is the case a
 #: three-bucket table has no answer for at all.
-X265_RULED_HEIGHTS = {1080: "1080p", 2160: "4K", 4320: "8K"}
-
-#: **CF's ruled values, `docs/decisions.md` §11.** *`switch` is the DELIVERED FRAME COUNT the row
-#: changes at: below it takes `below`, at it and above takes `at`.* **Both switches sit on the
-#: safe side of a gap rather than at a measured boundary** — nothing ran between 480 and 1500
-#: delivered frames at either area — *so the more expensive setting starts earlier than the
-#: curves were seen to cross.*
-X265_RULED = {
-    "1080p": {"switch": None, "below": (16, 16), "at": (16, 16)},
-    "4K": {"switch": 1400, "below": (8, 32), "at": (16, 32)},
-    "8K": {"switch": 1200, "below": (16, 64), "at": (16, 32)},
-}
-
-#: HEVC's coding-tree-unit size, which is what makes the row count `height / 64`.
-CTU_SIZE = 64
-
-#: The derived row's `frame_threads`, for every resolution the table does not name. **CF's call
-#: and the reason is SPEED, not memory**: `ft` never separated on speed at any area, and the one
-#: place it measurably won is 1080p, where 16 is the ruled value. *This fleet does not come near
-#: its memory ceiling — the worst case measured is 20.42 GiB against the A40's 46.57 GiB slice.*
-#: **That headroom is known up to 8K and INFERRED above it**, so the first delivered frame larger
-#: than 8K is the one to read `encoder_peak_rss_gb` off before trusting this at that size.
+#: **THE TABLE ITSELF LIVES IN `ladder`, WHICH IS THE ONE HOME FOR CF's §11 ROWS.** *The settings
+#: and the ETA seed are the same rows — measured together, on the same runs — and `current.md`
+#: prints them as one table for that reason.* **Two modules holding half a table each would be two
+#: things to keep equal**, and the copy that rotted would be indistinguishable from the live one.
+#: *That is this project's central hazard, stated in `CLAUDE.md` about four repositories, arriving
+#: inside one.*
 DERIVED_FRAME_THREADS = 16
 
 
@@ -287,46 +272,6 @@ def area_row(delivered_pixels):
                 delivered_pixels, type(delivered_pixels).__name__))
     return (AREA_ROW_SMALL if delivered_pixels <= AREA_BOUNDARY_DELIVERED_PIXELS
             else AREA_ROW_LARGE)
-
-
-def derived_pools(delivered_height):
-    """`clamp(round(height / 64), 1, 64)` — the CTU-row rule, for a frame the table does not name.
-
-    **HALF-UP, AND PYTHON'S `round` IS NOT.** *`docs/decisions.md` §11 writes the rule as
-    `round(delivered_height / 64)` and then works the example: a 1440p job takes `pools 23`.*
-    **1440/64 is exactly 22.5, and `round(22.5)` is 22 in Python** — banker's rounding, which
-    breaks ties to even. *The worked example is the authority on what was intended and the
-    spelling is the authority on nothing, so this rounds half up and the divergence is filed to
-    the gate rather than resolved by picking the reading that needs no comment.*
-
-    **The clamp's ends are not decoration.** *Below 64 pixels of height there is less than one CTU
-    row and `pools 0` is not a setting; above 4096 the row count passes x265's own ceiling, which
-    `envelope.POOLS_RANGE` already refuses a caller for asking.*
-    """
-    rows = int(math.floor(float(delivered_height) / CTU_SIZE + 0.5))
-    return max(1, min(rows, 64))
-
-
-def x265_ruled_row(delivered_height, delivered_frames):
-    """The ruled `(frame_threads, pools)` for this frame, or `None` if the table does not name it.
-
-    **`None` IS A REAL ANSWER AND NOT A FAILURE** — it is every resolution CF did not measure,
-    which includes 1440p, every portrait clip and everything above 8K.
-
-    **A NAMED HEIGHT WITH AN UNKNOWN FRAME COUNT DOES NOT TAKE THE TABLE.** *Two of the three rows
-    switch on delivered frames, so a count of `None` cannot choose between them* — and picking
-    either silently would put the job on a row nobody selected, which is the whole failure the
-    third basis value exists to make visible.
-    """
-    name = X265_RULED_HEIGHTS.get(int(delivered_height))
-    if name is None:
-        return None
-    row = X265_RULED[name]
-    if row["switch"] is None:
-        return row["at"]
-    if delivered_frames is None:
-        return None
-    return row["at"] if int(delivered_frames) >= row["switch"] else row["below"]
 
 
 def x265_threading(frame_threads=None, pools=None, delivered_height=None,
@@ -358,19 +303,21 @@ def x265_threading(frame_threads=None, pools=None, delivered_height=None,
     pair `MasterWriter` is constructed with — §6d-1's pin, one surface over.
     """
     ruled = (None if delivered_height is None
-             else x265_ruled_row(delivered_height, delivered_frames))
+             else ladder.levers(delivered_height, delivered_frames, "h265"))
     if ruled is not None:
         default_ft, default_pools = ruled
         unsent_basis = BASIS_DEFAULT
     elif delivered_height is not None:
-        default_ft, default_pools = DERIVED_FRAME_THREADS, derived_pools(delivered_height)
+        default_ft, default_pools = (DERIVED_FRAME_THREADS,
+                                     ladder.derived_pools(delivered_height))
         unsent_basis = BASIS_DERIVED
     else:
         # **A caller with no frame to key on gets the 1080p row and the record says `derived`.**
         # *There is no honest `default` here: `default` means CF ruled this frame's values, and
         # nothing ruled a frame nobody named.* **Reachable only by a direct caller** — `routec`
         # has the delivered size at the one site that builds the writer.
-        default_ft, default_pools = DERIVED_FRAME_THREADS, X265_RULED["1080p"]["at"][1]
+        default_ft, default_pools = (DERIVED_FRAME_THREADS,
+                                     ladder.levers(1080, None, "h265")[1])
         unsent_basis = BASIS_DERIVED
     values = {
         "frame_threads": default_ft if frame_threads is None else int(frame_threads),

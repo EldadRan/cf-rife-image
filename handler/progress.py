@@ -135,6 +135,10 @@ class Progress:
         #: payload with a fresh timestamp rather than letting `at` age past the interval the
         #: worker itself asked for.
         self._eta_basis = None
+        #: **Which step of CF's ruled table the SEED came from**, or `outside` where the table
+        #: names no row. *Set once by `expect` and never cleared: it describes the seed, and a
+        #: payload that has moved to `measured` still answers what the job was priced from.*
+        self._eta_ladder = None
         # **State lives here, not in `emitted`.** `_emit` is rate-limited, so anything read back
         # out of the emitted history is missing whatever the limiter dropped. Reading
         # `frames_done` from that list made the ETA compute against zero frames done and report
@@ -146,7 +150,7 @@ class Progress:
         #: no history and CF's only account of how the estimate behaved is what is returned.
         self.emitted = []
 
-    def expect(self, seconds_per_frame, basis=None, band_frac=None):
+    def expect(self, seconds_per_frame, basis=None, band_frac=None, ladder=None):
         """Seed the rate the planner already predicted, before any work has been done.
 
         **So that an ETA exists during the model stretch** (F-2026-08-19-29). `eta_s` answered
@@ -182,6 +186,19 @@ class Progress:
                 self._band_frac = float(band_frac)
         except (TypeError, ValueError):
             pass
+        # **`eta_ladder` IS A SECOND FIELD AND NOT A FOURTH `eta_basis` VALUE.** *`eta_basis`
+        # answers HOW this ETA was computed — predicted from a seed, or measured from this run's
+        # own frames — and that axis is unchanged for a frame the table does not name: it is
+        # still a prediction, and it still becomes `measured` on the second emission.* **Folding
+        # "which row" into it would make one field answer two questions and cost the payload the
+        # ability to say the thing `eta_basis` exists to say.** *That is `bit_depth`-inside-`codec`
+        # one surface over, and §11's third basis value rested on the same argument.*
+        #
+        # **Taken independently of both the rate and the band, because all three fail
+        # independently** — the step is known even where the seed is not, and above the ladder
+        # that is the only thing the payload can honestly carry.
+        if ladder:
+            self._eta_ladder = str(ladder)
 
     def plan_frames(self, count):
         """Name the planned output count once it is known, rather than at construction.
@@ -287,6 +304,11 @@ class Progress:
                 if seconds >= 1:
                     payload["eta_s"] = seconds
                     payload["eta_basis"] = self._eta_basis
+                    # **Beside the basis, and only where an ETA is.** *A step with no ETA
+                    # attached describes nothing a caller can act on; the field exists to
+                    # qualify the number next to it.*
+                    if self._eta_ladder is not None:
+                        payload["eta_ladder"] = self._eta_ladder
                     # **§19a/§19b: the spread, applied to the LIVE point and not the seed's.**
                     # `docs/current.md` §9b has required a point and a spread since the estimator was
                     # ruled; the estimator honours it in the record and this channel discarded it.
