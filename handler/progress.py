@@ -47,6 +47,19 @@ MIN_POLL_S = 5
 MIN_PASS_GAP_S = 1.0
 MAX_POLL_S = 90
 
+#: **THE CADENCE HOLDS AT `MAX_POLL_S` UNTIL THE JOB IS THIS FAR THROUGH ITS WORK** (CF's rule,
+#: `docs/decisions.md` §11). *Below it there is nothing a tighter poll can learn: the job is
+#: mid-stream and the next payload says the same thing as this one.*
+#:
+#: **75 IS THIS FILE'S CHOICE AND NOT CF's — THE RULE WAS RULED AND THE THRESHOLD WAS NOT.**
+#: *`F-2026-09-02-4`'s error profile is what it is read against: the estimate is at its best
+#: between 50 and 75 per cent (median 6%, p90 24%) and at its worst in the last tenth (median
+#: 18%, p90 76%).* **So tightening starts where the estimate is still trustworthy and the ending
+#: is close enough to be worth learning promptly** — and it keys on WORK, which is exactly why
+#: the last tenth's unreliability does not propagate into the cadence. *Reported to the gate as
+#: a number that wants ruling rather than left to be discovered as a constant.*
+TIGHTEN_ABOVE_PCT = 75
+
 #: **§18's coarse phases, and inside one of them `eta_s` and `eta_basis` are ABSENT**
 #: (`docs/archive/instrumentation-archive.md` §18d). *Not zero, not null, not a guess.*
 #:
@@ -341,7 +354,7 @@ class Progress:
                 name, "" if MIN_POLL_S <= half <= MAX_POLL_S else " (clamped)")
             payload["phase_expected_s"] = round(float(expected_s), 1)
         else:
-            payload["next_poll_s"] = self._next_poll_s(eta)
+            payload["next_poll_s"] = self._next_poll_s(eta, payload.get("pct"))
         # **The basis of the promise, published beside it** (CF ruling, 2026-08-20). A client that
         # can see the cadence the worker measured can check the promise rather than trust it, and
         # the whole cadence investigation had to be run from outside precisely because the
@@ -639,7 +652,7 @@ class Progress:
         self._eta_basis = basis
         return seconds
 
-    def _next_poll_s(self, eta):
+    def _next_poll_s(self, eta, pct=None):
         """**When the next news arrives — not how much work is left** (F-2026-08-20, cadence).
 
         This asked for a tenth of the remaining time, which is a statement about the *end of the
@@ -662,7 +675,53 @@ class Progress:
             # Half a pass: a client polling at this rate sees every payload at least once, which
             # is the property a mailbox needs. Clamped like everything else, because a cadence
             # measured from one very long pass is still a promise someone has to keep.
+            #
+            # **AND THE MAILBOX ARGUMENT DOES NOT APPLY TO ROUTE C** (CF, 2026-09-02). *It was
+            # designed so a client sees every payload, because `/status` overwrites and a missed
+            # PASS is news lost for ever. On a continuous frame counter every payload is a fresh
+            # snapshot of one quantity, so missing one costs nothing and only the latest
+            # matters.* **This branch is kept because it is true wherever passes exist** — and
+            # `pass_cadence_s` appears in zero of 6,791 retained route-C payloads, so it governs
+            # nothing here.
             return int(max(MIN_POLL_S, min(MAX_POLL_S, self._pass_cadence_s / 2.0)))
+        # ── CF's RULE: TIGHTEN ON WORK DONE, NOT ON TIME LEFT ─────────────────────────────
+        #
+        # **`eta / 10` WAS A STATEMENT ABOUT THE END OF THE JOB OFFERED IN ANSWER TO A QUESTION
+        # ABOUT THE NEXT UPDATE**, and this function's own docstring has called it that since it
+        # was written — *as a fallback for stretches with no passes to time.* **On this worker it
+        # is not the fallback, it is the rule**: route C's direct variant is one streaming loop
+        # with no passes at all.
+        #
+        # **AND IT CONVERGES ON THE FLOOR BY CONSTRUCTION**, so the polls cluster where least is
+        # left to learn: one delivered run spent its last 95 seconds making 11 polls.
+        #
+        # **FRAMES DELIVERED IS OBSERVED; SECONDS REMAINING IS INFERRED** — and
+        # `F-2026-09-02-4` prices the difference: at p90 a phase predicted to end in 60 s ends
+        # anywhere between 34 and 106.
+        if pct is not None:
+            work_left = max(0.0, 100.0 - float(pct))
+            if float(pct) < TIGHTEN_ABOVE_PCT:
+                return MAX_POLL_S
+            # **NEVER TIGHTEN WHILE THE WORK IS BEHIND WHAT THE ETA IMPLIES** — CF's second
+            # formulation, and it is the operative half: *if 90 per cent of the time has passed
+            # and only 80 per cent of the work is done, that is the moment NOT to tighten.* **The
+            # disagreement between the two is the signal**, and a rule reading only the clock
+            # cannot see it. *Implied progress is `elapsed / (elapsed + eta)` — where the job
+            # would be if time had tracked work.*
+            if eta is not None and eta > 0:
+                elapsed = max(0.0, time.time() - self._started)
+                implied = 100.0 * elapsed / (elapsed + float(eta))
+                if float(pct) < implied:
+                    return MAX_POLL_S
+            # Linear in the work that remains: `MAX_POLL_S` at the threshold, the floor at the
+            # last frame. **The span is the tightening band's own width**, so moving the
+            # threshold moves the whole ramp with it rather than leaving a step at one end.
+            span = max(1.0, 100.0 - TIGHTEN_ABOVE_PCT)
+            return int(max(MIN_POLL_S, min(MAX_POLL_S, MAX_POLL_S * work_left / span)))
+        # **NO `pct` MEANS THE RULE HAS NO SUBJECT.** *Work done is what it keys on, and a
+        # payload without it — the stretches before `plan_frames`, and the phases that carry no
+        # percentage — cannot be answered by a rule about work.* **The floor is what §18b already
+        # rules honest for having no information**, and this is that state rather than a new one.
         if eta is None:
             return MIN_POLL_S
         return int(max(MIN_POLL_S, min(MAX_POLL_S, eta / 10.0)))
