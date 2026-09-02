@@ -18,20 +18,29 @@ meaningful rather than decorative:
     yuv_s       rawvideo yuv420p to /dev/null   adds the output write, no colour conversion
     bgr_s       rawvideo bgr24 to /dev/null     adds swscale's yuv->BGR
 
-**IT IS NOT THE FIX.** `OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;8"` is a Dockerfile `ENV` and
-costs no code. **What this probe cannot do is say whether the BACKEND honoured it** — that
-variable is OpenCV's and these passes shell out to the ffmpeg CLI, which never reads it. So
-`decode_s` unchanged after the ENV lands reads two ways, *"honoured and threading did not help"*
-and *"never reached the decoder"*, and nothing here separates them.
+**IT IS NOT THE FIX, AND THE VARIABLE IT USED TO NAME WAS NEVER THE LEVER.**
+`OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;8"` is a Dockerfile `ENV`, and `F-2026-09-02-3`
+established from OpenCV 5.x source that it goes to `av_dict_parse_string` and then
+`avformat_open_input` — **the DEMUXER**. *The variable that sets decoder threads is
+`OPENCV_FFMPEG_THREADS`, and this image has never set it.* **So every run banked on this image
+decoded at whatever the auto path chose, not at 8**, and the paragraph that used to stand here
+said the probe could not tell whether the backend had honoured a setting that was never reaching
+the decoder at all.
 
-**WHAT IT DOES ANSWER IS THE BETTER QUESTION, AND IT NEEDS NO SECOND RUN.** `decode_s` wraps
-`capture.read()` (`routec.py:620`), which is the cv2 path and returns BGR; `bgr_s` is ffmpeg
-decoding the SAME source to the SAME format. **So `decode_s` against `bgr_s` is cv2 against
-ffmpeg on identical work, inside one record, with no A/B and no second job.**
+**WHAT ANSWERS IT IS A READ AND NOT A PASS.** `decode._decoder_threads` asks the capture for
+`CAP_PROP_N_THREADS` after open — `thread_count` off the codec context, the codec's own state
+rather than an echo of a variable. *A `0` is a result about the instrument, not a defect to
+chase; `None` is this build having no such property, which is a different fact and is filed as
+one.*
 
-- **Close** — the capture backend is fine and the ENV is not the lever, whatever it did.
-- **`decode_s` far larger** — the capture path is the defect regardless of what the variable did,
-  and that is worth knowing before anyone spends two runs toggling an environment variable.
+**AND THE `decode_s` AGAINST `bgr_s` COMPARISON IS REFUTED — `F-2026-09-01-5`, STRUCTURALLY.**
+*This docstring used to sell it as "cv2 against ffmpeg on identical work, inside one record, with
+no A/B and no second job", and drew two branches from the size of the gap.* **The probe runs
+AFTER the pipeline, so a CONTENDED read is being compared against an UNCONTENDED one** — the
+retime's decode competes with the model and the encoder for the same cores, and these three
+passes have the box to themselves. *No arming will ever make it one comparison.* **The two errors
+were independent and correcting only the environment variable would have left the larger one
+standing.**
 
 *One asymmetry, small and stated rather than discovered: `decode_s` also covers the surplus
 `grab()` sweep at `routec.py:847`, which is bounded at two frames by `SURPLUS_TOLERANCE_FRAMES`.*
@@ -50,14 +59,9 @@ import time
 #: block from a dict literal, and nothing ever compared the two. A list named as the single
 #: source of truth that nothing consults is worse than no list, because the next person trusts it.
 #:
-#: The block also carries `capture_options` and `elapsed_s`, which §11a does not name and the kit
-#: ignores. This tuple is the REQUIRED set, not the exact one.
+#: The block also carries `elapsed_s`, which §11a does not name and the kit ignores. This tuple
+#: is the REQUIRED set, not the exact one.
 FIELDS = ("entropy_s", "yuv_s", "bgr_s", "frames", "threads")
-
-#: The env var item 2 sets on the image. Reported so a reading can be attributed to a
-#: configuration rather than to a guess about one — a probe that cannot say what the backend was
-#: told is a probe whose number nobody can reproduce.
-CAPTURE_OPTIONS_ENV = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
 
 #: Per pass. A 600-frame 8K decode is minutes; three of them plus the retime must still fit
 #: inside a job, and a pass that hangs must not take the master with it.
@@ -81,11 +85,12 @@ TIMEOUT_S = 1800
 #: the case where this is invisible.
 _VIDEO_ONLY = ("-map", "0:v:0", "-an")
 
-#: **Threading is stated rather than inherited.** The ffmpeg CLI does not read
-#: `OPENCV_FFMPEG_CAPTURE_OPTIONS` — that variable is OpenCV's — so these passes would otherwise
-#: run at ffmpeg's own `-threads 0` auto default while the block reported OpenCV's setting beside
-#: them. **A number measured under one configuration and labelled with another is the shape this
-#: project keeps finding**, so the passes name their own and the block reports both.
+#: **Threading is stated rather than inherited.** *These passes would otherwise run at ffmpeg's
+#: own `-threads 0` auto default and the block would carry a number nobody could reproduce.*
+#: **A number measured under one configuration and labelled with another is the shape this
+#: project keeps finding**, so the passes name their own. *The block used to report an OpenCV
+#: environment variable beside it as "the capture backend's setting"; that field is deleted —
+#: the variable reached the demuxer, not the decoder.*
 PROBE_THREADS = "8"
 
 
@@ -152,21 +157,27 @@ def run(path, frames, log=print):
                  # one — the probe shells out to the ffmpeg CLI and never goes through OpenCV, so
                  # it cannot report on the backend by measuring itself.
                  "threads": PROBE_THREADS,
-                 "capture_options": os.environ.get(CAPTURE_OPTIONS_ENV) or "unset",
+                 # **`capture_options` IS DELETED FROM THIS BLOCK — CF, 2026-09-02.** *It filed
+                 # `OPENCV_FFMPEG_CAPTURE_OPTIONS` as the capture backend's configuration, and
+                 # `F-2026-09-02-3` established that the variable reaches `avformat_open_input`
+                 # — the DEMUXER. The decoder's thread count is `OPENCV_FFMPEG_THREADS`, which
+                 # this image has never set.* **A record field that names one decoder and reports
+                 # another is worse than an absent one, because it is indistinguishable from a
+                 # true reading** — and it was read as one for as long as it existed. *What
+                 # answers the question it was pretending to answer is `decode._decoder_threads`,
+                 # which asks the codec context rather than the environment.*
                  "elapsed_s": round(time.perf_counter() - started, 3)}
         missing = [f for f in FIELDS if f not in block]
         if missing:
             log("[decode-probe] block is missing {} — not filed".format(", ".join(missing)))
             return None
-        # **The two thread facts are printed as two facts.** The first draft of this line
-        # formatted `block["threads"]` — which is what THESE passes ran at — under the
-        # `OPENCV_FFMPEG_CAPTURE_OPTIONS` label, so the log said `OPENCV_FFMPEG_CAPTURE_
-        # OPTIONS=8` on a box where that variable was unset. The field split of F5 was
-        # pointless if the log put them back together.
+        # **ONE THREAD FACT NOW, AND IT IS THE ONE THESE PASSES RAN AT.** *The line used to
+        # print the capture backend's environment variable beside it, after an earlier draft had
+        # printed this number under that variable's label — two facts confused, then split, and
+        # now one of them deleted because it was never about the decoder.*
         log("[decode-probe] entropy {:.1f}s, +yuv {:.1f}s, +bgr {:.1f}s over {} frames "
-            "(these passes: -threads {}; capture backend: {}={})".format(
-                entropy, yuv - entropy, bgr - yuv, block["frames"], block["threads"],
-                CAPTURE_OPTIONS_ENV, block["capture_options"]))
+            "(these passes: -threads {})".format(
+                entropy, yuv - entropy, bgr - yuv, block["frames"], block["threads"]))
         # **Reported, not enforced.** §11c is the kit's check and this is the worker's own
         # reading of it — a probe that refused to file an out-of-order result would delete the
         # evidence that it measured something other than what it names.

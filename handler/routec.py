@@ -1242,6 +1242,15 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                     # only as positive, so nothing refuses one. A derived `n_in` would have
                     # failed a clean run on the identity the gate is graded by.
                     n_in=decoded.decoded,
+                    # **§11's read-back, and it is a READ rather than a control.** *`decode`
+                    # asks the capture what `thread_count` the codec context actually holds,
+                    # after open.* **The request field that would have SET it is dropped, not
+                    # deferred** — its lever sets the decoder and the colour conversion from one
+                    # value and cannot be split, and the conversion runs at the container's full
+                    # core count. *`0` is the property answering and `None` is this build having
+                    # no such property; they are different facts and are filed as different
+                    # values.*
+                    decoder_threads=shape.get("n_threads"),
                     # **§5-0, and it travels beside `estimate` for the same reason** — `retime`
                     # is handed no `trace`. `handler._retime` lifts it to the record's TOP level
                     # rather than filing it under `retime`, because the kit grades

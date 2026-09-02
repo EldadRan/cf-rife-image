@@ -240,26 +240,24 @@ ENV IMAGE_TAG=${IMAGE_REF} \
     BUILD_UTC=${BUILD_UTC} \
     WORKER_VERSION=${WORKER_VERSION}
 
-# **`decode_s` IS 106.8 s AT 8K — 18.70% of `compute_s`, larger than the entire conversion
-# pipeline two waves were spent deleting** (`docs/archive/instrumentation-archive.md` §11). And the pointer that
-# says this is worth trying: **the worker decodes at 0.556 s/frame where a laptop's
-# SINGLE-THREADED ffmpeg does the same file at 0.285** — so the capture backend is very likely
-# not threading at all.
+# **THE `OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;8"` LINE THAT STOOD HERE IS DELETED, AND SO ARE
+# THE FIFTEEN COMMENT LINES THAT EXPLAINED IT.** *`F-2026-09-02-3`, read from OpenCV 5.x source
+# 2026-09-02: that variable goes to `av_dict_parse_string` and then `avformat_open_input` — THE
+# DEMUXER. The variable that sets decoder threads is `OPENCV_FFMPEG_THREADS`, and this image has
+# never set it.*
 #
-# **This is the whole of item 2 and it is deliberately zero code.** OpenCV's FFmpeg backend reads
-# this variable and passes the options straight to libavcodec; `threads;8` asks for frame
-# threading. **Expect roughly 3x, not linear** — h264 frame threading is bounded by the
-# dependency structure of the stream, not by core count.
+# **SO THE ENV WAS INERT AND FOUR DOCUMENTS DESCRIBED IT AS EFFECTIVE.** *`nThreads` stayed 0,
+# `fill_codec_context`'s auto path bound, and every run banked on this image decoded at
+# `min(getNumberOfCPUs(), 16)` rather than at 8.* **The comment claimed the options went
+# "straight to libavcodec" and that the setting could not be a request field even in principle —
+# both wrong, and the second one wrong about a different variable than the one it named.**
 #
-# **A DOCKERFILE `ENV` AND NOT A REQUEST FIELD, and that is consistent with CF's rule rather than
-# an exception to it.** The rule is that a per-JOB control belongs in the request; this is a
-# property of how the image is built and would be identical on every job. It also cannot be a
-# request field even in principle: OpenCV reads it once, when the capture backend initialises.
-#
-# **NOTHING HERE PROVES IT WORKED.** `params.decode_probe` (§11) is what says whether the
-# backend honoured it and what is left — and `decode_s` being unchanged after this lands is
-# itself the answer, not a null result.
-ENV OPENCV_FFMPEG_CAPTURE_OPTIONS="threads;8"
+# **NOTHING REPLACES IT, AND THAT IS A RULING RATHER THAN AN OMISSION (CF, 2026-09-02).** *The
+# decoder thread count as a request field is DROPPED, not deferred: its lever is
+# `CAP_PROP_N_THREADS`, which sets the decoder AND the colour conversion from one value and
+# cannot be split — and the scaler cap is dead.* **What survives is a READ**:
+# `decode._decoder_threads` asks the codec context what `thread_count` it actually holds, so the
+# number reaches the record as a measurement instead of as a configuration nobody verified.
 
 # ── this repo's code, last ──────────────────────────────────────────────────────────────────
 # **`*.py` is currently everything the handler needs, and that has not always been true.**

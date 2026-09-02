@@ -74,4 +74,38 @@ def open_source(source_path):
         raise
     # **Outside the `try` on purpose.** A `return` inside it would put the success path one
     # editing mistake away from releasing the capture it is handing to the caller.
-    return capture, {"fps": fps, "width": width, "height": height}
+    return capture, {"fps": fps, "width": width, "height": height,
+                     "n_threads": _decoder_threads(capture)}
+
+
+def _decoder_threads(capture):
+    """`CAP_PROP_N_THREADS` after open — **the codec's own thread count, or `None`**.
+
+    **THIS IS THE ONE LINE THAT TURNS "the decoder runs at 16" FROM A READING OF UPSTREAM SOURCE
+    INTO A MEASUREMENT.** *`F-2026-09-02-3` established from OpenCV 5.x source that
+    `OPENCV_FFMPEG_CAPTURE_OPTIONS` reaches `avformat_open_input` — the DEMUXER — and that the
+    decoder's thread count is `OPENCV_FFMPEG_THREADS`, which this image has never set.* **So
+    every banked run decoded at whatever the auto path chose**, and the Dockerfile comment, the
+    probe's docstring and two documents all described a variable that was doing something else.
+
+    **A `0` IS A RESULT AND NOT A DEFECT TO CHASE (CF, 2026-09-02).** *The read rests on a source
+    reading nobody in this project has corroborated; if the property returns the cached member
+    rather than the codec's live state it reads 0.* **That is an answer about the INSTRUMENT and
+    it gets recorded like any other.**
+
+    **`None` IS A THIRD STATE AND NOT THE SAME AS `0`.** *`0` is the property answering; `None` is
+    this build having no such property to ask, or the read raising.* **Recording them as one
+    number would make "the instrument is absent" indistinguishable from "the instrument says
+    zero"** — which is the whole failure the read exists to end, re-made one layer down.
+    """
+    prop = getattr(cv2, "CAP_PROP_N_THREADS", None)
+    if prop is None:
+        return None
+    try:
+        value = capture.get(prop)
+    except BaseException:  # noqa: BLE001 — a measurement must never cost a delivered master
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
