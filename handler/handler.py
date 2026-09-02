@@ -160,6 +160,46 @@ _SAID_BOOT = []
 #: dropping it.
 
 
+#: **How often a transfer publishes, and it is a THROTTLE rather than a cadence.** *`storage`
+#: reports every chunk because it should not be deciding a poll interval; this is where that
+#: decision lives.* **Below the client's own poll floor on purpose** — a payload the client never
+#: fetches costs nothing, and a transfer that publishes less often than the client polls is a
+#: transfer the client watches go stale.
+BYTE_REPORT_INTERVAL_S = 3.0
+
+
+def _byte_reporter(progress, phase_name, pct=None):
+    """A throttled `on_bytes(done, expected)` that publishes `phase_name` with the byte counts.
+
+    **`bytes_expected` MAY BE UNKNOWABLE AND THE PHASE MUST STILL EMIT.** *A name and an elapsed
+    time and no percentage is strictly better than silence, and it is the shape `draining`
+    already ships.* So an absent expectation drops the key rather than filing a zero — *a zero
+    there is a number, and it would read as a transfer of nothing.*
+
+    **NOTHING IN HERE MAY RAISE INTO THE TRANSFER.** *The bytes are already moving; a progress
+    payload that abandons a fetch or an upload has cost the delivery it was reporting on.* The
+    callers treat a raising callback as a dead one and stop calling it, which is the same rule
+    from the other side.
+    """
+    state = {"last": 0.0}
+
+    def report(done, expected):
+        now = time.time()
+        if now - state["last"] < BYTE_REPORT_INTERVAL_S:
+            return
+        state["last"] = now
+        facts = {"bytes_done": int(done)}
+        if expected:
+            facts["bytes_expected"] = int(expected)
+        try:
+            progress.phase(phase_name, pct=pct, force=True, **facts)
+        except Exception as exc:  # noqa: BLE001 — never at the cost of the transfer
+            print("[progress] {} bytes not emitted ({}: {})".format(
+                phase_name, type(exc).__name__, exc), flush=True)
+
+    return report
+
+
 def handle(job_input, job=None):
     started = time.time()
     machine = hardware.read()
@@ -333,9 +373,25 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # still spent the time and the record must account for it or `wall_s` stops adding up; how
     # many bytes arrived before it failed is not something `fetch_source` can say, and 0 would be
     # a number rather than an absence.
+    # **THE FETCH ANNOUNCES ITSELF BEFORE IT STARTS, AND THAT IS THE WHOLE OF THE SILENCE.**
+    # *The first UNCONDITIONAL emission on this path was `progress.phase("load", …)` further
+    # down; the one above it is gated on `request.get("tie_check")` and is not on a production
+    # run at all.* **CF measured 176 seconds of silence on a 780 MB source** — two `[quiet]`
+    # notices, and a healthy job indistinguishable from a dead one. *Every source this project
+    # had tested fetched in about two seconds, so the defect was a function of the input.*
+    #
+    # **Wrapped, because an emit must never cost a delivery** — the same rule every other emit on
+    # this path already follows.
+    try:
+        progress.phase("fetching", pct=1, force=True)
+    except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
+        print("[progress] fetching phase not emitted ({}: {})".format(
+            type(exc).__name__, exc), flush=True)
     fetch_started = time.time()
     try:
-        fetch_bytes = storage.fetch_source(request["source_url"], download)
+        fetch_bytes = storage.fetch_source(
+            request["source_url"], download,
+            on_bytes=_byte_reporter(progress, "fetching", pct=1))
     finally:
         _note(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))
     _note(trace, "transfer", "fetch_bytes", fetch_bytes)
@@ -611,7 +667,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     upload_started = time.time()
     try:
         master_key = storage.upload(client, request["output"], master, master_path,
-                                    keys.content_type(master))
+                                    keys.content_type(master),
+                                    on_bytes=_byte_reporter(progress, "uploading"))
     finally:
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
     _note(trace, "transfer", "upload_bytes", upload_bytes)

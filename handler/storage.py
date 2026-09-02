@@ -48,8 +48,18 @@ CREDENTIAL_ERROR_CODES = {
 }
 
 
-def fetch_source(source_url, destination):
+def fetch_source(source_url, destination, on_bytes=None):
     """Stream the presigned GET to disk. No media ever arrives in the payload.
+
+    **`on_bytes(done, expected)` IS CALLED PER CHUNK AND `expected` MAY BE `None`.** *The whole
+    fetch ran in silence until 2026-09-02: `handler` started the download and the next
+    unconditional emission was the interpolator load, so a 780 MB source produced 176 seconds in
+    which a healthy job was indistinguishable from a dead one — two `[quiet]` notices and
+    nothing else.* **The defect was a function of the INPUT and not of the code**, which is why
+    it survived: every source this project had tested fetched in about two seconds.
+
+    *The caller throttles; this reports every chunk, because the rate at which bytes arrive is
+    not something this function should be deciding a poll cadence from.*
 
     **Returns the byte count, which it has always had and always discarded**
     (`docs/archive/instrumentation-archive.md` §8a). `received` below is measured to check the transfer against
@@ -67,10 +77,27 @@ def fetch_source(source_url, destination):
         )
         response.raise_for_status()
         declared = response.headers.get("Content-Length")
+        # **`None` WHEN THE SERVER DID NOT SAY, AND THE PHASE MUST STILL EMIT.** *A name and an
+        # elapsed time with no percentage is strictly better than silence, and it is the shape
+        # `draining` already ships.* A chunked or compressed response has no length to declare.
+        try:
+            expected = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            expected = None
+        done = 0
         with open(destination, "wb") as handle:
             for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
                 if chunk:
                     handle.write(chunk)
+                    done += len(chunk)
+                    if on_bytes is not None:
+                        # **A reporting failure must not lose the transfer.** *The bytes are on
+                        # disk; a raising callback would abandon a fetch that is succeeding, for
+                        # a progress payload.*
+                        try:
+                            on_bytes(done, expected)
+                        except Exception:  # noqa: BLE001 — an emit never costs a delivery
+                            on_bytes = None
     except requests.exceptions.RequestException as exc:
         raise WorkerError(SOURCE_FETCH_FAILED, "could not fetch source_url: {}".format(exc))
 
@@ -113,13 +140,35 @@ def client_for(output):
     )
 
 
-def upload(client, output, name, path, content_type):
-    """Write one file under the prefix. The key is deterministic, so a re-run overwrites."""
+def upload(client, output, name, path, content_type, on_bytes=None):
+    """Write one file under the prefix. The key is deterministic, so a re-run overwrites.
+
+    **`on_bytes(done, expected)` reports absolute bytes**, not boto3's per-part delta — the
+    accumulation happens here so every caller does not repeat it, and `expected` is the file's
+    own size, which is known before the first byte moves.
+    """
     import botocore.exceptions
     from boto3.s3.transfer import TransferConfig
 
     prefix = output["prefix"]
     key = "{}{}".format(prefix if prefix.endswith("/") else prefix + "/", name)
+    #: **boto3 hands the callback a DELTA and the phase wants a total.** *Accumulated here, and
+    #: the expected figure is read once before the transfer rather than per part.*
+    progressed = {"done": 0, "on_bytes": on_bytes}
+    try:
+        expected = os.path.getsize(path)
+    except OSError:
+        expected = None
+
+    def _relay(delta):
+        progressed["done"] += int(delta)
+        if progressed["on_bytes"] is None:
+            return
+        try:
+            progressed["on_bytes"](progressed["done"], expected)
+        except Exception:  # noqa: BLE001 — an emit never costs a delivered master
+            progressed["on_bytes"] = None
+
     try:
         # upload_fileobj switches to multipart above the threshold and stays a single PUT below
         # it, so a poster keeps exactly the behaviour a single PUT would have given it.
@@ -129,6 +178,7 @@ def upload(client, output, name, path, content_type):
                 output["bucket"],
                 key,
                 ExtraArgs={"ContentType": content_type},
+                Callback=_relay if on_bytes is not None else None,
                 Config=TransferConfig(
                     multipart_threshold=MULTIPART_THRESHOLD_BYTES,
                     multipart_chunksize=MULTIPART_CHUNK_BYTES,
