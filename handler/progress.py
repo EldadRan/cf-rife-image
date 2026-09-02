@@ -52,12 +52,26 @@ MAX_POLL_S = 90
 #: mid-stream and the next payload says the same thing as this one.*
 #:
 #: **75 IS THIS FILE'S CHOICE AND NOT CF's — THE RULE WAS RULED AND THE THRESHOLD WAS NOT.**
-#: *`F-2026-09-02-4`'s error profile is what it is read against: the estimate is at its best
-#: between 50 and 75 per cent (median 6%, p90 24%) and at its worst in the last tenth (median
-#: 18%, p90 76%).* **So tightening starts where the estimate is still trustworthy and the ending
-#: is close enough to be worth learning promptly** — and it keys on WORK, which is exactly why
-#: the last tenth's unreliability does not propagate into the cadence. *Reported to the gate as
-#: a number that wants ruling rather than left to be discovered as a constant.*
+#:
+#: **AND THE FIRST DEFENCE WRITTEN HERE WAS WRONG ABOUT THE EVIDENCE IT CITED.** *It said
+#: tightening starts where the estimate is still trustworthy.* **`F-2026-09-02-4` says the
+#: opposite about this boundary**: the estimate is at its best from 50 to 75 per cent (median 6%,
+#: p90 24%) and is ALREADY DEGRADING from 75 to 90 (median 11%), before collapsing in the last
+#: tenth (median 18%, p90 76%). *So 75 is not inside the trustworthy region — it is the edge of
+#: it, and a comment claiming otherwise invites the next reader to move the number in the
+#: direction the evidence refuses.*
+#:
+#: **WHAT ACTUALLY DEFENDS 75 IS THAT THE CADENCE DOES NOT READ THE ESTIMATE.** *It keys on WORK
+#: DONE — frames delivered, observed — so the estimate's decay past this point never reaches the
+#: interval at all.* **That is the whole reason CF's rule is worth having**, and it means the
+#: threshold can sit exactly where the estimate stops being good without inheriting anything from
+#: what happens after. **75 is a boundary `F-2026-09-02-4`'s own bands draw**, not a round number
+#: chosen for feel — which is the property that makes it defensible and the property a
+#: replacement would have to keep.
+#:
+#: *The gate supplied this argument after refuting the first one; the value is CF's to rule.*
+#: **A constant defended by a wrong argument is one somebody later moves for a good-looking wrong
+#: reason.**
 TIGHTEN_ABOVE_PCT = 75
 
 #: **§18's coarse phases, and inside one of them `eta_s` and `eta_basis` are ABSENT**
