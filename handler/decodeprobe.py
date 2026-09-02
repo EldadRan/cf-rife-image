@@ -123,8 +123,6 @@ def run(path, frames, log=print):
     reports the number the retime actually decoded, and the ordering check below is what says
     the probe measured what it names.
     """
-    import os  # noqa: PLC0415 — trivial, but this module is imported only when asked
-
     started = time.perf_counter()
     try:
         # **Checked BEFORE the first subprocess, not after the third.** The first cut built the
