@@ -1,4 +1,4 @@
-"""Release 3's request surface: the codec, the retime-only spelling, the interpolation block.
+"""The request surface: the codec, the bit depth, the retime's own fields.
 
 `fable/envelope_oracle.py` is this section of the contract executable and is the authority — if
 this file and that one disagree, one of them is a bug and it gets a decision entry rather than a
@@ -12,7 +12,7 @@ there, and the one property protecting production — that a request carrying no
 behaves exactly as it did — is easiest to keep true when the new surface is one file that can be
 read end to end.
 """
-from errors import INVALID_FIELD_VALUE, MISSING_REQUIRED_FIELD, WorkerError
+from errors import FIELD_NOT_SUPPORTED, INVALID_FIELD_VALUE, WorkerError
 
 #: **`source` means "match the input's codec"**, which is a release-3 field and not a default.
 CODECS = ("h264", "h265", "source")
@@ -42,9 +42,60 @@ DEFAULT_POOLS = 16
 #: how much the encoder allocates on a path §1 says has no host guard, so an unbounded value is a
 #: memory bound handed to the caller. *`frame-threads` above a small number multiplies the frames
 #: in flight; `pools` above the visible core count buys nothing and costs scheduling.*
-#: Every key `params.output` may carry. **One home, and the refusal above reads it** — a field
-#: added without joining this tuple is refused by name, which is the outcome a caller can act on.
-OUTPUT_FIELDS = ("codec", "bit_depth", "frame_threads", "pools")
+#: Every key `params.output` may carry, SPLIT BY WHICH LIST IT IS ON. **One home, and the
+#: refusal in `derive` reads both** — a field added without joining one of them is refused by
+#: name, which is the outcome a caller can act on.
+#:
+#: **THE TWO THREADING LEVERS ARE DEBUG NAMES AS OF THE STRICT SURFACE (CF, 2026-09-02).** *They
+#: are encoder internals: a caller with no basis to choose between wavefront settings should not
+#: be choosing, and the worker's own defaults govern a production job.* **Sending either without
+#: `debug: true` is refused BY NAME rather than ignored**, which is the distinction the whole
+#: strictness rule rests on.
+OUTPUT_PRODUCTION_FIELDS = ("codec", "bit_depth")
+OUTPUT_DEBUG_FIELDS = ("frame_threads", "pools")
+OUTPUT_FIELDS = OUTPUT_PRODUCTION_FIELDS + OUTPUT_DEBUG_FIELDS
+
+
+def refuse_field(name, where, gated):
+    """The two refusals a strict request can produce, spelled once for every level.
+
+    **THEY ARE DIFFERENT FACTS ABOUT THE REQUEST AND THE MESSAGES SAY WHICH.** *A DEBUG name
+    arriving without `debug: true` is a name this contract DEFINES, arriving in the wrong state;
+    an unlisted name is one the contract does not define at all.* **Calling a defined field
+    unknown would be a false statement in an error message** — and the caller's next action
+    differs: one adds a flag, the other fixes a typo or stops sending the field.
+
+    *CF ruled the behaviour 2026-09-02 — strict at every level, a debug name without the flag is
+    refused. The STRING was still unruled when this was written; the gate's reading is what is
+    built, and one string and one branch is the cost if CF rules otherwise.*
+    """
+    if gated:
+        raise WorkerError(
+            FIELD_NOT_SUPPORTED,
+            "field '{}' {} is a debug field and this request did not set 'debug: true'. It is "
+            "defined by this contract and refused in this state rather than ignored: send "
+            "'debug: true' at the top level to use it, or drop it.".format(name, where))
+    raise WorkerError(
+        FIELD_NOT_SUPPORTED,
+        "field '{}' {} is not a field this worker accepts. Every field in a request is named by "
+        "the contract or the request is refused — nothing is silently ignored.".format(
+            name, where))
+
+
+def refuse_unlisted(present, production, debug, where, debug_on):
+    """Every name in `present` is production, or debug with the flag, or REFUSED.
+
+    **The order matters: a debug name is checked before it is called unknown**, so the caller who
+    sent a real field in the wrong state is never told their field does not exist.
+    """
+    for name in sorted(present):
+        if name in production:
+            continue
+        if name in debug:
+            if debug_on:
+                continue
+            refuse_field(name, where, gated=True)
+        refuse_field(name, where, gated=False)
 
 FRAME_THREADS_RANGE = (1, 16)
 POOLS_RANGE = (1, 64)
@@ -69,13 +120,13 @@ DEFAULT_BIT_DEPTH = 8
 #: CF: request-carried, default 60.
 DEFAULT_TARGET_FPS = 60.0
 
-#: Relative to the upscale. **No default** — Phase 2's A/B rules it.
-ROUTES = ("before", "after")
-
-#: The two spellings of "what size do you want", either of which satisfies the release-2 rule.
-SIZING_FIELDS = ("target_short_edge_px", "output_size")
-
-INTERPOLATE_FIELDS = ("target_fps", "snap_tolerance", "route")
+#: **`target_fps` AND `snap_tolerance` SIT IN `params` AND THE `interpolate` BLOCK IS GONE.**
+#: *That block was the seeded worker's switch between upscaling and retiming; with one capability
+#: it discriminates nothing, and it cost `target_fps` a refusal at the top level for want of it.*
+#: **`route` went with it and was DELETED rather than moved** — it named where interpolation sat
+#: RELATIVE TO THE UPSCALE, and the same argument that deletes the block deletes it. (CF,
+#: 2026-09-02.)
+RETIME_FIELDS = ("target_fps", "snap_tolerance")
 
 
 def _threading_lever(output, name, bounds):
@@ -99,20 +150,31 @@ def _threading_lever(output, name, bounds):
     return value
 
 
-def derive(params):
-    """`params` in, a normalised release-3 config out, or `WorkerError`.
+def derive(params, debug=False):
+    """`params` in, a normalised config out, or `WorkerError`.
 
-    **Absent fields produce the release-2 answer exactly**, which is the property that lets the
-    development tier run this code while other tiers serve customers.
+    **THE UPSCALE PATH IS GONE FROM HERE, AND WITH IT THE SHAPE OF THIS FUNCTION.** *It used to
+    answer "is this a retime or an upscale" first and everything else after; `upscale: false` was
+    the explicit retime spelling, an omitted `upscale` meant an upscale, and `validation` then
+    refused that default request shape by name.* **One capability means the question no longer
+    discriminates**, so `upscale`, the two sizing fields, the `interpolate` block and `route` are
+    all DELETED rather than defaulted, and `target_fps` and `snap_tolerance` sit in `params`
+    where every other per-job field already sat. (CF, 2026-09-02.)
+
+    **`release_2_equivalent` AND `default_off_identity` WENT WITH IT.** *They asserted that a
+    request carrying none of release 3's fields behaves as release 2 did — and a release-2
+    request is an upscale request, which is now refused at the door.* **An assertion about a
+    request shape the worker no longer accepts cannot fail and cannot pass**, which is worse than
+    no assertion: it reads as protection.
+
+    `debug` gates the DEBUG names in `params.output`; the levels above are `validation`'s, which
+    is the module that reads the flag off the top level.
     """
     params = dict(params or {})
-    interpolate = params.get("interpolate")
-    upscale = params.get("upscale")
     output = dict(params.get("output") or {})
-    # **UNKNOWN KEYS IN `params.output` ARE REFUSED BY NAME**, exactly as `interpolate`'s are
-    # below and as `validation._refuse_unknown` does for `params` and the destination block.
-    # Nothing checked this sub-object until §6i, and the gap was invisible while its only fields
-    # were enums a typo turned into a refusal anyway.
+    # **UNKNOWN KEYS IN `params.output` ARE REFUSED BY NAME, AND SO ARE DEBUG KEYS WITHOUT THE
+    # FLAG.** Nothing checked this sub-object until §6i, and the gap was invisible while its only
+    # fields were enums a typo turned into a refusal anyway.
     #
     # **§6i PUT TWO NUMBERS BEHIND IT AND THAT CHANGES THE FAILURE.** The x265 spelling is
     # `frame-threads`, hyphenated, in every comment and document in this tree — so the natural
@@ -123,13 +185,8 @@ def derive(params):
     # believing a bound is in force" — and `x265_params`' own F-2026-08-28-7 hazard, where x265
     # discards an unknown NAME without a word, re-made one layer up at the request.* Found in
     # review.
-    unknown_output = sorted(set(output) - set(OUTPUT_FIELDS))
-    if unknown_output:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "unknown field(s) in 'params.output': {}. Known: {}.".format(
-                unknown_output, sorted(OUTPUT_FIELDS)))
-    has_size = any(params.get(field) is not None for field in SIZING_FIELDS)
+    refuse_unlisted(output, OUTPUT_PRODUCTION_FIELDS, OUTPUT_DEBUG_FIELDS,
+                    "in 'params.output'", debug)
 
     codec = output.get("codec", DEFAULT_CODEC)
     if codec not in CODECS:
@@ -166,123 +223,35 @@ def derive(params):
             "not a codec name — 10 selects HEVC main10 and is refused on h264.".format(
                 BIT_DEPTHS, bit_depth))
 
-    # **`upscale: false` is explicit, and the tempting spelling was a trap.** Letting a missing
-    # size field mean "no upscale" needs no new field and reuses the sizing refusal as the
-    # discriminator — and a caller who wants interpolation AND an upscale but forgets the size
-    # field would then silently receive a retime instead of an error. This project has paid for
-    # the silent-reinterpretation class twice: an endpoint renamed by a defaulted `--name`, and
-    # 16-bit sources downconverted without a word. A forgotten field must still refuse; a
-    # deliberate retime says so in words.
-    if upscale is not None:
-        if upscale is not False:
-            raise WorkerError(
-                INVALID_FIELD_VALUE,
-                "field 'upscale' is not a toggle: the only legal value is false, which asks for "
-                "a retime with no upscaling. Omit it to upscale.")
-        if has_size:
-            raise WorkerError(
-                INVALID_FIELD_VALUE,
-                "'upscale: false' contradicts a sizing field. A retime does not resize, so say "
-                "one or the other.")
-        if interpolate is None:
-            raise WorkerError(
-                MISSING_REQUIRED_FIELD,
-                "'upscale: false' with no 'interpolate' asks the worker to do nothing.")
-    elif not has_size:
-        # Release-2 behaviour, restated only because release 3 must not weaken it.
-        raise WorkerError(
-            MISSING_REQUIRED_FIELD,
-            "a request must say what size it wants: either 'target_short_edge_px' (one edge, "
-            "aspect preserved) or 'output_size' as {'width': W, 'height': H} (an exact canvas). "
-            "Neither was given in 'params'.")
-
-    if interpolate is None:
-        # **Named at the top level, they mean nothing and are refused rather than ignored.** A
-        # caller who put `target_fps` beside `params` instead of inside `interpolate` has asked
-        # for something; silence would deliver the opposite of it.
-        for orphan in INTERPOLATE_FIELDS:
-            if orphan in params:
-                raise WorkerError(
-                    INVALID_FIELD_VALUE,
-                    "field '{}' has no meaning without 'interpolate'".format(orphan))
-        # **Both §6i levers are on THIS return too, and that is not tidiness.** A config key that
-        # exists on one return path and not the other makes every reader of it correct on one
-        # path and a `KeyError` on the other — the shape that cost a live job earlier today, one
-        # repository over. *They are `None` here for the same reason they are `None` anywhere the
-        # caller said nothing: absence stays absence until the encoder resolves it.*
-        return {"codec": codec, "bit_depth": bit_depth, "interpolate": None, "upscale": True,
-                "frame_threads": frame_threads, "pools": pools,
-                # **`bit_depth` joins the equivalence test rather than riding beside it.** A
-                # 10-bit request is not what a release-2 caller sends, and `default_off_identity`
-                # asserts that the DEFAULT path is unmoved — which stays true, because an omitted
-                # field is 8.
-                #
-                # **And the two threading levers join it for the same reason**: a request naming
-                # either is not a release-2 request, and an omitted field is `None`, so the
-                # default path is still unmoved.
-                "release_2_equivalent": (codec == DEFAULT_CODEC
-                                         and bit_depth == DEFAULT_BIT_DEPTH
-                                         and frame_threads is None and pools is None)}
-
-    if not isinstance(interpolate, dict):
-        raise WorkerError(INVALID_FIELD_VALUE, "field 'interpolate' must be an object")
-    unknown = sorted(set(interpolate) - set(INTERPOLATE_FIELDS))
-    if unknown:
-        raise WorkerError(
-            INVALID_FIELD_VALUE, "unknown field(s) in 'interpolate': {}".format(unknown))
-
-    target_fps = interpolate.get("target_fps", DEFAULT_TARGET_FPS)
+    # **`params.target_fps`, and the block it used to live in is gone.** *`envelope` REFUSED this
+    # name at the top level until today, for want of the `interpolate` object it belonged to —
+    # so the field a caller most obviously wants to send was the one spelling the contract would
+    # not take.*
+    target_fps = params.get("target_fps", DEFAULT_TARGET_FPS)
     if isinstance(target_fps, bool) or not isinstance(target_fps, (int, float)) \
             or target_fps <= 0:
         raise WorkerError(
-            INVALID_FIELD_VALUE, "field 'interpolate.target_fps' must be a positive number")
+            INVALID_FIELD_VALUE, "field 'target_fps' must be a positive number")
 
     # **No default, and absent is not zero** (§5c). A `snap_tolerance` defaulted to 0 would ship
     # the unsnapped plan as the ruled answer before the benchmark that decides it has run.
     # Unruled must be visible as unruled, including in the code.
-    tolerance = interpolate.get("snap_tolerance")
+    tolerance = params.get("snap_tolerance")
     if tolerance is not None and (isinstance(tolerance, bool)
                                   or not isinstance(tolerance, (int, float))
                                   or not 0.0 <= tolerance < 0.5):
         raise WorkerError(
             INVALID_FIELD_VALUE,
-            "field 'interpolate.snap_tolerance' is a fraction of one source interval, in "
-            "[0, 0.5)")
-
-    # **No default either**, for the same reason: "before" by omission would settle Phase 2's A/B
-    # without the A/B.
-    route = interpolate.get("route")
-    if route is not None and route not in ROUTES:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "field 'interpolate.route' must be one of {}".format(ROUTES))
-    if route is not None and upscale is False:
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "'interpolate.route' names where interpolation sits relative to the upscale, and "
-            "'upscale: false' has no upscale to sit beside.")
+            "field 'snap_tolerance' is a fraction of one source interval, in [0, 0.5)")
 
     return {
         "codec": codec,
         "bit_depth": bit_depth,
         "frame_threads": frame_threads,
         "pools": pools,
-        "interpolate": {"target_fps": float(target_fps), "snap_tolerance": tolerance,
-                        "route": route},
-        "upscale": upscale is not False,
-        "release_2_equivalent": False,
+        # **FLAT, where an `interpolate` sub-object used to sit.** *Keeping the nesting for
+        # readers downstream would leave the record and the wire disagreeing about the shape of
+        # the request, which is the one thing a normalised form exists to prevent.*
+        "target_fps": float(target_fps),
+        "snap_tolerance": tolerance,
     }
-
-
-def default_off_identity(release_2_params):
-    """One assertion: a request carrying none of release 3's fields behaves as it always did.
-
-    **This is what lets the development tier run release-3 code while other tiers serve
-    customers** — h264, no interpolation, upscaling on. Enforced by a local run before a dispatch,
-    never by CI, which no longer sees the suite.
-    """
-    config = derive(release_2_params)
-    return (config["codec"] == DEFAULT_CODEC
-            and config["interpolate"] is None
-            and config["upscale"] is True
-            and config["release_2_equivalent"] is True)

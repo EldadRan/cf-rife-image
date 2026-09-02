@@ -350,7 +350,10 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         trace["source"] = {"width": source["width"], "height": source["height"],
                            "fps": source["fps"], "duration_s": source["duration_s"]}
 
-    config = request["release_3"]["interpolate"]
+    # **The retime's own fields sit flat in the normalised config now.** *They arrived inside an
+    # `interpolate` sub-object that existed to distinguish a retime from an upscale; with one
+    # capability it discriminated nothing and it is deleted from the wire and from here.*
+    config = request["release_3"]
     # **`scale` is RIFE's flow-pyramid resolution and it reaches two places.** The interpolator
     # pads to a multiple derived from it, and the model call runs motion estimation at it — so a
     # scale set in one and not the other would pad for a geometry the model never sees. One

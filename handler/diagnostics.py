@@ -355,9 +355,11 @@ def _runpod_identity(job):
 _REQUEST_FIELDS = ("keep_audio", "crf", "force_variant", "force_scale", "convert_check",
                    "tie_check", "input_check", "decode_probe", "reference_score")
 
-#: Read out of `release_3["interpolate"]` rather than off the top level, because that is where
-#: the envelope puts them.
-_INTERPOLATE_FIELDS = ("target_fps", "snap_tolerance")
+#: Read out of `release_3` rather than off the top level, because that is where the envelope
+#: puts them. **They were one level deeper until the strict surface: `release_3["interpolate"]`
+#: was a sub-object distinguishing a retime from an upscale, and with one capability it
+#: discriminated nothing.**
+_RETIME_FIELDS = ("target_fps", "snap_tolerance")
 
 
 def _source_reference(request):
@@ -384,10 +386,10 @@ def _request_summary(request):
         return None
     summary = {field: request.get(field) for field in _REQUEST_FIELDS
                if request.get(field) is not None}
-    interpolate = ((request.get("release_3") or {}).get("interpolate")) or {}
-    for field in _INTERPOLATE_FIELDS:
-        if interpolate.get(field) is not None:
-            summary[field] = interpolate[field]
+    release_3 = request.get("release_3") or {}
+    for field in _RETIME_FIELDS:
+        if release_3.get(field) is not None:
+            summary[field] = release_3[field]
     source = _source_reference(request)
     if source:
         summary["source"] = source
