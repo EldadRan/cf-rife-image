@@ -808,7 +808,14 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # either way; an instrument that exists to say which arm ran should not under-report the
         # arm.* Found in review.
         if codec == "h265":
-            threading, threading_basis = encoder.x265_threading(frame_threads, pools)
+            # **§11: KEYED ON THE DELIVERED HEIGHT AND THE PLANNED FRAME COUNT**, the same two
+            # facts `MasterWriter` is constructed with below — `height` is the same local, and
+            # `stats["n_out"]` is the planned delivered count the writer is handed. *Resolved
+            # ONCE here and reused for the arm, rather than called twice: two calls with the same
+            # arguments are two chances for one of them to be given different ones.*
+            threading, threading_basis = encoder.x265_threading(
+                frame_threads, pools, delivered_height=int(height),
+                delivered_frames=stats.get("n_out"))
             print("[encode] x265 threading: {}".format(" ".join(
                 "{}={} ({})".format(name, threading[name], threading_basis[name + "_basis"])
                 for name in ("frame_threads", "pools"))), flush=True)
@@ -842,7 +849,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # `threads=4` and was never fitted over these, so claiming it was would be the
         # fabrication §6c forbids.*
         if codec == "h265":
-            encode_arm.update(encoder.x265_threading(frame_threads, pools)[0])
+            encode_arm.update(threading)
 
         # ── contract §6g's DISK BOUND, AND IT FIRES BEFORE THE FIRST FRAME ──────────────────
         #
@@ -908,11 +915,17 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # **THAT IS TRUE OF THE FIVE AND NOT OF §6i's TWO, AND THE DIFFERENCE IS WORTH
             # STATING.** `frame_threads` and `pools` reach the writer as the RAW parameters below,
             # and the writer derives its own values from them — so the arm's copy and the encode's
-            # come from two calls to `x265_threading` rather than from one dict. *They cannot
-            # disagree, because that function is pure, reads only its arguments and two module
-            # constants, and both sites pass names this function never rebinds — but the property
-            # is held by ARGUMENT and not by construction, which is a weaker thing and a reader
-            # should not be told otherwise.* **The raw values must stay raw on the way in**: the
+            # come from two calls to `x265_threading` rather than from one dict. *That function is
+            # pure and both sites pass names this function never rebinds, so the two agree by
+            # ARGUMENT and not by construction, which is a weaker thing and a reader should not be
+            # told otherwise.* **AND §11 GAVE IT A SECOND ARGUMENT THAT CAN MOVE.** *The values are
+            # keyed on the DELIVERED HEIGHT now; the arm resolves against the `height` local and
+            # the writer against `self.height`, which are the same integer at construction and
+            # would diverge if anything called `set_frame_size`.* **Nothing does today** — the
+            # setter is a leftover of the upscale path — *and the writer re-derives on it while
+            # the arm cannot, so the divergence would be silent: the estimate would carry the
+            # pools of a frame that was never written.* **Named here rather than guarded, because
+            # a guard against an uncalled setter is a guard nobody can test.** **The raw values must stay raw on the way in**: the
             # writer needs to see `None` to know the caller sent nothing, which is what makes
             # `frame_threads_basis` say `default` rather than `caller`. Found in review.
             # **The codec goes to the ONE place that maps a name to a library**, and the
@@ -927,6 +940,11 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # number came from the caller or from this worker.
             frame_threads=frame_threads,
             pools=pools,
+            # **§11's key, and it is the SAME `n_out` the log line above resolved against.**
+            # *The writer re-resolves rather than being handed the answer, because it re-resolves
+            # again on `set_frame_size` — one function decides these values and it decides them
+            # from the frame that is actually being written.*
+            delivered_frames=stats.get("n_out"),
             # §6g. None on an unarmed run, which is what leaves the command a single output.
             reference_path=reference_path,
             crf=encode_crf, preset=encode_preset, **encode_settings)

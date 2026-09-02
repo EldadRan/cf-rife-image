@@ -19,6 +19,7 @@ distinction matters because the failure CF measured comes from *reinterpreting* 
 carried an edit list, which cannot arise here.
 """
 
+import math
 import os
 import subprocess
 import time
@@ -136,6 +137,15 @@ BASIS_CALLER = "caller"
 BASIS_DEFAULT = "default"
 BASIS_MIXED = "mixed"
 
+#: **THE THIRD VALUE, AND WITHOUT IT THE RECORD CANNOT BE SEARCHED.** *`caller` and `default` were
+#: enough while an absent field resolved to a constant.* **Now an absent field resolves either
+#: from CF's ruled table or from the CTU-row rule, and a 1440p job at `pools 23` would be
+#: indistinguishable in the record from a ruled one** — so nobody could find those jobs later to
+#: check whether the rule held. *`default` keeps meaning what it meant on every banked row: the
+#: worker chose, from what it had ruled. `derived` says the worker COMPUTED it, from a frame the
+#: ruling does not name.* (`docs/decisions.md` §11, CF 2026-09-02.)
+BASIS_DERIVED = "derived"
+
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────
 # §6e — THE CODEC IS THE CALLER'S CHOICE, and each library gets its bound assembled for it.
@@ -206,11 +216,11 @@ PIXEL_FORMATS = {8: "yuv420p", 10: "yuv420p10le"}
 #: figure is the encoder's throughput seen through a small window and not a queueing artefact.
 #: **x265 throughput varies 1.74x ACROSS hosts and reproduces to 1.1% WITHIN one**, which §6h
 #: rules is host contention and an infrastructure ask rather than anything this file can fix.
-#: *`X265_POOLS` and `X265_FRAME_THREADS` used to sit here. They are gone rather than left as
-#: unread copies: the defaults now have ONE home, `envelope.DEFAULT_POOLS` and
-#: `envelope.DEFAULT_FRAME_THREADS`, which is where a caller-facing default belongs and which
-#: `x265_threading` reads. Keeping a second pair with a comment asserting the two agreed is the
-#: drift this file has been fixing all week.* Found in review.
+#: *`X265_POOLS` and `X265_FRAME_THREADS` used to sit here, then `envelope.DEFAULT_POOLS` and
+#: `envelope.DEFAULT_FRAME_THREADS` replaced them as the one home for a flat default. **Both are
+#: gone: §11 rules the values from a TABLE keyed on delivered height, and a flat default is what
+#: it refutes.*** Keeping a second copy with a comment asserting the two agreed is the drift this
+#: file has been fixing all week, and a stale constant is the same drift with one copy.
 X265_RC_LOOKAHEAD = 10
 
 #: **§6i: THE x265 THREADING PATH IS NO LONGER KEYED ON AREA.** *`X265_FRAME_THREADS_BY_AREA`
@@ -219,8 +229,42 @@ X265_RC_LOOKAHEAD = 10
 #: caller sees, and it stops selecting x265 threading.* **`area_row` is untouched and still drives
 #: the x264 defaults row**, which is where it always belonged.
 #:
-#: The defaults a request naming neither field receives are `envelope.DEFAULT_FRAME_THREADS` and
-#: `envelope.DEFAULT_POOLS`, and `x265_threading` is the one place the fallback happens.
+#: **§11: AND AS OF 2026-09-02 IT IS KEYED ON THE FRAME AGAIN — ON HEIGHT, WHICH IS NOT WHAT §6h
+#: KEYED ON.** *§6h keyed on AREA and §6i struck it, on the ground that area is not the
+#: requester's to set. That ground still holds and this is not its reversal: what a caller SENDS
+#: is unchanged, both fields are still optional and still obeyed when sent, and this table only
+#: decides what an ABSENT field resolves to.* **A flat default could not serve 1080p and 8K at
+#: once** — measured, `docs/decisions.md` §11 — *and shipping one meant every unset job at one of
+#: the two areas ran at a setting nothing measured.*
+#:
+#: **HEIGHT RATHER THAN PIXELS, AND THAT IS THE WHOLE MECHANISM.** *A CTU-64 frame has
+#: `height / 64` rows; WPP cannot use more pools than it has rows, and pools below the row count
+#: starves it.* **A portrait 1080x1920 clip has 1080p's pixel count and 30 CTU rows** — an area
+#: bucket hands it 16 pools against 30 rows and starves the encoder, which is the case a
+#: three-bucket table has no answer for at all.
+X265_RULED_HEIGHTS = {1080: "1080p", 2160: "4K", 4320: "8K"}
+
+#: **CF's ruled values, `docs/decisions.md` §11.** *`switch` is the DELIVERED FRAME COUNT the row
+#: changes at: below it takes `below`, at it and above takes `at`.* **Both switches sit on the
+#: safe side of a gap rather than at a measured boundary** — nothing ran between 480 and 1500
+#: delivered frames at either area — *so the more expensive setting starts earlier than the
+#: curves were seen to cross.*
+X265_RULED = {
+    "1080p": {"switch": None, "below": (16, 16), "at": (16, 16)},
+    "4K": {"switch": 1400, "below": (8, 32), "at": (16, 32)},
+    "8K": {"switch": 1200, "below": (16, 64), "at": (16, 32)},
+}
+
+#: HEVC's coding-tree-unit size, which is what makes the row count `height / 64`.
+CTU_SIZE = 64
+
+#: The derived row's `frame_threads`, for every resolution the table does not name. **CF's call
+#: and the reason is SPEED, not memory**: `ft` never separated on speed at any area, and the one
+#: place it measurably won is 1080p, where 16 is the ruled value. *This fleet does not come near
+#: its memory ceiling — the worst case measured is 20.42 GiB against the A40's 46.57 GiB slice.*
+#: **That headroom is known up to 8K and INFERRED above it**, so the first delivered frame larger
+#: than 8K is the one to read `encoder_peak_rss_gb` off before trusting this at that size.
+DERIVED_FRAME_THREADS = 16
 
 
 def area_row(delivered_pixels):
@@ -245,7 +289,48 @@ def area_row(delivered_pixels):
             else AREA_ROW_LARGE)
 
 
-def x265_threading(frame_threads=None, pools=None):
+def derived_pools(delivered_height):
+    """`clamp(round(height / 64), 1, 64)` — the CTU-row rule, for a frame the table does not name.
+
+    **HALF-UP, AND PYTHON'S `round` IS NOT.** *`docs/decisions.md` §11 writes the rule as
+    `round(delivered_height / 64)` and then works the example: a 1440p job takes `pools 23`.*
+    **1440/64 is exactly 22.5, and `round(22.5)` is 22 in Python** — banker's rounding, which
+    breaks ties to even. *The worked example is the authority on what was intended and the
+    spelling is the authority on nothing, so this rounds half up and the divergence is filed to
+    the gate rather than resolved by picking the reading that needs no comment.*
+
+    **The clamp's ends are not decoration.** *Below 64 pixels of height there is less than one CTU
+    row and `pools 0` is not a setting; above 4096 the row count passes x265's own ceiling, which
+    `envelope.POOLS_RANGE` already refuses a caller for asking.*
+    """
+    rows = int(math.floor(float(delivered_height) / CTU_SIZE + 0.5))
+    return max(1, min(rows, 64))
+
+
+def x265_ruled_row(delivered_height, delivered_frames):
+    """The ruled `(frame_threads, pools)` for this frame, or `None` if the table does not name it.
+
+    **`None` IS A REAL ANSWER AND NOT A FAILURE** — it is every resolution CF did not measure,
+    which includes 1440p, every portrait clip and everything above 8K.
+
+    **A NAMED HEIGHT WITH AN UNKNOWN FRAME COUNT DOES NOT TAKE THE TABLE.** *Two of the three rows
+    switch on delivered frames, so a count of `None` cannot choose between them* — and picking
+    either silently would put the job on a row nobody selected, which is the whole failure the
+    third basis value exists to make visible.
+    """
+    name = X265_RULED_HEIGHTS.get(int(delivered_height))
+    if name is None:
+        return None
+    row = X265_RULED[name]
+    if row["switch"] is None:
+        return row["at"]
+    if delivered_frames is None:
+        return None
+    return row["at"] if int(delivered_frames) >= row["switch"] else row["below"]
+
+
+def x265_threading(frame_threads=None, pools=None, delivered_height=None,
+                   delivered_frames=None):
     """§6i's two levers resolved: `(values, basis)`, each field independently.
 
     **`None` MEANS THE CALLER SENT NOTHING, AND THAT IS THE WHOLE MECHANISM** — §6d's rule, which
@@ -258,17 +343,42 @@ def x265_threading(frame_threads=None, pools=None):
     §6i: *optional, and independently so* — and a single basis cannot describe it. That is
     `BASIS_MIXED`'s defect re-made: a row saying `caller` about a number the caller never sent.
 
-    **NOT KEYED ON AREA.** §6h derived this from the delivered frame; §6i struck that, because
-    `area` is not the requester's to set and so is not theirs to read either.
+    **THREE STATES NOW.** *`caller` — sent. `default` — CF's ruled table named this frame.
+    `derived` — the table did not, and the CTU-row rule computed it.* **The third exists so the
+    computed jobs can be FOUND** in a corpus, which is the only way anyone checks later whether
+    the rule held.
+
+    **AND THE DEFAULTS ARE NO LONGER TWO CONSTANTS.** *`envelope.DEFAULT_FRAME_THREADS` and
+    `envelope.DEFAULT_POOLS` were the one home for a flat default, and a flat default is what
+    §11 refutes: 1 and 16 served neither 1080p nor 8K, and every unset job ran at a setting
+    nothing had measured.* **A table is the home now, and the constants are gone rather than left
+    beside it saying something that is no longer true.**
+
+    `delivered_height` and `delivered_frames` describe THE FRAME THE ENCODER IS HANDED, the same
+    pair `MasterWriter` is constructed with — §6d-1's pin, one surface over.
     """
+    ruled = (None if delivered_height is None
+             else x265_ruled_row(delivered_height, delivered_frames))
+    if ruled is not None:
+        default_ft, default_pools = ruled
+        unsent_basis = BASIS_DEFAULT
+    elif delivered_height is not None:
+        default_ft, default_pools = DERIVED_FRAME_THREADS, derived_pools(delivered_height)
+        unsent_basis = BASIS_DERIVED
+    else:
+        # **A caller with no frame to key on gets the 1080p row and the record says `derived`.**
+        # *There is no honest `default` here: `default` means CF ruled this frame's values, and
+        # nothing ruled a frame nobody named.* **Reachable only by a direct caller** — `routec`
+        # has the delivered size at the one site that builds the writer.
+        default_ft, default_pools = DERIVED_FRAME_THREADS, X265_RULED["1080p"]["at"][1]
+        unsent_basis = BASIS_DERIVED
     values = {
-        "frame_threads": (envelope.DEFAULT_FRAME_THREADS if frame_threads is None
-                          else int(frame_threads)),
-        "pools": envelope.DEFAULT_POOLS if pools is None else int(pools),
+        "frame_threads": default_ft if frame_threads is None else int(frame_threads),
+        "pools": default_pools if pools is None else int(pools),
     }
     basis = {
-        "frame_threads_basis": BASIS_DEFAULT if frame_threads is None else BASIS_CALLER,
-        "pools_basis": BASIS_DEFAULT if pools is None else BASIS_CALLER,
+        "frame_threads_basis": unsent_basis if frame_threads is None else BASIS_CALLER,
+        "pools_basis": unsent_basis if pools is None else BASIS_CALLER,
     }
     return values, basis
 
@@ -529,7 +639,8 @@ class MasterWriter:
                  audio_source=None, audio_codec=None, audio_limit_s=None,
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None, bit_depth=None,
                  threads=None, sliced_threads=None, rc_lookahead=None,
-                 reference_path=None, frame_threads=None, pools=None):
+                 reference_path=None, frame_threads=None, pools=None,
+                 delivered_frames=None):
         self.path = path
         #: **Where ffmpeg writes contract §6g's raw reference, or None for an unarmed run.**
         #: A SECOND OUTPUT of this same command rather than a copy of what crossed the pipe: the
@@ -649,20 +760,17 @@ class MasterWriter:
             #: **§6i's two levers, resolved HERE and only here.** `None` from the caller means
             #: absent; `x265_threading` applies the default and says per field which it was.
             #:
-            #: *§6h derived `frame-threads` from the delivered frame, so this had to be re-derived
-            #: whenever `set_frame_size` moved the size. §6i struck the area keying, so the values
-            #: no longer depend on the frame at all and there is nothing for a resize to
-            #: invalidate.* **That removes a whole class of staleness rather than guarding it**,
-            #: which is why the re-derivation hook is gone rather than kept pointing at a constant.
-            values, basis = x265_threading(frame_threads, pools)
-            self.frame_threads = values["frame_threads"]
-            self.pools = values["pools"]
-            self.frame_threads_basis = basis["frame_threads_basis"]
-            self.pools_basis = basis["pools_basis"]
-            #: **Assembled from named fields for a reason sharper than §6a's** — see
-            #: `x265_params`: x265 discards an unknown NAME without a word, so a bound is not in
-            #: force merely because the job succeeded.
-            self.x265_params = x265_params(frame_threads=self.frame_threads, pools=self.pools)
+            #: **THE VALUES DEPEND ON THE FRAME AGAIN, SO THE HOOK COMES BACK.** *§6h derived
+            #: `frame-threads` from the delivered frame and had to re-derive whenever
+            #: `set_frame_size` moved it; §6i struck the keying and the comment here recorded
+            #: that a whole class of staleness had been removed rather than guarded.* **§11 keys
+            #: on HEIGHT, so the dependency exists once more and `set_frame_size` re-runs this.**
+            #: *A value computed from a size, kept across a change of that size, is the defect
+            #: that comment was celebrating the absence of — it does not stop being one because
+            #: nothing calls the setter today.*
+            self._x265_caller = (frame_threads, pools)
+            self._delivered_frames = delivered_frames
+            self._resolve_x265()
             self.threads = None
             self.sliced_threads = None
             self.rc_lookahead = None
@@ -713,6 +821,20 @@ class MasterWriter:
             self.sliced_threads = bool(sliced_threads)
             self.rc_lookahead = int(rc_lookahead)
 
+    def _resolve_x265(self):
+        """§6i's two levers against THIS frame. **Called at construction and on every resize.**"""
+        frame_threads, pools = self._x265_caller
+        values, basis = x265_threading(frame_threads, pools, delivered_height=self.height,
+                                       delivered_frames=self._delivered_frames)
+        self.frame_threads = values["frame_threads"]
+        self.pools = values["pools"]
+        self.frame_threads_basis = basis["frame_threads_basis"]
+        self.pools_basis = basis["pools_basis"]
+        #: **Assembled from named fields for a reason sharper than §6a's** — see `x265_params`:
+        #: x265 discards an unknown NAME without a word, so a bound is not in force merely
+        #: because the job succeeded.
+        self.x265_params = x265_params(frame_threads=self.frame_threads, pools=self.pools)
+
     def set_frame_size(self, width, height):
         """Adopt the size the model actually produced, before ffmpeg is started.
 
@@ -726,6 +848,11 @@ class MasterWriter:
             raise WorkerError(INTERNAL, "the master's frame size was changed after ffmpeg started")
         self.width, self.height = int(width), int(height)
         self._identity["cf_output"] = "{}x{}".format(self.width, self.height)
+        # **AND THE x265 SETTINGS ARE RE-DERIVED, because §11 keys them on height.** *Adopting a
+        # new frame without re-running this would encode at the pools count of a frame that was
+        # never written, and the record would carry it.*
+        if self.codec == "h265":
+            self._resolve_x265()
 
     def _build_command(self):
         width, height, fps = self.width, self.height, self.fps

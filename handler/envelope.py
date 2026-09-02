@@ -21,23 +21,14 @@ CODECS = ("h264", "h265", "source")
 #: today and must still encode h264 after this ships — `default_off_identity` is the assertion.
 DEFAULT_CODEC = "h264"
 
-#: **contract §6i: x265's two threading levers, optional and independently so.** *Either sent is
-#: used, either absent takes its default, any combination is legal — and a request sending NEITHER
-#: behaves exactly as `sha-88fec73` does, which is what makes the field shippable before any
-#: calibration has happened.*
-#:
-#: **These are an OVERRIDE ON TOP OF A DEFAULT, not a decision moved to the caller**, which is why
-#: §6i is not the request-field shape CF refused earlier the same day. *What was refused was
-#: handing the caller a BOUND — a knob deciding what the worker does when the caller has no basis
-#: to choose. Here the default still governs and a caller who says nothing gets the worker's
-#: answer.*
-#: **THE ONE HOME FOR BOTH NUMBERS.** `encoder.x265_threading` reads these rather than keeping
-#: its own copies — the pattern `validation` already uses for `encoder.DEFAULT_CRF`, "imported
-#: rather than repeated". *They lived in both files for one commit and nothing kept them equal;
-#: a second home for one fact is how the copies drift and the comment claiming they agree stays.*
-DEFAULT_FRAME_THREADS = 1
-DEFAULT_POOLS = 16
-
+#: **THERE IS NO FLAT DEFAULT FOR THE TWO THREADING LEVERS ANY MORE.** *`DEFAULT_FRAME_THREADS`
+#: and `DEFAULT_POOLS` lived here — 1 and 16 — as the one home for a caller-facing default, and
+#: `encoder.x265_threading` read them.* **CF's §11 ruling refutes a flat default outright**: 1 and
+#: 16 served neither 1080p nor 8K, and every unset job at one of those areas ran at a setting
+#: nothing had measured — *1080p h265 shipped at `frame-threads=1` and read as a 5x codec penalty
+#: for a week.* **The home is now `encoder.X265_RULED` plus the CTU-row rule**, and the constants
+#: are gone rather than left beside a table that overrules them. *A named default that is not the
+#: default is worse than none: it is the first thing a reader believes.*
 #: The ranges. **Bounded rather than open**, for §6a's reason one codec over: these settings decide
 #: how much the encoder allocates on a path §1 says has no host guard, so an unbounded value is a
 #: memory bound handed to the caller. *`frame-threads` above a small number multiplies the frames
