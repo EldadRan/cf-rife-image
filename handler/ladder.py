@@ -70,10 +70,32 @@ ROWS = {
 UPLOAD_BYTES_PER_S = 13.1 * 1000 * 1000
 FETCH_BYTES_PER_S = 54.5 * 1000 * 1000
 
-#: The spread each transfer seed publishes, as a fraction of the point. *Derived from the ranges
-#: §11 records — upload 7.7-25.5 MB/s, fetch 3.9-138.2 — rather than chosen.*
-UPLOAD_BAND_FRAC = 0.7
-FETCH_BAND_FRAC = 0.95
+#: **TWO BAND FRACTIONS STOOD HERE AND THEY ARE DELETED. THE COMMENT CALLED THEM DERIVED FROM
+#: THE RANGES ABOVE AND THEY WERE NOT** — and nothing read them, so the file carried a false
+#: claim about a number that did no work. *Found by the gate, which asked for the arithmetic and
+#: could not reproduce either value.*
+#:
+#: **THE ARITHMETIC, IN TIME, WHICH IS WHAT A CALLER SIZES A TIMEOUT IN.** *The payload's band is
+#: symmetric — `progress.py` publishes `point x (1 +/- f)`:*
+#:
+#:     upload   13.1 / 7.7   = 1.70x the point at the slow end
+#:              13.1 / 25.5  = 0.51x at the fast end        -> f = 0.70 covers the slow side
+#:                                                             exactly, overstates the fast by 21
+#:     fetch    54.5 / 3.9   = 13.97x the point at the slow end
+#:              54.5 / 138.2 = 0.39x at the fast end
+#:
+#: **A SYMMETRIC FRACTION CANNOT EXPRESS THE FETCH SPREAD AT ALL.** *It would need `f = 12.97`,
+#: and `expect()` drops any band outside `[0, 1)` because at `f >= 1` the low edge is zero or
+#: negative.* **So `0.95` was a number chosen to satisfy the validator, wearing a derivation's
+#: clothes** — which is the shape §11's own clause warns about, since the caller sizing a timeout
+#: is the one who pays for false precision.
+#:
+#: **AND THE GAP IS REAL RATHER THAN CLOSED BY THIS DELETION.** *§11 requires a spread beside
+#: every point and the transfer phases publish `phase_expected_s` bare.* **The band the payload
+#: has belongs to the FRAME ETA and is symmetric; a transfer spread of 0.39x to 13.97x is neither
+#: symmetric nor inside `[0, 1)`, so it needs a shape nobody has ruled.** *Filed to the gate; not
+#: built, because inventing the spelling here would be the second time this pair of numbers was
+#: asserted rather than derived.*
 
 #: What `step_for` says about a frame the table does not name.
 #:
