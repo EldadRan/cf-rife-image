@@ -222,13 +222,26 @@ def seconds_per_frame(delivered_height, delivered_frames, codec="h265"):
     """`(s_per_frame, step)` for the ETA seed. **Above the ladder it seeds from 8K and says so.**
 
     **ABOVE 8K IS PRICED AS 8K — CF, 2026-09-02, ORDERED 2026-09-03.** *Priced, not executed: the
-    SEED comes from 8K's row and the SETTINGS do not.* **`levers` still answers `None` for any
-    height the table does not name, so an above-8K frame takes the CTU-row rule** — 64 pools at
-    8640, against the 32 that 8K's row was measured at. *That is the module header's claim
-    inverted for exactly one case: the price and the settings were measured together and here
-    they part.* **Reported to the gate rather than reconciled here** — the row rule is right about
-    a taller frame's CTU rows and the seed is CF's ruling, and choosing between them is not this
-    file's to do. *This returned `None` until
+    SEED comes from 8K's row and the SETTINGS come from the CTU-row rule, because `levers`
+    answers `None` for any height the table does not name.*
+
+    **THE HEADER'S CLAIM — that a job taking one row's settings is priced by that row's seconds —
+    SURVIVES WITH ONE STATED EXCEPTION, AND THE EXCEPTION IS NARROWER THAN IT LOOKS.**
+
+        below 1,200 frames    seeded 0.75, measured at 16/64    encoded at 16/64    they AGREE
+        1,200 and above       seeded 0.96, measured at 16/32    encoded at 16/64    they part
+
+    **AND THEY PART ACROSS A PAIR THAT WAS MEASURED AND DID NOT SEPARATE.** *`docs/decisions.md`
+    §11 on that very row: "32 and 64 measured indistinguishable at 8K and CF took the cheaper
+    one."* **So the 16/32 the price was measured at is not the faster configuration — it is the
+    cheaper of two that tied**, and the price is borrowed across a difference that was looked for
+    and not found.
+
+    **THE TIDY FIX WOULD HAVE BEEN THE WRONG WAY ROUND AND THE REASON IS ON RECORD.** *Extending
+    `levers` so `OUTSIDE` takes 8K's settings puts 32 pools against 8640's 135 CTU rows, which
+    starves WPP on the mechanism `F-2026-09-01-2` predicted before it was measured — a real cost
+    paid to remove a difference that measured as zero.* **Gate-ruled 2026-09-03: leave it as
+    built.** *This returned `None` until
     then, and the docstring argued for the absence: three readings were open, and a number shipped
     ahead of its ruling is indistinguishable afterwards from one CF chose.* **That reasoning was
     right and its premise is gone**, so the argument goes with the behaviour rather than being
