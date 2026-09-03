@@ -111,6 +111,52 @@ ROUNDED = ":rounded"
 OUTSIDE = "outside"
 
 
+#: **THE MAXIMUM A JOB MAY DELIVER, PER STEP — CF, 2026-09-02, `docs/decisions.md` §11.**
+#:
+#: **KEYED BY `step_for` AND NOT BY A SECOND TABLE OF SIZES.** *The cap and the seed take one step
+#: boundary from one function; a second table would be free to disagree with the ladder about
+#: where 4K ends, and that disagreement would be invisible until a job landed between them.*
+#:
+#: **ABOVE 8K IS CAPPED HARDER THAN 8K AND THAT IS THE POINT OF THE ROW.** *A frame larger than 8K
+#: is served on 8K's timings, which under-predict it by construction — nothing has been measured
+#: up there — so the smaller cap is the margin that covers the difference.*
+#:
+#: **WHAT EACH CAP ACTUALLY BUYS, AGAINST THE 3,600 s KILL, FROM THE ROWS IN THIS FILE.** *The
+#: first version of this comment called the above-8K row "the tightest of the four" and it is the
+#: LOOSEST — the phrase was lifted from §11, where it compares three s/frame BASES for that one
+#: row, and re-scoping it to the four rows inverts it.* **A constant defended by arithmetic that
+#: does not reproduce is the offence this file deletes two other constants for**, seventy lines
+#: up, so here is the arithmetic:
+#:
+#:     1080p   30,000 x 0.115 = 3,450 s    1.04x   <- the tightest by a wide margin
+#:     4K      20,000 x 0.157 = 3,140 s    1.15x
+#:     8K       3,000 x 0.96  = 2,880 s    1.25x
+#:     >8K      1,800 x 1.0   = 1,800 s    2.00x   <- the loosest
+#:
+#: **SO THE BAND WITH FOUR PER CENT OF MARGIN IS 1080p, WHICH IS THE ONE NOBODY WORRIED ABOUT.**
+#: *A 30,000-frame 1080p job is predicted to finish 150 seconds inside a wall that kills it with
+#: nothing delivered, and the fleet's own host spread is 1.7x.* **Reported to the gate rather than
+#: adjusted here: the caps are CF's numbers and this file does not get to pick a different one.**
+MAX_DELIVERED_FRAMES = {
+    "1080p": 30_000,
+    "4K": 20_000,
+    "8K": 3_000,
+    OUTSIDE: 1_800,
+}
+
+
+def max_delivered_frames(delivered_height):
+    """The cap for this frame. **A rounded step takes the step it rounds to.**
+
+    *`step_for` rounds an unmeasured height UP — 1440p is priced at 4K — and the cap follows the
+    same step for the same reason: the seed says this job costs 4K seconds, so the limit that
+    keeps it inside the 3,600 s kill is 4K's.* **Two answers from one step, which is what putting
+    them in one module buys.**
+    """
+    step = step_for(delivered_height)
+    return MAX_DELIVERED_FRAMES[step[:-len(ROUNDED)] if step.endswith(ROUNDED) else step]
+
+
 def step_for(delivered_height):
     """`"1080p"`, `"4K"`, `"8K"`, `DERIVED`, or `OUTSIDE`.
 

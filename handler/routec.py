@@ -28,7 +28,7 @@ import numpy as np
 
 import stages
 
-from errors import INVALID_SOURCE, WorkerError
+from errors import CAPACITY_EXCEEDED, INTERNAL, INVALID_SOURCE, WorkerError
 
 #: BGR uint8 out of cv2, RGB float in [0, 1] for RIFE, rgb24 bytes for the writer. Stated once
 #: here because a channel order that is wrong is a picture that still plays.
@@ -681,7 +681,8 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
            variant="direct", scale=None, preset=None, threads=None,
            sliced_threads=None, rc_lookahead=None, clock=None, convert_check=False,
            input_check=False, armed=None, encode_defaults=None, codec=None,
-           bit_depth=None, reference_score=False, frame_threads=None, pools=None):
+           bit_depth=None, reference_score=False, frame_threads=None, pools=None,
+           expected_frames=None, cap_note=None):
     """Decode, interpolate, encode. Returns the stats the plan produced.
 
     `snap_tolerance` is passed through as given and **is not defaulted here** (contract §5c): a
@@ -704,6 +705,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
     import reference  # noqa: PLC0415 — contract §6g, and stdlib-only like the rest of this pair
     import variants  # noqa: PLC0415
 
+    import ladder  # noqa: PLC0415 — CF's ruled table: the cap and the seed share its steps
     from decode import open_source  # noqa: PLC0415 — cv2 is a GPU-box import, like the rest
 
     # **Bound BEFORE the `try`, because the `finally` that releases it is at THIS level.** A name
@@ -781,6 +783,106 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # §15a). §6d's table is x264's vocabulary and cannot have resolved an h265 job, so
         # `resolve_defaults` returns NO settings and a basis that says the table was skipped —
         # and everything below reads off `encode_settings` rather than assuming three keys.
+        # ── THE FRAME CAP, SECOND TEST: THE WRITER'S OWN HEIGHT AND THE PLAN'S OWN COUNT ────
+        #
+        # **`handler` ALREADY REFUSED ON THE PROBER'S ANSWER AND THIS IS A DIFFERENT READER.**
+        # *§6d-1 moved the encoder-settings branch out of `handler` for precisely this reason —
+        # that function holds `probe.probe_source`'s dimensions, "which are a different reader's
+        # answer" — and the cap is keyed on the DELIVERED frame, so it inherits that ruling
+        # rather than arguing with it.* **A source the two readers disagree about would be capped
+        # in one band and encoded in another**, which is §6d-1's defect on the same axis with a
+        # worse consequence: there it was encoder settings, here it is whether the job can finish
+        # at all.
+        #
+        # **AFTER THE MODEL LOAD AND BEFORE THE ENCODE, WHICH IS THE BEST THAT IS AVAILABLE.** *A
+        # model load is a real cost and it is nothing beside a job killed at 3,600 s with a
+        # half-written master.*
+        #
+        # **AND THE COUNT IS `n_out` — WHAT THE PLAN ACTUALLY PRODUCED, NOT WHAT WAS PREDICTED.**
+        # *`handler` tested `target_count`'s answer before the plan existed; this tests the plan.*
+        planned = stats.get("n_out")
+        # ── AND THE COUNT THE CAP WAS TESTED AGAINST MUST BE THE COUNT THE PLAN PRODUCED ─────
+        #
+        # **NOT A REFUSAL — A DEFECT.** *By this line the model is loaded and the money is spent,
+        # so there is nothing to save by refusing; what there is to do is make the disagreement
+        # FINDABLE.* **Two computations of one quantity disagreeing is worse than either**, and a
+        # job that was supposed to be impossible arriving as a delivered row with nothing saying
+        # so is the outcome that has no floor.
+        #
+        # *`handler` computed `expected_frames` from `target_count` before the plan existed;
+        # `n_out` is what the plan built. They are the same function on the same inputs, so a
+        # divergence is a plumbing defect and not a legal state.* **`INTERNAL` carries both
+        # numbers, because a code without them would say only that something was wrong.**
+        # **A TRIPWIRE RATHER THAN A CHECK, AND THE DIFFERENCE IS WORTH STATING.** *On the only
+        # path that arms it — `handler`, `variant="direct"` — `expected_frames` and `n_out` are
+        # the same pure function on the same inputs, so it is unfalsifiable by construction and
+        # any test that "exercises" it has to fake one of the two.* **It is here for the plumbing
+        # drift it would catch, not for a state the code can reach today**, and calling it a
+        # check would overstate what a green run proves. *A direct caller passing
+        # `expected_frames` alongside a non-direct variant is the one live way to trip it, and it
+        # trips as `INTERNAL` — which is right: those stats are a different quantity and pricing
+        # a cap against them would be the second answer this guard exists to refuse.*
+        if expected_frames is not None and int(expected_frames) != int(planned):
+            raise WorkerError(
+                INTERNAL,
+                "the frame cap was tested against {} planned frames and the plan delivers {}. "
+                "These come from one function on one set of inputs — `interpolate.target_count` "
+                "before the plan, `n_out` after it — so they cannot legally differ, and a job "
+                "refused on one count and delivered on another is the state this guard "
+                "exists to make impossible to reach silently.".format(
+                    expected_frames, planned))
+        cap_here = ladder.max_delivered_frames(int(height))
+        # **THE DIVERGENCE IS RECORDED WHETHER OR NOT IT CHANGES THE VERDICT — the gate's order,
+        # and the reason is that nobody has ever seen these two readers disagree.** *The first
+        # instance is worth more than the refusal it would trigger: it is the evidence that the
+        # hazard §6d-1 was written about is real rather than argued.*
+        # **BOTH READERS' ANSWERS GO ON THE RECORD, EVERY RUN, AGREEING OR NOT** — the gate's
+        # order, and the reason is that nobody has ever seen these two disagree. *`source` is
+        # `probe.probe_source`'s answer, which is what `handler` capped on; `height` is
+        # `decode.open_source`'s, which is what the encoder is handed.* **The first instance of a
+        # divergence is worth more than the refusal it triggers**, and it can only be found by
+        # filing the pair on runs where there is nothing to find.
+        #
+        # **INTO `cap_note` AND NOT INTO `encode_defaults`, WHICH THE FIRST DRAFT DID AND WHICH
+        # DESTROYED A DISCRIMINATOR.** *`handler` files that dict as `... or None` precisely so
+        # an EMPTY one means "died before the encode was configured"; three keys written above
+        # `resolve_defaults` made it truthy on every path that raises in between — including this
+        # cap's own refusal — so a record would have carried an `encode_defaults` with no `basis`
+        # and no `boundary`, reading as a provenance that was recorded and said nothing.* Found
+        # in review.
+        probed_height = (source or {}).get("height")
+        if cap_note is not None:
+            cap_note["delivered_height"] = int(height)
+            cap_note["delivered_step"] = ladder.step_for(int(height))
+            cap_note["frame_cap_delivered"] = cap_here
+            cap_note["n_out"] = planned
+        if probed_height is not None and int(probed_height) != int(height):
+            print("[cap] THE TWO READERS DISAGREE: probe says {} and the decoder says {}. The "
+                  "cap was tested on the first and the encode runs at the second; §6d-1 named "
+                  "this hazard and this is the first instance of it.".format(
+                      probed_height, int(height)), flush=True)
+        # **AN ABSENT COUNT IS A DEFECT AND NOT A SKIP, AND THE FIRST DRAFT SKIPPED.** *`is not
+        # None` turned the second cap into a silent no-op on exactly the input it is least able
+        # to trust — which is the outcome the paragraph above says has no floor.* The disk bound
+        # forty lines down states the same rule for the same value: passed as it is, and the
+        # callee refuses a non-positive count, "which is what an internal guard is for".
+        if planned is None:
+            raise WorkerError(
+                INTERNAL,
+                "the plan returned no delivered-frame count, so the frame cap cannot be tested "
+                "against the frame the encoder is being handed. Refusing rather than encoding: "
+                "an untested job is the state this cap exists to make unreachable.")
+        if int(planned) > cap_here:
+            raise WorkerError(
+                CAPACITY_EXCEEDED,
+                "the plan delivers {} frames and the limit for a {} frame is {}. This is the "
+                "SECOND cap test: the first ran on the prober's dimensions before the model was "
+                "loaded, and this one runs on the {}x{} frame the encoder is actually handed. "
+                "Reaching here means the two readers disagreed about the source's size — the "
+                "job is refused before the encode rather than killed at the platform's "
+                "3,600-second wall.".format(
+                    planned, ladder.step_for(int(height)), cap_here, int(width), int(height)))
+
         encode_settings, encode_provenance = encoder.resolve_defaults(
             int(width) * int(height), codec=codec,
             threads=threads, sliced_threads=sliced_threads, rc_lookahead=rc_lookahead)

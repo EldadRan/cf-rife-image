@@ -478,6 +478,58 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # measurement to compare it against — an instrument read on the one path where nothing can
     # check it.
     _note(trace, "estimate", "fit", fit)
+
+    # ── THE FRAME CAP, AND IT REFUSES BEFORE ANYTHING IS LOADED ────────────────────────────
+    #
+    # **CF, 2026-09-03: a job asking for more than its band allows is REFUSED rather than served
+    # slowly.** *The platform kills a job at 3,600 s: no master, no error, every second billed and
+    # the caller gets `TIMED_OUT` with nothing attached. A refusal in seconds is a better answer
+    # than a container that dies with a half-written file.*
+    #
+    # **BELOW THE FIT PREDICATE AND ABOVE EVERYTHING THAT COSTS.** *It was above `fits` in
+    # the first draft, so a capacity-refused job filed `estimate: null` — and the comment on
+    # that line rules the fit is banked whether it fits or not, because a prediction recorded
+    # only on the runs that ran is an instrument read where nothing can check it. A large
+    # frame is exactly the case the residual corpus wants.* **The predicate is arithmetic on
+    # a snapshot and costs nothing.**
+    #
+    # **AFTER THE SOURCE EXISTS AND BEFORE ANYTHING COSTS.** *Delivered frames is a
+    # function of the source's DURATION, so it cannot be known at validation time and the fetch
+    # has to happen first — a caller pays for their download before being told no, and the
+    # message says so rather than reading as arbitrary.* **What it must not cost is the model
+    # load, the encoder or a single interpolated frame, and this line is above all three.**
+    #
+    # **THE COUNT IS THE PLANNER'S OWN, NOT A RE-DERIVATION.** *`target_count` is the function
+    # `build_plan` itself calls, on `source_frame_count`'s `n_in` — the number the plan is built
+    # from. A second sum of "duration times target_fps" could refuse a job on one count and
+    # deliver it on another, and the two disagreeing is worse than either.*
+    #
+    # **AND IT IS KEYED ON THE PROBER'S HEIGHT, WHICH IS A DIFFERENT READER FROM THE ENCODER'S.**
+    # *§6d-1 moved the encoder-settings branch OUT of this function for exactly that reason.* **So
+    # this is the first of two tests and not the only one**: `routec` re-tests on the writer's own
+    # locals, where the delivered frame is the one actually being encoded.
+    planned_frames = interpolate_module.target_count(
+        routec.source_frame_count(source), source["fps"], config["target_fps"])
+    frame_cap = ladder.max_delivered_frames(source["height"])
+    # **`cap`, ITS OWN BLOCK, AND `runrecord` LIFTS IT BY NAME.** *The first draft filed these
+    # under `trace["plan"]`, which `_write_run_record` does not enumerate and `runrecord` already
+    # uses for the estimator's configuration — so the pair was written on every run and read on
+    # none, and would have landed on another quantity's slot if anyone later plumbed it through.*
+    # Found in review.
+    _note(trace, "cap", "planned_frames", planned_frames)
+    _note(trace, "cap", "frame_cap", frame_cap)
+    _note(trace, "cap", "probed_height", source["height"])
+    _note(trace, "cap", "step", ladder.step_for(source["height"]))
+    if planned_frames > frame_cap:
+        raise WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "this job would deliver {} frames and the limit for a {} frame is {}. Refused "
+            "before the model was loaded rather than killed at the platform's 3,600-second "
+            "wall with a half-written master. The source had to be fetched to know this — "
+            "delivered frames is its duration times target_fps — so the download is spent and "
+            "the refusal is not. Send a shorter clip, a lower target_fps, or split it.".format(
+                planned_frames, ladder.step_for(source["height"]), frame_cap))
+
     if ok is False:
         raise WorkerError(
             errors.CAPACITY_EXCEEDED,
@@ -606,6 +658,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         target_fps=config["target_fps"], identity=identity_tags(
             request, source["width"], source["height"]),
         snap_tolerance=config["snap_tolerance"],
+        # **What the cap was tested against, so `routec` can check the plan against it.** *Not
+        # recomputed there: a second sum would be a second answer, and the guard exists to catch
+        # the two disagreeing rather than to produce a third.*
+        expected_frames=planned_frames,
+        # **The same block the first test wrote into**, so both readers' answers land side by
+        # side rather than in two places a reader has to join.
+        cap_note=(trace.setdefault("cap", {}) if trace is not None else None),
         crf=request.get("crf"),
         # **§6a's other four. `preset` is still `validation`'s to default; the three below are
         # §6d's and arrive already resolved from the branch above.** Passed by name rather than
@@ -1067,6 +1126,7 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             # branch, so an empty dict means "died before it ran" and must file as null rather
             # than as `{}`, which would read as a provenance that was recorded and said nothing.
             encode_defaults=(trace or {}).get("encode_defaults") or None,
+            cap=(trace or {}).get("cap") or None,
             # §15. **Top level, where §15c's inference rule reads it**, and OMITTED rather than
             # null on a run that never got as far as banking one — `record.get("codec", "h264")`
             # returns `None` for a present-and-null field and "h264" for an absent one, so the

@@ -128,7 +128,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
           convert_check=None, input_check=None, decode_probe=None, encode_defaults=None,
-          codec=None, bit_depth=None, reference=None):
+          codec=None, bit_depth=None, reference=None, cap=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -200,6 +200,13 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # before the encode was configured, or a defect, and never a choice — and §13's whole
         # argument is that provenance must not have to be inferred from silence.
         "encode_defaults": encode_defaults,
+        # **What the frame cap computed and what it compared against, on EVERY run.** *The
+        # refusal's message carries both numbers, so a refused job keeps them either way — but a
+        # DELIVERED run is where they are worth most: they are the only evidence of how close to
+        # the limit the fleet actually operates, and a corpus that holds them only for refusals
+        # can never answer that.* **It also carries both readers' heights**, which is the first
+        # instrument this project has ever had on whether `probe` and the decoder agree.
+        "cap": cap,
         "rationale": rationale,
         "source": source,
         "output": output,
