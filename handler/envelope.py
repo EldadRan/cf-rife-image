@@ -58,9 +58,12 @@ def refuse_field(name, where, gated):
     unknown would be a false statement in an error message** — and the caller's next action
     differs: one adds a flag, the other fixes a typo or stops sending the field.
 
-    *CF ruled the behaviour 2026-09-02 — strict at every level, a debug name without the flag is
-    refused. The STRING was still unruled when this was written; the gate's reading is what is
-    built, and one string and one branch is the cost if CF rules otherwise.*
+    **CF RULED BOTH THE BEHAVIOUR AND THE STRING, 2026-09-02, AND THESE TWO MESSAGES ARE WHAT WAS
+    RULED.** *An earlier version of this paragraph said the string was still open and that what
+    stood here was the gate's reading — true when it was written and false from the moment the
+    ruling landed.* **The reader most likely to open this docstring is the one deciding whether a
+    message may change**, and a sentence telling them the question is still open is the worst
+    place in the file for that to be wrong.
     """
     if gated:
         raise WorkerError(
