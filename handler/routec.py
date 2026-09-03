@@ -1577,11 +1577,19 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
             delivered_height, stats.get("n_out"), codec=codec)
         if seed is not None:
             progress.expect(seed, basis="measured", ladder=step)
-            print("[eta] seed {} s/frame from the {} step of CF's ruled table".format(
-                seed, step), flush=True)
+            # **THE `outside` CASE SAYS WHOSE ROW IT BORROWED, AND THE FIRST DRAFT DID NOT.**
+            # *`ROWS` has no `outside` key — only `MAX_DELIVERED_FRAMES` does — so the sentence
+            # "from the outside step of CF's ruled table" named a row that does not exist, and a
+            # 12K run and an 8K run printed the same 0.96 attributed to different steps with
+            # nothing saying the first was borrowed.* Found in review.
+            print("[eta] seed {} s/frame {}".format(
+                seed,
+                "borrowed from the 8K row — this frame is ABOVE the ladder and nothing has been "
+                "measured at its size" if step == ladder.OUTSIDE
+                else "from the {} step of CF's ruled table".format(step)), flush=True)
         else:
-            print("[eta] no ruled row for this frame ({}); the fit stands in if it "
-                  "prices".format(step), flush=True)
+            print("[eta] the ruled table did not answer for this frame ({}); the fit stands in "
+                  "if it prices".format(step), flush=True)
     except Exception as exc:  # noqa: BLE001 — a seed must never cost a delivered master
         print("[eta] the ruled table did not answer ({}: {})".format(
             type(exc).__name__, str(exc)[:120]), flush=True)
@@ -1631,12 +1639,22 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # point and this republishes it with the fit's band attached* — same rate, so the ETA
         # does not move, and `expect` keeps whichever `ladder` label it was already given.
         #
-        # **WHERE THE TABLE HAD NO ROW, THIS IS THE ONLY SEED THERE IS.** *Above 8K CF has not
-        # ruled what to seed from, so the fit stands in and `eta_ladder` says `outside`.*
+        # **WHERE THE TABLE HAS NO ROW AT ALL, THIS IS THE ONLY SEED THERE IS.** *Above 8K was
+        # that case until 2026-09-03 and is not any more: it seeds from 8K's row and keeps
+        # `eta_ladder: "outside"`, so every HEIGHT is answered.* **The fallback covers the table
+        # failing rather than a size it does not name** — a codec its rows do not carry, or a
+        # lookup that raises.
+        # **`ladder=` ONLY WHERE THE LADDER PRODUCED THE POINT.** *The fallback's one remaining
+        # trigger is the table failing to answer — a codec its rows do not carry — and there
+        # `step` is still the frame's step while the NUMBER is the fit's. Publishing the label
+        # beside it would tell a caller CF's table priced a run it did not price.* **`eta_ladder`
+        # says which row the seed came from, so a seed that came from no row carries no label.**
+        # Found in review; pre-existing, and the seed answering every height is what made it the
+        # whole of the fallback rather than a corner.
         progress.expect(seed if seed is not None else per_frame,
                         basis=(estimate or {}).get("basis") or estimator.BASIS,
                         band_frac=(estimate or {}).get("band_frac"),
-                        ladder=step)
+                        ladder=step if seed is not None else None)
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's

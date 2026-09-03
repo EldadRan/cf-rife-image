@@ -29,7 +29,9 @@ CTU_SIZE = 64
 #: The three heights CF's table names, and nothing else is in the ladder.
 STEPS = {1080: "1080p", 2160: "4K", 4320: "8K"}
 
-#: **The tallest step. Above it there is no row to round up to** — see `seconds_per_frame`.
+#: **The tallest step, and what an above-8K frame is priced from.** *There is no row ABOVE it to
+#: round up to, so `step_for` answers `OUTSIDE` — and `seconds_per_frame` then borrows this step's
+#: seconds rather than publishing nothing, which is CF's ruling of 2026-09-02.*
 TALLEST = 4320
 
 #: **CF's rows, `docs/decisions.md` §11.** `switch` is the DELIVERED FRAME COUNT the row changes
@@ -167,8 +169,10 @@ def step_for(delivered_height):
     reproduce it in the other direction.*
 
     **A ROUNDED STEP AND `OUTSIDE` ARE DIFFERENT STATES.** *A rounded step is between or below
-    the steps and has a row above it to round up to, and says so with the `:rounded` suffix;
-    `OUTSIDE` is above the tallest step and has no row at all.*
+    the steps and has a row ABOVE it to round up to, and says so with the `:rounded` suffix;
+    `OUTSIDE` is above the tallest step, so there is nothing above it and it BORROWS the tallest
+    step's seconds instead.* **The label stays `outside` either way**: a borrowed price is not a
+    measured one, and the field exists to say which.
     """
     height = int(delivered_height)
     if height in STEPS:
@@ -215,27 +219,40 @@ def levers(delivered_height, delivered_frames, codec="h265"):
 
 
 def seconds_per_frame(delivered_height, delivered_frames, codec="h265"):
-    """`(s_per_frame, step)` for the ETA seed. **`s_per_frame` is `None` above the ladder.**
+    """`(s_per_frame, step)` for the ETA seed. **Above the ladder it seeds from 8K and says so.**
 
-    **ABOVE 8K IS UNRULED AND SHIPS NO NUMBER UNTIL IT IS RULED.** *Three readings were put to the
-    gate — seed from the 8K row and label it, scale that row by the pixel ratio, or seed nothing —
-    and CF has not ruled between them.* **A retime does not resize, so a caller with a 12K source
-    produces an above-8K job with no cap to stop it**, which makes this a question about whether
-    the state is served at all rather than about which number to publish.
+    **ABOVE 8K IS PRICED AS 8K — CF, 2026-09-02, ORDERED 2026-09-03.** *Priced, not executed: the
+    SEED comes from 8K's row and the SETTINGS do not.* **`levers` still answers `None` for any
+    height the table does not name, so an above-8K frame takes the CTU-row rule** — 64 pools at
+    8640, against the 32 that 8K's row was measured at. *That is the module header's claim
+    inverted for exactly one case: the price and the settings were measured together and here
+    they part.* **Reported to the gate rather than reconciled here** — the row rule is right about
+    a taller frame's CTU rows and the seed is CF's ruling, and choosing between them is not this
+    file's to do. *This returned `None` until
+    then, and the docstring argued for the absence: three readings were open, and a number shipped
+    ahead of its ruling is indistinguishable afterwards from one CF chose.* **That reasoning was
+    right and its premise is gone**, so the argument goes with the behaviour rather than being
+    left to defend an absence beside a present seed.
 
-    *So the seed is absent here and the label says `outside`.* **An unruled default is the failure
-    this project has paid for**: `snap_tolerance` is not defaulted to 0 for the same reason, and a
-    number shipped ahead of its ruling is indistinguishable afterwards from one CF chose. **No
-    figure is a state §18b already rules honest** — the phase still emits, and the second payload
-    is measured.
+    **THE SEED UNDER-PREDICTS A LARGER FRAME BY CONSTRUCTION AND THE CAP IS WHAT ABSORBS IT.**
+    *8K's row is the slowest measured and a frame above 8K is slower still, so this is the
+    optimistic direction the ladder otherwise exists to refuse.* **`MAX_DELIVERED_FRAMES[OUTSIDE]`
+    is 1,800: at the cap the seed predicts 1,800 s against a 3,600 s kill, so the job may run
+    twice as slow per frame as 8K did and still land.** *The two halves are one ruling and neither
+    is safe alone — a seed with no cap is the 3,663-second failure pointing the other way.*
 
-    **The step is REPORTED whatever it is**, because a rule that is silent about being outside its
-    population reads as being inside it (§9e's symmetry, ruled for a fit and surviving for a
-    table).
+    **THE STEP STAYS `OUTSIDE` AND MUST NOT READ AS 8K.** *The seed comes from 8K's row; the frame
+    is not 8K, and nothing measured says it costs what 8K costs.* **`eta_ladder` is the field that
+    says the frame is off the table, and a seed arriving does not put it on** — which is §9e's
+    symmetry: a rule silent about being outside its population reads as being inside it.
     """
     step = step_for(delivered_height)
     if step == OUTSIDE:
-        return None, OUTSIDE
+        # **8K's ROW, AND THE LABEL IS STILL `OUTSIDE`.** *The band is chosen by the frame count
+        # exactly as an 8K job's is, because the seed IS 8K's row — reading it any other way
+        # would be inventing a second rule for a size nobody has measured.*
+        seed, _ = seconds_per_frame(TALLEST, delivered_frames, codec)
+        return seed, OUTSIDE
     # **The suffix is a label for the caller, not a key** — the seed comes from the row it names.
     name = step[:-len(ROUNDED)] if step.endswith(ROUNDED) else step
     row = ROWS[name].get(codec or "h265")

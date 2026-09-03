@@ -222,8 +222,11 @@ class Progress:
         # one surface over, and §11's third basis value rested on the same argument.*
         #
         # **Taken independently of both the rate and the band, because all three fail
-        # independently** — the step is known even where the seed is not, and above the ladder
-        # that is the only thing the payload can honestly carry.
+        # independently.** *The sentence that stood here added "above the ladder that is the only
+        # thing the payload can honestly carry" — true while an above-8K frame published no seed,
+        # and false since 2026-09-03: it seeds from 8K's row and the label says the row was
+        # borrowed.* **The caller now passes `None` where the seed did not come from the table at
+        # all**, so a label without a rate behind it does not arrive here.
         if ladder:
             self._eta_ladder = str(ladder)
 
