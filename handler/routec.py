@@ -856,17 +856,28 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         # and no `boundary`, reading as a provenance that was recorded and said nothing.* Found
         # in review.
         probed_height = (source or {}).get("height")
+        probed_width = (source or {}).get("width")
         if cap_note is not None:
             cap_note["delivered_height"] = int(height)
+            cap_note["delivered_width"] = int(width)
             cap_note["delivered_step"] = ladder.step_for(delivered_pixels)
             cap_note["delivered_pixels"] = delivered_pixels
             cap_note["frame_cap_delivered"] = cap_here
             cap_note["n_out"] = planned
-        if probed_height is not None and int(probed_height) != int(height):
-            print("[cap] THE TWO READERS DISAGREE: probe says {} and the decoder says {}. The "
-                  "cap was tested on the first and the encode runs at the second; §6d-1 named "
-                  "this hazard and this is the first instance of it.".format(
-                      probed_height, int(height)), flush=True)
+        # **THE TRIPWIRE COMPARES WHAT THE CAP IS A FUNCTION OF, AND IT COMPARED HEIGHT ALONE.**
+        # *That was exact while the cap was keyed on height: any divergence that could move the
+        # cap moved the height.* **Since the cap became a function of AREA, a WIDTH-only
+        # divergence changes the cap while a height comparison stays silent** — probe `2560x1080`
+        # against a decoder's `1920x1080` is 20,000 frames against 30,000, two equal heights, and
+        # a record showing the two readers in agreement. *The instrument written to make §6d-1's
+        # hazard findable stopped covering the axis its own rule depends on.* Found in review.
+        if probed_height is not None and probed_width is not None \
+                and (int(probed_width), int(probed_height)) != (int(width), int(height)):
+            print("[cap] THE TWO READERS DISAGREE: probe says {}x{} ({} px) and the decoder says "
+                  "{}x{} ({} px). The cap was tested on the first and the encode runs at the "
+                  "second; §6d-1 named this hazard and this is the first instance of it.".format(
+                      probed_width, probed_height, int(probed_width) * int(probed_height),
+                      int(width), int(height), delivered_pixels), flush=True)
         # **AN ABSENT COUNT IS A DEFECT AND NOT A SKIP, AND THE FIRST DRAFT SKIPPED.** *`is not
         # None` turned the second cap into a silent no-op on exactly the input it is least able
         # to trust — which is the outcome the paragraph above says has no floor.* The disk bound
@@ -1015,8 +1026,13 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                                       # built from, not the source's probed size. *Pixels rather
                                       # than height since 2026-09-03: a portrait 4K frame is 4K's
                                       # work and was being priced as 8K's.*
+                                      # **`delivered_pixels` is the local resolved at the cap
+                                      # test and NOT a second `width * height`** — this file's
+                                      # own rule two hundred lines down: two calls with the same
+                                      # arguments are two chances for one to be given different
+                                      # ones. Found in review.
                                       substituted,
-                                      delivered_pixels=int(width) * int(height), codec=codec)
+                                      delivered_pixels=delivered_pixels, codec=codec)
 
         writer_cm = encoder.MasterWriter(
             master_path, width, height, float(target_fps), identity,

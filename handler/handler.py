@@ -504,7 +504,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # from. A second sum of "duration times target_fps" could refuse a job on one count and
     # deliver it on another, and the two disagreeing is worse than either.*
     #
-    # **AND IT IS KEYED ON THE PROBER'S HEIGHT, WHICH IS A DIFFERENT READER FROM THE ENCODER'S.**
+    # **AND IT IS KEYED ON THE PROBER'S DIMENSIONS, WHICH ARE A DIFFERENT READER'S FROM THE
+    # ENCODER'S.**
     # *§6d-1 moved the encoder-settings branch OUT of this function for exactly that reason.* **So
     # this is the first of two tests and not the only one**: `routec` re-tests on the writer's own
     # locals, where the delivered frame is the one actually being encoded.
@@ -525,7 +526,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     _note(trace, "cap", "planned_frames", planned_frames)
     _note(trace, "cap", "frame_cap", frame_cap)
     _note(trace, "cap", "probed_height", source["height"])
-    _note(trace, "cap", "delivered_pixels", delivered_pixels)
+    # **`probed_pixels`, NOT `delivered_pixels`, AND THE NAME IS THE WHOLE POINT.** *`routec`
+    # writes into this same block from the DECODER's dimensions, and every other key there is
+    # already disjoint by name for that reason — `probed_height` beside `delivered_height`,
+    # `frame_cap` beside `frame_cap_delivered`. The first draft used one name for both readers,
+    # so the decoder's number silently overwrote the prober's and the block could carry a step
+    # and a cap that its own pixel count cannot produce.* Found in review.
+    _note(trace, "cap", "probed_pixels", delivered_pixels)
     _note(trace, "cap", "step", ladder.step_for(delivered_pixels))
     if planned_frames > frame_cap:
         raise WorkerError(

@@ -1,6 +1,6 @@
 """CF's ruled table — `docs/decisions.md` §11 — and it is ONE table with two readers.
 
-**THE SETTINGS AND THE SEED ARE THE SAME ROWS.** *`docs/current.md` prints them as one table for a
+**THE SETTINGS AND THE SEED COME FROM THE SAME ROWS, ON A 16:9 FRAME.** *`docs/current.md` prints them as one table for a
 reason: an area's `frame_threads / pools` and its `s/frame` were measured together, on the same
 runs, and a job that takes one row's settings is priced by that row's seconds.* **Split across two
 modules they would be two things to keep equal, and the copy that rotted would be
@@ -133,7 +133,7 @@ FETCH_BYTES_PER_S = 54.5 * 1000 * 1000
 #: What `step_for` says about a frame the table does not name.
 #:
 #: **`ROUNDED` IS A SUFFIX ON A STEP AND NOT A STEP OF ITS OWN, AND THE FIRST DRAFT HAD A THIRD
-#: BARE VALUE THAT NO INPUT COULD PRODUCE.** *`step_for` rounds every unnamed height UP to the
+#: BARE VALUE THAT NO INPUT COULD PRODUCE.** *`step_for` rounds every unnamed size UP to the
 #: step above it, so a `derived` return was unreachable — and a 1440p job then published
 #: `eta_ladder: "4K"` while its `pools_basis` said `derived`: two fields on one run disagreeing
 #: about whether CF's table names the frame, and the one a caller reads said it does.* **The seed
@@ -146,9 +146,14 @@ OUTSIDE = "outside"
 
 #: **THE MAXIMUM A JOB MAY DELIVER, PER STEP — CF, 2026-09-02, `docs/decisions.md` §11.**
 #:
-#: **KEYED BY `step_for` AND NOT BY A SECOND TABLE OF SIZES.** *The cap and the seed take one step
-#: boundary from one function; a second table would be free to disagree with the ladder about
-#: where 4K ends, and that disagreement would be invisible until a job landed between them.*
+#: **KEYED BY `step_for`, SO THE CAP AND THE SEED TAKE ONE BOUNDARY FROM ONE FUNCTION.** *A cap
+#: keyed on its own sizes would be free to disagree with the ladder about where 4K ends, and the
+#: disagreement would be invisible until a job landed between them.*
+#:
+#: **`LEVER_HEIGHTS` IS A SECOND TABLE AND THIS SENTENCE USED TO FORBID ONE.** *It is not the
+#: thing that was forbidden: it answers a DIFFERENT question — CTU rows — on a different
+#: quantity, and the three tables are checked against each other below rather than trusted to
+#: stay aligned.* Found in review.
 #:
 #: **ABOVE 8K IS CAPPED HARDER THAN 8K AND THAT IS THE POINT OF THE ROW.** *A frame larger than 8K
 #: is served on 8K's timings, which under-predict it by construction — nothing has been measured
@@ -181,7 +186,7 @@ MAX_DELIVERED_FRAMES = {
 def max_delivered_frames(delivered_pixels):
     """The cap for this frame. **A rounded step takes the step it rounds to.**
 
-    *`step_for` rounds an unmeasured height UP — 1440p is priced at 4K — and the cap follows the
+    *`step_for` rounds an unmeasured size UP — 1440p is priced at 4K — and the cap follows the
     same step for the same reason: the seed says this job costs 4K seconds, so the limit that
     keeps it inside the 3,600 s kill is 4K's.* **Two answers from one step, which is what putting
     them in one module buys.**
@@ -190,8 +195,25 @@ def max_delivered_frames(delivered_pixels):
     return MAX_DELIVERED_FRAMES[step[:-len(ROUNDED)] if step.endswith(ROUNDED) else step]
 
 
+#: **THE THREE TABLES NAME ONE SET OF STEPS, AND UNTIL THIS LINE NOTHING SAID SO.** *`STEPS` keys
+#: on pixels, `LEVER_HEIGHTS` on height and `ROWS`/`MAX_DELIVERED_FRAMES` on the label both
+#: produce — so a step added to one and not the others raises `KeyError` deep inside a job: in
+#: `max_delivered_frames` that is uncaught inside `handler._retime`, and a 1440p job would crash
+#: with a bookkeeping error instead of being capped.* **Checked at import, where it costs nothing
+#: and cannot be reached by a request.** Found in review.
+_LABELS = set(STEPS.values())
+if set(LEVER_HEIGHTS.values()) != _LABELS or set(ROWS) != _LABELS \
+        or set(MAX_DELIVERED_FRAMES) != _LABELS | {OUTSIDE}:
+    raise ImportError(
+        "the ladder's tables name different steps: STEPS {}, LEVER_HEIGHTS {}, ROWS {}, "
+        "MAX_DELIVERED_FRAMES {}. They are four keyings of one set of frames and a step present "
+        "in one and absent from another is a KeyError inside a job.".format(
+            sorted(_LABELS), sorted(set(LEVER_HEIGHTS.values())), sorted(ROWS),
+            sorted(set(MAX_DELIVERED_FRAMES))))
+
+
 def step_for(delivered_pixels):
-    """`"1080p"`, `"4K"`, `"8K"`, `DERIVED`, or `OUTSIDE`.
+    """`"1080p"`, `"4K"`, `"8K"`, any of those three plus `ROUNDED`, or `OUTSIDE`.
 
     **EACH NAMED RESOLUTION IS THE UPPER LIMIT OF ITS STEP AND AN UNMEASURED ONE ROUNDS UP** — CF,
     2026-09-02. *1440p seeds from 4K, not from 1080p.* **The direction is the whole point**: the
@@ -262,7 +284,19 @@ def seconds_per_frame(delivered_pixels, delivered_frames, codec="h265"):
     answers `None` for any height the table does not name.*
 
     **THE HEADER'S CLAIM — that a job taking one row's settings is priced by that row's seconds —
-    SURVIVES WITH ONE STATED EXCEPTION, AND THE EXCEPTION IS NARROWER THAN IT LOOKS.**
+    HOLDS FOR A 16:9 FRAME AND FOR NOTHING ELSE, AND THAT IS A CONSEQUENCE OF THE SPLIT.** *The
+    price keys on pixels and the settings key on height, so the two agree exactly when the frame's
+    height implies its area.* **On any other aspect they name different rows by construction:**
+
+        2560x1080 ultrawide     priced 0.157 from 4K's row      encoded 16/16, 1080p's settings
+        2160x3840 portrait 4K   priced 0.157 from 4K's row      encoded 16/60, no row's settings
+
+    *Neither is a wrong number — the price is the frame's work and the settings are its CTU rows,
+    and both are right about what they measure.* **But a reader taking the header at its word
+    would attribute an ultrawide job's outturn to a row it was not encoded on**, which is why the
+    exception is written here rather than left to be discovered. Found in review.
+
+    **AND THE ORIGINAL EXCEPTION SURVIVES INSIDE ABOVE-8K, WHERE IT IS NARROWER THAN IT LOOKS:**
 
         below 1,200 frames    seeded 0.75, measured at 16/64    encoded at 16/64    they AGREE
         1,200 and above       seeded 0.96, measured at 16/32    encoded at 16/64    they part
