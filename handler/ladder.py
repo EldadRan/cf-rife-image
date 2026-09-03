@@ -130,6 +130,39 @@ FETCH_BYTES_PER_S = 54.5 * 1000 * 1000
 #: built, because inventing the spelling here would be the second time this pair of numbers was
 #: asserted rather than derived.*
 
+#: **WHAT PRICED THE RUN, FOR THE BASIS STRING — and it is not the estimator.** *`eta_basis` read
+#: `predicted_estimator_v3/crf12` on both of the first two delivered runs, for numbers this table
+#: produced: 26 s at 1080p is 225 x 0.115 and 1440 s at 8K is 1500 x 0.96.* **`estimate.time.basis`
+#: is a corpus key**, so every row said `estimator_v3` about a number `estimator_v3` did not
+#: produce, and a query separating table-priced rows from fit-priced ones separated nothing.
+#:
+#: **VERSIONED THE WAY `estimator.BASIS` IS, AND FOR THE SAME REASON.** *A re-ruled table is a
+#: different pricer; a row priced by today's numbers and a row priced by tomorrow's must not
+#: share a label.*
+#:
+#: **AND BUMPING IT IS A CONVENTION WITH NOTHING BEHIND IT, WHICH IS WORTH SAYING PLAINLY.** *The
+#: import guard below compares the tables' KEY SETS and cannot see a value change, so re-ruling
+#: 4K's 0.157 without touching this line pools two pricers under one label — the condition
+#: `estimator.BASIS`'s own comment calls a corpus nobody can sort.* **`estimator.BASIS` carries
+#: the identical exposure**, so this is parity rather than a new hazard; it is named here because
+#: the first draft's comment read as though the rule were enforced. Found in review.
+#:
+#: *It does not carry the step: `eta_ladder` does, and one fact has one home.*
+BASIS = "ruled_table_v1"
+
+
+def basis_for(crf):
+    """`ruled_table_v1/crfNN`, or the bare string where no CRF was declared.
+
+    **§9e REQUIRES THE DECLARED CRF ON THE ANSWER'S OWN KEY AND THE FIRST DRAFT DROPPED IT.** *The
+    fit's `basis_for` puts it there and says why — `eta.first_basis` is the channel §8g grades,
+    and it is not covered by the record's `estimate` block.* **These rows are CRF-12
+    measurements**, so a CRF-20 job is priced off-axis; a basis that does not say so loses the
+    declaration on nearly all traffic, since the table prices almost every job. *Found in review:
+    the first version traded one mislabelling for the loss of a declared input on the same field.*
+    """
+    return BASIS if crf is None else "{}/crf{}".format(BASIS, crf)
+
 #: What `step_for` says about a frame the table does not name.
 #:
 #: **`ROUNDED` IS A SUFFIX ON A STEP AND NOT A STEP OF ITS OWN, AND THE FIRST DRAFT HAD A THIRD

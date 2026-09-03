@@ -1596,12 +1596,24 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
     #
     # **The ladder is a dict lookup and the fit is a model**, so the cheap, ruled, always-present
     # answer is published first and the fit refines nothing that this already said.
-    seed, step = None, None
+    seed, step, priced_by_table = None, None, False
     try:
         seed, step = ladder.seconds_per_frame(
             delivered_pixels, stats.get("n_out"), codec=codec)
-        if seed is not None:
-            progress.expect(seed, basis="measured", ladder=step)
+        # **`> 0` AND NOT MERELY `is not None`, BECAUSE `expect` GATES THE RATE ON TRUTHINESS.**
+        # *A zero seed would set the rung and drop the rate and the basis, filing a rung beside an
+        # `observed` ETA.* Not reachable from today's rows; the condition is the one `expect`
+        # actually applies.
+        priced_by_table = seed is not None and seed > 0
+        if priced_by_table:
+            # **THE BASIS GOES ON *THIS* CALL AND THE FIRST DRAFT PUT IT ONLY ON THE REPUBLISH.**
+            # *This one is inside the same `try` as the fit, and it is the seed that survives when
+            # the fit RAISES — so on exactly the runs where the ruled table is the ONLY pricer,
+            # the basis normalised to a bare `predicted` and a query for the table's label missed
+            # them.* **The case the wave exists to enable, failing on the case it most wants.**
+            # Found in review.
+            progress.expect(seed, basis=ladder.basis_for((encode_arm or {}).get("crf")),
+                            ladder=step)
             # **THE `outside` CASE SAYS WHOSE ROW IT BORROWED, AND THE FIRST DRAFT DID NOT.**
             # *`ROWS` has no `outside` key — only `MAX_DELIVERED_FRAMES` does — so the sentence
             # "from the outside step of CF's ruled table" named a row that does not exist, and a
@@ -1676,10 +1688,19 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # says which row the seed came from, so a seed that came from no row carries no label.**
         # Found in review; pre-existing, and the seed answering every height is what made it the
         # whole of the fallback rather than a corner.
-        progress.expect(seed if seed is not None else per_frame,
-                        basis=(estimate or {}).get("basis") or estimator.BASIS,
+        # **AND THE BASIS NAMES WHAT PRICED IT, WHICH IS THE SAME SENTENCE RUN THE OTHER WAY.**
+        # *The clause above withholds the ladder label when the FIT produced the point, because
+        # publishing it would tell a caller CF's table priced a run it did not.* **When the table
+        # DOES price the run, crediting the fit is that error mirrored** — and it shipped on both
+        # of the first two delivered runs: `predicted_estimator_v3/crf12` beside 26 s at 1080p,
+        # which is 225 x 0.115, and beside 1440 s at 8K, which is 1500 x 0.96. *`estimate.time.
+        # basis` is a corpus key, so every row claimed a pricer that did not price it.*
+        progress.expect(seed if priced_by_table else per_frame,
+                        basis=(ladder.basis_for((encode_arm or {}).get("crf"))
+                               if priced_by_table
+                               else (estimate or {}).get("basis") or estimator.BASIS),
                         band_frac=(estimate or {}).get("band_frac"),
-                        ladder=step if seed is not None else None)
+                        ladder=step if priced_by_table else None)
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's

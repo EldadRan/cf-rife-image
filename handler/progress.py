@@ -785,8 +785,25 @@ class Progress:
         # A payload built with an ETA and then dropped inside MIN_INTERVAL_S was never a promise
         # anybody could read.
         if self._first_eta is None and payload.get("eta_s") is not None:
+            # **`first_ladder` RIDES WITH THEM, AND WITHOUT IT HALF OF §11 IS UNFINDABLE.**
+            # *`eta_ladder` reached 20 retained payloads on the 8K run and appears nowhere in its
+            # run record: a caller watching live could see which rung priced the job and nobody
+            # reading `records/` afterwards can.* **`frame_threads_basis` and `pools_basis` ARE on
+            # the record**, so one half of the same ruling was findable in the corpus and the
+            # other was not — and that ruling exists because nobody can otherwise find those jobs
+            # later to check whether the rule held. *`F-2026-09-03-2`.*
             self._first_eta = {"first_s": payload["eta_s"],
-                               "first_basis": payload.get("eta_basis")}
+                               "first_basis": payload.get("eta_basis"),
+                               # **`ladder`, NOT `first_ladder`, AND THE NAME IS THE FIX.** *The
+                               # rung describes what SEEDED the run and is set once; `first_s`
+                               # and `first_basis` describe the first ETA PUBLISHED. Those are
+                               # the same payload on every ordinary run, and they part when the
+                               # forced emit is skipped — the fit raising is one way — so the
+                               # first published ETA is a MEASURED one and a key called
+                               # `first_ladder` would read as "this measured ETA came from rung
+                               # 8K".* **A field named for the seed cannot be misread as a claim
+                               # about the payload beside it.** Found in review.
+                               "ladder": self._eta_ladder}
         # **Before the POST, not after it.** The emit below is best-effort and swallows its own
         # failure; a sample taken after it would be skipped on exactly the jobs where the
         # progress channel is unhealthy, which are the jobs a load strip is most wanted for.
