@@ -10,10 +10,18 @@ indistinguishable from the live one** — which is this project's central hazard
 So `encoder` reads the levers from here and the ETA seed comes from here, and neither owns the
 numbers.
 
-**THE ROWS ARE KEYED ON DELIVERED HEIGHT AND NOT ON PIXELS.** *A CTU-64 frame has `height / 64`
-rows; WPP cannot use more pools than it has rows.* **A portrait 1080x1920 clip has 1080p's pixel
-count and 30 CTU rows**, so a bucket keyed on area starves it — and vertical video is the case a
-three-bucket table has no answer for at all.
+**TWO KEYINGS, DELIBERATELY, BECAUSE THE TABLE ANSWERS TWO QUESTIONS.**
+
+    the price and the cap    DELIVERED PIXELS — they are questions about WORK, and a frame's
+                             work is its area. `step_for` and everything that reads it.
+    the threading levers     HEIGHT — WPP counts CTU rows and a CTU-64 frame has `height / 64`
+                             of them, so pools is a question about rows. `levers` alone.
+
+**ONE FUNCTION ANSWERED BOTH UNTIL 2026-09-03 AND KEYED ON HEIGHT**, which is a frame's pixel
+count only when it is 16:9. *A 2160x3840 portrait 4K clip took 8K's row — six times the cap and
+six times the price of the identical pixel count in landscape — and a 2560x1080 ultrawide took
+1080p EXACTLY, under-priced for a third more work and over-capped, with no `:rounded` suffix to
+make it findable.* **The second is the direction the cap exists to prevent.**
 
 **`s/frame` IS `wall_s` OVER DELIVERED FRAMES, POOLED ACROSS THE BAND** — *not `calc_t`, not
 `frame_s`* — **so it already contains fetch, decode and upload.** *A prediction must contain the
@@ -26,13 +34,36 @@ and `ft=2` runs. *That is the conservative direction and it is deliberate.*
 #: HEVC's coding-tree-unit size, which is what makes the row count `height / 64`.
 CTU_SIZE = 64
 
-#: The three heights CF's table names, and nothing else is in the ladder.
-STEPS = {1080: "1080p", 2160: "4K", 4320: "8K"}
+#: **THE THREE STEPS, IN DELIVERED PIXELS, AND THEY ARE THE TEST FILES' OWN PIXEL COUNTS.**
+#: *`1920x1080`, `3840x2160`, `7680x4320` — CF, 2026-09-03, asked directly: the names are those
+#: files and nothing else.*
+#:
+#: **THIS WAS KEYED ON HEIGHT UNTIL 2026-09-03 AND A HEIGHT IS ONLY THESE COUNTS ON A 16:9
+#: FRAME.** *`docs/current.md` has said "keyed on DELIVERED pixels" since the ladder was written,
+#: and gave the portrait case as its worked example; the code and the document disagreed from the
+#: first commit and nothing caught it, because while only an ETA rode on it the error was
+#: conservative.* **The cap made it functional**: it decides whether a job is refused.
+#:
+#:     2160x3840 portrait 4K   8,294,400 px   by height it took 8K's row — priced 0.96 against
+#:                                            0.157 and capped 3,000 against 20,000, which
+#:                                            limits a vertical 4K clip to 50 seconds at 60 fps
+#:     2560x1080 ultrawide     2,764,800 px   by height it took `1080p` EXACTLY, with no
+#:                                            `:rounded` — under-priced at 0.115 for a third
+#:                                            more work, over-capped at 30,000, and not
+#:                                            findable afterwards as anything unusual
+#:
+#: **THE SECOND IS THE DIRECTION THE CAP EXISTS TO PREVENT**, and it was the silent one.
+STEPS = {2_073_600: "1080p", 8_294_400: "4K", 33_177_600: "8K"}
 
-#: **The tallest step, and what an above-8K frame is priced from.** *There is no row ABOVE it to
-#: round up to, so `step_for` answers `OUTSIDE` — and `seconds_per_frame` then borrows this step's
-#: seconds rather than publishing nothing, which is CF's ruling of 2026-09-02.*
-TALLEST = 4320
+#: **`levers` READS THIS AND NOT `STEPS`, AND THAT SEPARATION IS THE WHOLE FIX.** *WPP counts CTU
+#: ROWS, so the thread settings are a question about HEIGHT — `height / 64` — while the price and
+#: the cap are questions about WORK, which is pixels.* **One function was answering both.**
+LEVER_HEIGHTS = {1080: "1080p", 2160: "4K", 4320: "8K"}
+
+#: **The largest step, in pixels, and what an above-8K frame is priced from.** *There is no row
+#: ABOVE it to round up to, so `step_for` answers `OUTSIDE` — and `seconds_per_frame` then borrows
+#: this step's seconds rather than publishing nothing, which is CF's ruling of 2026-09-02.*
+LARGEST = 33_177_600
 
 #: **CF's rows, `docs/decisions.md` §11.** `switch` is the DELIVERED FRAME COUNT the row changes
 #: at: below it takes `below`, at it and above takes `at`. **Both switches sit on the safe side of
@@ -147,7 +178,7 @@ MAX_DELIVERED_FRAMES = {
 }
 
 
-def max_delivered_frames(delivered_height):
+def max_delivered_frames(delivered_pixels):
     """The cap for this frame. **A rounded step takes the step it rounds to.**
 
     *`step_for` rounds an unmeasured height UP — 1440p is priced at 4K — and the cap follows the
@@ -155,11 +186,11 @@ def max_delivered_frames(delivered_height):
     keeps it inside the 3,600 s kill is 4K's.* **Two answers from one step, which is what putting
     them in one module buys.**
     """
-    step = step_for(delivered_height)
+    step = step_for(delivered_pixels)
     return MAX_DELIVERED_FRAMES[step[:-len(ROUNDED)] if step.endswith(ROUNDED) else step]
 
 
-def step_for(delivered_height):
+def step_for(delivered_pixels):
     """`"1080p"`, `"4K"`, `"8K"`, `DERIVED`, or `OUTSIDE`.
 
     **EACH NAMED RESOLUTION IS THE UPPER LIMIT OF ITS STEP AND AN UNMEASURED ONE ROUNDS UP** — CF,
@@ -174,17 +205,17 @@ def step_for(delivered_height):
     step's seconds instead.* **The label stays `outside` either way**: a borrowed price is not a
     measured one, and the field exists to say which.
     """
-    height = int(delivered_height)
-    if height in STEPS:
-        return STEPS[height]
-    if height > TALLEST:
+    pixels = int(delivered_pixels)
+    if pixels in STEPS:
+        return STEPS[pixels]
+    if pixels > LARGEST:
         return OUTSIDE
     for boundary in sorted(STEPS):
-        if height < boundary:
+        if pixels < boundary:
             return STEPS[boundary] + ROUNDED
-    # **Unreachable while `TALLEST` is the largest key of `STEPS`, and it is not an assertion of
-    # that.** *A step added above 4320 without moving `TALLEST` would land here, and returning
-    # `OUTSIDE` is the honest answer for a height no row was found for.*
+    # **Unreachable while `LARGEST` is the largest key of `STEPS`, and it is not an assertion of
+    # that.** *A step added above it without moving `LARGEST` would land here, and returning
+    # `OUTSIDE` is the honest answer for a size no row was found for.*
     return OUTSIDE
 
 
@@ -201,11 +232,16 @@ def levers(delivered_height, delivered_frames, codec="h265"):
     `derived` basis exists to make visible.
 
     **THE LEVERS TAKE THE EXACT STEP AND NEVER THE ROUNDED ONE.** *`step_for` rounds an unmeasured
-    height UP for the seed, which is the conservative direction for a TIME estimate — but a
-    setting is not an estimate: handing a 1440p frame 4K's 32 pools would be a claim about its CTU
-    rows, and it has 23.*
+    size UP for the seed, which is the conservative direction for a TIME estimate — but a setting
+    is not an estimate: handing a 1440p frame 4K's 32 pools would be a claim about its CTU rows,
+    and it has 23.*
+
+    **AND IT READS `LEVER_HEIGHTS`, NOT `STEPS`.** *`STEPS` moved to pixels on 2026-09-03 because
+    the price and the cap are questions about work; this one did not, because CTU rows are a
+    question about height.* **The two tables name the same three frames and are keyed on
+    different quantities, which is why they are two tables.*
     """
-    name = STEPS.get(int(delivered_height))
+    name = LEVER_HEIGHTS.get(int(delivered_height))
     if name is None:
         return None
     row = ROWS[name].get(codec or "h265")
@@ -218,7 +254,7 @@ def levers(delivered_height, delivered_frames, codec="h265"):
     return (row["at"] if int(delivered_frames) >= row["switch"] else row["below"])[0]
 
 
-def seconds_per_frame(delivered_height, delivered_frames, codec="h265"):
+def seconds_per_frame(delivered_pixels, delivered_frames, codec="h265"):
     """`(s_per_frame, step)` for the ETA seed. **Above the ladder it seeds from 8K and says so.**
 
     **ABOVE 8K IS PRICED AS 8K — CF, 2026-09-02, ORDERED 2026-09-03.** *Priced, not executed: the
@@ -259,12 +295,12 @@ def seconds_per_frame(delivered_height, delivered_frames, codec="h265"):
     says the frame is off the table, and a seed arriving does not put it on** — which is §9e's
     symmetry: a rule silent about being outside its population reads as being inside it.
     """
-    step = step_for(delivered_height)
+    step = step_for(delivered_pixels)
     if step == OUTSIDE:
         # **8K's ROW, AND THE LABEL IS STILL `OUTSIDE`.** *The band is chosen by the frame count
         # exactly as an 8K job's is, because the seed IS 8K's row — reading it any other way
         # would be inventing a second rule for a size nobody has measured.*
-        seed, _ = seconds_per_frame(TALLEST, delivered_frames, codec)
+        seed, _ = seconds_per_frame(LARGEST, delivered_frames, codec)
         return seed, OUTSIDE
     # **The suffix is a label for the caller, not a key** — the seed comes from the row it names.
     name = step[:-len(ROUNDED)] if step.endswith(ROUNDED) else step

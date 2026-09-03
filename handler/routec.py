@@ -831,7 +831,12 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                 "refused on one count and delivered on another is the state this guard "
                 "exists to make impossible to reach silently.".format(
                     expected_frames, planned))
-        cap_here = ladder.max_delivered_frames(int(height))
+        # **PIXELS HERE TOO, AND FROM THE WRITER'S OWN TWO LOCALS.** *`width` and `height` are
+        # what `MasterWriter` is constructed with, so the cap and the encode cannot be deciding
+        # against different answers to how big the frame is — §6d-1's rule, and the reason this
+        # second test exists at all.*
+        delivered_pixels = int(width) * int(height)
+        cap_here = ladder.max_delivered_frames(delivered_pixels)
         # **THE DIVERGENCE IS RECORDED WHETHER OR NOT IT CHANGES THE VERDICT — the gate's order,
         # and the reason is that nobody has ever seen these two readers disagree.** *The first
         # instance is worth more than the refusal it would trigger: it is the evidence that the
@@ -853,7 +858,8 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
         probed_height = (source or {}).get("height")
         if cap_note is not None:
             cap_note["delivered_height"] = int(height)
-            cap_note["delivered_step"] = ladder.step_for(int(height))
+            cap_note["delivered_step"] = ladder.step_for(delivered_pixels)
+            cap_note["delivered_pixels"] = delivered_pixels
             cap_note["frame_cap_delivered"] = cap_here
             cap_note["n_out"] = planned
         if probed_height is not None and int(probed_height) != int(height):
@@ -881,7 +887,7 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
                 "Reaching here means the two readers disagreed about the source's size — the "
                 "job is refused before the encode rather than killed at the platform's "
                 "3,600-second wall.".format(
-                    planned, ladder.step_for(int(height)), cap_here, int(width), int(height)))
+                    planned, ladder.step_for(delivered_pixels), cap_here, int(width), int(height)))
 
         encode_settings, encode_provenance = encoder.resolve_defaults(
             int(width) * int(height), codec=codec,
@@ -1004,10 +1010,13 @@ def retime(source, source_path, master_path, interpolator, target_fps, identity,
             # which is what `begin_phase` below excludes from the rate rather than what the ETA
             # is priced from.
             estimate = _seed_estimate(progress, source, stats, scale, encode_arm, armed,
-                                      # **THE DELIVERED HEIGHT AND THE CODEC, because §11's rows
-                                      # are keyed on both** — and it is the same `height` local
-                                      # the writer is built from, not the source's probed size.
-                                      substituted, delivered_height=int(height), codec=codec)
+                                      # **DELIVERED PIXELS AND THE CODEC, because §11's rows are
+                                      # keyed on both** — from the same two locals the writer is
+                                      # built from, not the source's probed size. *Pixels rather
+                                      # than height since 2026-09-03: a portrait 4K frame is 4K's
+                                      # work and was being priced as 8K's.*
+                                      substituted,
+                                      delivered_pixels=int(width) * int(height), codec=codec)
 
         writer_cm = encoder.MasterWriter(
             master_path, width, height, float(target_fps), identity,
@@ -1545,7 +1554,7 @@ def _print_write_distribution(writer):
 
 
 def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
-                   substituted=None, delivered_height=None, codec=None):
+                   substituted=None, delivered_pixels=None, codec=None):
     """Price the job, seed the ETA with it, and hand the whole answer back. **Never raises.**
 
     Returns the §9b estimate — point, band, basis and corpus — or None where it could not be
@@ -1574,7 +1583,7 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
     seed, step = None, None
     try:
         seed, step = ladder.seconds_per_frame(
-            delivered_height, stats.get("n_out"), codec=codec)
+            delivered_pixels, stats.get("n_out"), codec=codec)
         if seed is not None:
             progress.expect(seed, basis="measured", ladder=step)
             # **THE `outside` CASE SAYS WHOSE ROW IT BORROWED, AND THE FIRST DRAFT DID NOT.**

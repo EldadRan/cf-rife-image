@@ -510,7 +510,13 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # locals, where the delivered frame is the one actually being encoded.
     planned_frames = interpolate_module.target_count(
         routec.source_frame_count(source), source["fps"], config["target_fps"])
-    frame_cap = ladder.max_delivered_frames(source["height"])
+    # **DELIVERED PIXELS, NOT HEIGHT.** *The cap is a question about work and a frame's work is
+    # its area; keying on height gave a 2160x3840 portrait 4K clip 8K's cap — 3,000 frames, fifty
+    # seconds of video — and gave a 2560x1080 ultrawide 1080p's, under-priced for a third more
+    # work. Fixed 2026-09-03.* **`source["width"]` is read two lines above this for the fit
+    # predicate, so both numbers were already in hand.**
+    delivered_pixels = int(source["width"]) * int(source["height"])
+    frame_cap = ladder.max_delivered_frames(delivered_pixels)
     # **`cap`, ITS OWN BLOCK, AND `runrecord` LIFTS IT BY NAME.** *The first draft filed these
     # under `trace["plan"]`, which `_write_run_record` does not enumerate and `runrecord` already
     # uses for the estimator's configuration — so the pair was written on every run and read on
@@ -519,7 +525,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     _note(trace, "cap", "planned_frames", planned_frames)
     _note(trace, "cap", "frame_cap", frame_cap)
     _note(trace, "cap", "probed_height", source["height"])
-    _note(trace, "cap", "step", ladder.step_for(source["height"]))
+    _note(trace, "cap", "delivered_pixels", delivered_pixels)
+    _note(trace, "cap", "step", ladder.step_for(delivered_pixels))
     if planned_frames > frame_cap:
         raise WorkerError(
             errors.CAPACITY_EXCEEDED,
@@ -528,7 +535,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
             "wall with a half-written master. The source had to be fetched to know this — "
             "delivered frames is its duration times target_fps — so the download is spent and "
             "the refusal is not. Send a shorter clip, a lower target_fps, or split it.".format(
-                planned_frames, ladder.step_for(source["height"]), frame_cap))
+                planned_frames, ladder.step_for(delivered_pixels), frame_cap))
 
     if ok is False:
         raise WorkerError(
