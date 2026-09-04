@@ -7,8 +7,13 @@ for. Wiring it to anything is somebody else's step.
 
 Spec: `docs/archive/gate-findings-archive.md` §5 (the frame plan, the tail hold, the snap tolerance), §5b (the
 float defect), §9 (what is portable from the reference script) and §9b (what is forbidden).
-`fable/retime_oracle.py` is the same contract executable and is the authority: **if this file and
-that one disagree, one of them is a bug and it gets a decision entry rather than a patch.** The
+`cf-rife-project/gate_scripts/retime_oracle.py` is the same contract executable and is the
+authority: **if this file and that one disagree, one of them is a bug and it gets a decision entry
+rather than a patch.** *The path read `fable/retime_oracle.py` until 2026-09-04 and no `fable/`
+has ever existed in either rife repository — residue from the upscale project, carried across in
+the seed.* **The oracle is real and the property below is genuinely held; only the path was
+wrong**, which is the failure mode this project is most exposed to: a cite that names the right
+claim at an address nobody can reach. The
 arithmetic here is written from the contract rather than copied from the oracle, because two
 independent statements of one rule is the point — a plan that agreed with the oracle by sharing
 its code would prove nothing.

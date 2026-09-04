@@ -866,13 +866,29 @@ class MasterWriter:
             # not one of them video — the relocated `moov` atom.*
             #
             # **ITS ONE CONFORMANCE CONDITION IS THAT THE PARAMETER SETS STAY OUT-OF-BAND, AND
-            # THAT IS NOT SOMETHING THIS LINE CAN GUARANTEE.** libx265 writes them to `hvcC`
-            # today (`extradata_size=2458` on the probe-back), which is why the remux was a
-            # stream copy. **The day anyone puts `repeat-headers=1` into `x265_params` this flag
-            # becomes an assertion the file does not support** — and it would fail SILENTLY, with
-            # `output.codec` still reading `hevc` and every certification still green. *That is
-            # why the tag is read back into `output.codec_tag_string` rather than trusted here:
-            # the flag is the easy half and the instrument is the fix.*
+            # THE MUXER ENFORCES THAT RATHER THAN TRUSTING THE ENCODER.** *Measured across all
+            # four combinations on ffmpeg 9.0: `repeat-headers=1` puts the sets in the samples
+            # under the default tag, and asking for `hvc1` makes the muxer strip them again.* So
+            # the two settings do not fight, and a later `repeat-headers=1` in `x265_params`
+            # cannot quietly make this flag a lie.
+            #
+            # **NOT PROVEN ON THE ffmpeg THIS IMAGE PINS** — `FFMPEG_ASSET=ffmpeg-n8.1.2-...`,
+            # `Dockerfile:38`, against 9.0 on the host where it was measured. *A measurement whose
+            # version is not named is one nobody can re-check, and a muxer behaviour is not a
+            # contract.*
+            #
+            # **THE CLAUSE THIS REPLACES SAID THE OPPOSITE AND WAS FALSE**: that
+            # `repeat-headers=1` would make the tag "an assertion the file does not support" and
+            # would "fail silently". *It was written from `F-2026-09-04-7`'s forward-looking
+            # hazard, which the measurement above does not bear out.*
+            #
+            # **AND THE REASON TO READ THE TAG BACK DOES NOT DEPEND ON ANY OF THAT.** It stands on
+            # its own and always was the stronger argument: **nothing else in this worker can see
+            # whether a delivered file OPENS.** `output.codec` answered `hevc` on 123 masters
+            # QuickTime refuses, because it reads `codec_name` and the tag is a different field.
+            # *A comment that argues for a real instrument from a false premise is worse than one
+            # that argues badly — the day somebody checks the premise, they discard the conclusion
+            # with it.*
             #
             # **h264 is untouched.** Its `avc1` default is correct and universal, and a `-tag:v`
             # on that branch would be a second thing to keep right for no gain.

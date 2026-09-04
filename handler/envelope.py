@@ -1,10 +1,25 @@
 """The request surface: the codec, the bit depth, the retime's own fields.
 
-`fable/envelope_oracle.py` is this section of the contract executable and is the authority — if
-this file and that one disagree, one of them is a bug and it gets a decision entry rather than a
-patch. The rules are written from contract §5c rather than copied from the oracle, for the reason
-the retime plan is: two independent statements of one rule is the point, and agreement reached by
-sharing code proves nothing.
+**THE AUTHORITY IS `cf-rife-project/docs/api.md` §1a AND `docs/decisions.md` §12, AND THERE IS NO
+ORACLE FOR THIS SURFACE.** *This docstring named `fable/envelope_oracle.py` until 2026-09-04. No
+such file has ever existed — under that name or any other — and no `fable/` directory exists in
+either rife repository; it is residue from the upscale project, carried across in the seed.*
+**`interpolate.py`'s equivalent cite was a path error and this one was not**: that oracle is real
+and only its address was wrong.
+
+**SO THE "TWO INDEPENDENT STATEMENTS OF ONE RULE" PROPERTY IS NOT HELD FOR WHAT THIS FILE
+COMPUTES, AND SAYING SO IS THE POINT OF THIS PARAGRAPH.** *Nothing states the derivation rules a
+second time, so a defect in `derive` is caught by reading and by the delivered artefacts, and not
+by disagreement with an independent statement.* **A file claiming an authority that does not exist
+is the same defect as a check that cannot fail: it reads as covered.** The gap is named here rather
+than papered over, because the day someone goes looking for the oracle is the day they discover
+what this surface actually rests on, and they should not discover it then.
+
+**What DOES exist is `gate_scripts/request_witness.py`, and it is narrower than an oracle in a way
+that matters.** *Its field lists are TRANSCRIBED from `api.md` §1a rather than imported from this
+module (`request_witness.py:35`), so it is genuinely independent* — but it grades the REFUSAL
+surface, which names are accepted and which are declined and with what code. **It says nothing
+about what `derive` returns for a request it accepts**, which is most of this file.
 
 **Kept out of `validation.py` deliberately.** That module is release 2's surface and is large; a
 release-3 block folded into it would be indistinguishable from the fields that have always been
