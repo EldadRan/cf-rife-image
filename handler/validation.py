@@ -103,7 +103,19 @@ TOP_LEVEL_DEBUG = (
     "force_scale",
 )
 
-REQUIRED_TOP_LEVEL = ("request_id", "source_url", "output", "params")
+#: **`run_record` JOINED THIS ON 2026-09-04, RULED BY CF: A DELIVERED JOB IS AUDITABLE BY
+#: CONSTRUCTION RATHER THAN BY CONVENTION.** *It was optional, so a job could run, deliver and
+#: leave nothing behind — and `runrecord.write`'s own "skipped: the request carried no run_record
+#: URL" line says it expected to be printing that until CF's front-end started minting the field.*
+#:
+#: **IT DOES NOT MAKE EVERY JOB AUDITABLE AND THE LIMIT IS NAMED RATHER THAN LEFT.** *A VALIDATION
+#: refusal returns at `handler.py:277`, above the record's `try`/`finally` — so it files nothing
+#: whether this field is required or not, and requiring it is one more name such a request can be
+#: refused for.* **`F-2026-09-04-2`, not ordered, and deliberately not built toward**: the record
+#: is addressed from the VALIDATED request, and `runrecord` echoes an allowlist built for the
+#: normalised shape whose names do not exist on a raw `job_input` — which carries
+#: `output.secret_access_key` and a presigned `source_url` whole.
+REQUIRED_TOP_LEVEL = ("request_id", "source_url", "output", "params", "run_record")
 
 # Everything that changes the output. Strict: a name here that this worker does not implement is
 # refused by name rather than ignored.
@@ -235,17 +247,6 @@ def _as_int(value, field):
     if isinstance(value, bool) or not isinstance(value, int):
         raise WorkerError(INVALID_FIELD_VALUE, "field '{}' must be an integer".format(field))
     return value
-
-
-def _bool_or_none(value, field):
-    """A forced boolean, where absent means "the configuration decides" rather than False.
-
-    Distinct from `_as_bool` because these three states are all meaningful for a forcing field:
-    force it on, force it off, or do not force it. Collapsing absent to False would make
-    `force_vae_decode_tiled` unsettable to True by omission — and, worse, would silently turn
-    tiling *off* on every job that never mentioned it.
-    """
-    return None if value is None else _as_bool(value, field)
 
 
 def _as_bool(value, field):
@@ -623,9 +624,18 @@ def validate(job_input):
     if reserve is not None:
         reserve = _as_str(reserve, "diagnostics_reserve")
 
-    run_record = job_input.get("run_record")
-    if run_record is not None:
-        run_record = _as_str(run_record, "run_record")
+    # **REQUIRED, AND AN EMPTY STRING IS NOT A URL.** *`_require` only tests for `None`, so
+    # `run_record: ""` passed the door — and `runrecord.write`'s first branch is `if not url:`,
+    # which SKIPS and says "this is not an error". A delivered job with no record, which is the
+    # state the ruling exists to make impossible.* **`request_id` is guarded this way one
+    # function up and this field was not.** Found in review.
+    run_record = _as_str(job_input["run_record"], "run_record")
+    if not run_record.strip():
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'run_record' must not be empty: it is the presigned PUT this run's record is "
+            "written to, and an empty string is a job that delivers and leaves nothing behind — "
+            "which is what requiring the field exists to prevent.")
 
     # Flattened for the handler's use. The **wire** shape is nested; this is the normalised form
     # everything downstream reads, so the nesting exists exactly once — here — rather than being
