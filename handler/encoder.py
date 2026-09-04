@@ -852,6 +852,31 @@ class MasterWriter:
         # cheap, and caught by the first h265 job anybody runs; this is not.*
         if self.codec == "h265":
             command += ["-x265-params", self.x265_params]
+            # **`hvc1`, because `hev1` is a file nobody in Apple's chain can open**
+            # (`docs/gate-findings.md` F-2026-09-04-7). The two tags carry the SAME bitstream and
+            # differ only in where the parameter sets are permitted to live: `hvc1` requires them
+            # out-of-band in the `hvcC` box, `hev1` also permits them in-band, and QuickTime,
+            # Safari and every Apple decoder decline `hev1` on sight. **ffmpeg's MP4 muxer
+            # defaults to `hev1`** and this command set no `-tag:v`, so the default stood on
+            # every h265 master this worker has ever delivered.
+            #
+            # **It is strictly wider rather than a trade.** Everything that accepts `hev1`
+            # accepts `hvc1`; only one of them plays on Apple. *Witnessed rather than reasoned:
+            # the delivered master remuxed `-c copy -tag:v hvc1` plays, 255 bytes different and
+            # not one of them video — the relocated `moov` atom.*
+            #
+            # **ITS ONE CONFORMANCE CONDITION IS THAT THE PARAMETER SETS STAY OUT-OF-BAND, AND
+            # THAT IS NOT SOMETHING THIS LINE CAN GUARANTEE.** libx265 writes them to `hvcC`
+            # today (`extradata_size=2458` on the probe-back), which is why the remux was a
+            # stream copy. **The day anyone puts `repeat-headers=1` into `x265_params` this flag
+            # becomes an assertion the file does not support** — and it would fail SILENTLY, with
+            # `output.codec` still reading `hevc` and every certification still green. *That is
+            # why the tag is read back into `output.codec_tag_string` rather than trusted here:
+            # the flag is the easy half and the instrument is the fix.*
+            #
+            # **h264 is untouched.** Its `avc1` default is correct and universal, and a `-tag:v`
+            # on that branch would be a second thing to keep right for no gain.
+            command += ["-tag:v", "hvc1"]
         else:
             command += ["-x264-params", self.x264_params]
 

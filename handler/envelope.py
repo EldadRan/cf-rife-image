@@ -12,7 +12,8 @@ there, and the one property protecting production — that a request carrying no
 behaves exactly as it did — is easiest to keep true when the new surface is one file that can be
 read end to end.
 """
-from errors import FIELD_NOT_SUPPORTED, INVALID_FIELD_VALUE, WorkerError
+from errors import (FIELD_NOT_SUPPORTED, INVALID_FIELD_VALUE, MISSING_REQUIRED_FIELD,
+                    WorkerError)
 
 #: **`source` means "match the input's codec"**, which is a release-3 field and not a default.
 CODECS = ("h264", "h265", "source")
@@ -113,8 +114,19 @@ BIT_DEPTHS = (8, 10)
 #: by construction (`docs/archive/instrumentation-archive.md` §15a).
 DEFAULT_BIT_DEPTH = 8
 
-#: CF: request-carried, default 60.
-DEFAULT_TARGET_FPS = 60.0
+#: **`DEFAULT_TARGET_FPS` IS GONE AND WAS DELETED RATHER THAN LEFT UNREAD** (CF, 2026-09-04).
+#: It was `60.0`, and it meant a request that named no output frame rate was SERVED at a rate
+#: nobody asked for — on a worker whose entire capability is choosing that rate. *A default for
+#: the one field the job is FOR is not a convenience; it is the worker guessing the answer.*
+#:
+#: **The deletion is half the ruling and not a tidy-up.** A constant left sitting beside a rule
+#: that no longer reads it is the next reader's evidence that the rule does not apply — the same
+#: hazard the `OUTPUT_*_FIELDS` split names two screens up, where an unread union was removed
+#: rather than kept as a third name for a fact two lists already held.
+#:
+#: **IT IS A BREAKING CHANGE TO A CONTRACT A CLIENT IS HOLDING.** *`api.md` already says
+#: REQUIRED and carries a transitional line naming the live default; that line comes out when
+#: the image enforcing this ships.*
 
 #: **`target_fps` AND `snap_tolerance` SIT IN `params` AND THE `interpolate` BLOCK IS GONE.**
 #: *That block was the seeded worker's switch between upscaling and retiming; with one capability
@@ -239,7 +251,26 @@ def derive(params, debug=False):
     # name at the top level until today, for want of the `interpolate` object it belonged to —
     # so the field a caller most obviously wants to send was the one spelling the contract would
     # not take.*
-    target_fps = params.get("target_fps", DEFAULT_TARGET_FPS)
+    # **REQUIRED, and absent is its own refusal rather than a bad value** (CF, 2026-09-04). The
+    # two codes are two different facts about the request and the caller's next action differs:
+    # `missing_required_field` says send the field, `invalid_field_value` says the field you sent
+    # is not a rate. *Collapsing them into the positive-number check below would tell a caller
+    # who sent nothing that their nothing was not positive.* Same split `refuse_field` makes one
+    # screen up between a gated name and an unknown one.
+    #
+    # **`is None` rather than `not in params`, which is `validation._require`'s test exactly**
+    # (`validation.py:239`). An explicit `"target_fps": null` is a caller declining to choose,
+    # which is the state this ruling refuses, and reading it as "present, therefore check the
+    # type" would refuse it with the wrong code.
+    target_fps = params.get("target_fps")
+    if target_fps is None:
+        raise WorkerError(
+            MISSING_REQUIRED_FIELD,
+            "field 'target_fps' is required in 'params'. It is the rate this worker exists to "
+            "produce and there is no default: a job that does not name one has not said what to "
+            "do.")
+    # **Unchanged by the ruling above**, and it still rejects `bool` before the numeric test
+    # because `True` is an `int` in Python and would otherwise retime a clip to 1 fps.
     if isinstance(target_fps, bool) or not isinstance(target_fps, (int, float)) \
             or target_fps <= 0:
         raise WorkerError(

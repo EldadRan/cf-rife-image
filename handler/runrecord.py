@@ -166,6 +166,28 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # top rather than buried in the hardware block a reader has to know to open.
         "gpu": (machine or {}).get("gpu_name"),
         "hardware": machine,
+        # **THE CALLER'S OWN STRING, ECHOED, AND IT IS THE RECORD'S ONLY LINK BACK TO THE
+        # REQUEST THAT PRODUCED IT** (CF, 2026-09-04). The delivered object carries it as the S3
+        # tag `cf_request_id` (`handler.py:134`) and a failure bundle carries it at its top level
+        # (`diagnostics.py:260`); this record was the one artefact of the three without it, which
+        # is a gap and not a decision. **On a REFUSED run there is no `output.key` either**, so
+        # `runpod.job_id` was CF's only handle on the runs where a handle is worth most.
+        #
+        # **LIFTED SEPARATELY RATHER THAN BY WIDENING `_REQUEST_FIELDS`, AND THAT IS THE POINT OF
+        # THE LINE.** That allowlist is what stands between CF's diagnostics bucket and a
+        # presigned URL — `F-2026-09-04-6` is about a document that claimed it did not — and it
+        # should stay exactly as narrow as it is. *A field added to it is a field added to every
+        # summary in both artefacts; a field lifted here is this record's top level and nothing
+        # else.* **So `request` below is unchanged, and this is not a second home for one fact:
+        # the summary does not carry the id and never has.**
+        #
+        # **PRESENT-AND-NULL, and the `.get` is not defending against a caller.** `request_id` is
+        # `REQUIRED_TOP_LEVEL` and refused empty (`validation.py:118`, `:314-316`), and a
+        # validation refusal returns before the block that writes a record at all — so on every
+        # record this worker can actually write, this is a non-empty string. The guard mirrors
+        # `_request_summary`'s own tolerance of a falsy `request` one line down rather than
+        # asserting a stronger precondition than its neighbour.
+        "request_id": (request or {}).get("request_id"),
         "request": diagnostics._request_summary(request),
         # What the planner decided and why — the half that makes a measurement re-derivable
         # instead of merely recorded. Lifted off the *winning* attempt rather than the first,

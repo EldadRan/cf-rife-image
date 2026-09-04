@@ -321,6 +321,31 @@ def probe_output(path):
         "measured_fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
         "has_audio": any(s.get("codec_type") == "audio" for s in streams),
         "codec": video.get("codec_name"),
+        # **THE FIELD THAT DECIDES WHETHER ANYONE CAN OPEN THE FILE, AND THIS READ-BACK WAS BLIND
+        # TO IT FOR 123 DELIVERED RUNS** (`docs/gate-findings.md` F-2026-09-04-7). `codec` above
+        # answered `hevc` on every one of them — true, and true of a master QuickTime refuses,
+        # because the container tag was `hev1` and not `hvc1`. *A read-back exists to catch a
+        # master disagreeing with its request; this one could not see the half of the disagreement
+        # that mattered.* **It reached us because a person put a file in a player**, which is the
+        # one test this project has never owned an instrument for. This is that instrument.
+        #
+        # **SPELLED `codec_tag_string`, WHICH IS ffprobe's OWN NAME FOR IT** (CF, 2026-09-04).
+        # ffprobe exposes two fields — `codec_tag_string` = `hvc1` and `codec_tag` =
+        # `0x31637668`, the same four characters as a little-endian number — so a record field
+        # called `codec_tag` holding `"hvc1"` would be named after the field it is NOT read from,
+        # and the next person checking a record against its master with
+        # `-show_entries stream=codec_tag` would read a mismatch that is not there. *`codec` is
+        # read from `codec_name` and shortened, and that is not precedent for this: `codec_name`
+        # has no sibling of another name carrying another value, and `codec_tag` has exactly
+        # that.* **A cite that fails to check out, on the one instrument this wave exists to
+        # build.**
+        #
+        # **AND `codec_tag` IS DELIBERATELY NOT CARRIED BESIDE IT.** It is the same fact in a
+        # second spelling, which is one fact with two homes and a second thing that can rot.
+        #
+        # **`-show_streams` already returns it**, so this costs no second `ffprobe` and cannot
+        # disagree with the `codec` beside it — both come off the one stream object read once.
+        "codec_tag_string": video.get("codec_tag_string"),
     }
 
 

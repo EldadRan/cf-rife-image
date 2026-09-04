@@ -56,8 +56,82 @@ _REDACTIONS = (
     (re.compile(r"https?://[^\s\"']*[?&]X-Amz-[^\s\"']*", re.I), "<presigned-url-redacted>"),
     (re.compile(r"https?://[^\s\"']*[?&](?:Signature|token|sig)=[^\s\"']*", re.I),
      "<signed-url-redacted>"),
-    (re.compile(r"(?i)(secret_access_key|session_token|access_key_id)[\"']?\s*[:=]\s*[\"']?"
-                r"[A-Za-z0-9/+=_.-]{8,}"), r"\1=<redacted>"),
+    # **THIS ONE TAKES A FUNCTION BECAUSE A LITERAL REPLACEMENT CANNOT PUT BACK THE SHAPE IT ATE**
+    # (CF, 2026-09-04; `docs/gate-findings.md` F-2026-09-04-6, last section). The pattern used to
+    # be one expression replaced by `\1=<redacted>`, which turned
+    #
+    #     "access_key_id": "AKIAIOSFODNN7EXAMPLE"   ->   "access_key_id=<redacted>"
+    #
+    # a BARE STRING where a key/value pair had been — so the object stopped parsing. **The net
+    # tearing rather than catching, on the two artefacts whose whole job is to survive a
+    # failure**: a bundle and a run record are read by machines, and one that will not parse is
+    # one that arrived and said nothing. *Unreachable today — the allowlist means no credential
+    # reaches the text — which is exactly why it had never been seen fire.*
+    #
+    # **THE REQUIREMENT IS BOTH HALVES AND EITHER ALONE IS THE CHECK THAT CANNOT FAIL.** Text
+    # that was valid JSON going in is valid JSON coming out, AND the secret is gone. *A sweep
+    # graded only on the secret's absence passes trivially by deleting the document.*
+    #
+    # Three alternatives, and the order is load bearing:
+    #
+    #   1. a properly quoted value, matched as a JSON string body: any character that is not a
+    #      quote, a backslash or a NEWLINE, or a backslash-escape taken whole. The backreference
+    #      then REQUIRES the closing quote, so the QUOTES ARE CONSUMED AND REISSUED and the pair
+    #      survives as a pair. *The class excludes both quotes, so the run cannot cross into the
+    #      next field and swallow the rest of the object.* **This is what makes a value carrying
+    #      punctuation outside `[A-Za-z0-9/+=_.-]` — a `%` in a session token — redact whole
+    #      rather than leaving a tail outside the quotes.**
+    #
+    #      **THE NEWLINE EXCLUSION IS NOT TIDINESS AND THE ESCAPE BRANCH IS NOT PEDANTRY. BOTH
+    #      WERE FOUND IN REVIEW, AS DEFECTS, IN THE FIRST VERSION OF THIS REPAIR.**
+    #
+    #      *Without the newline exclusion the class matched a line ending, so an UNTERMINATED
+    #      quoted value on one line joined to the next quote anywhere later in the buffer and
+    #      everything between them was replaced by `<redacted>`.* `LogBuffer.text()` sweeps up to
+    #      `BUNDLE_HEAD_LINES + BUNDLE_TAIL_LINES` of raw multi-line log, so what got eaten was
+    #      the OOM line the bundle exists to carry. **A redactor deleting the failure it was
+    #      written to preserve is a worse tear than the one this entry is here to repair.**
+    #
+    #      *Without the escape branch the run stopped at the first backslash, alternative 3 then
+    #      matched from the opening quote, and a quote was reissued INSIDE the string* — invalid
+    #      JSON out from valid JSON in, with the tail of the secret surviving. **`json.dumps`
+    #      escapes every non-ASCII character by default**, so one accented byte anywhere in a
+    #      credential was enough to do it. *That is this wave's own stated requirement failing on
+    #      its own terms, and the first witnesses could not see it because every fixture value
+    #      was made of characters that need no escape.*
+    #
+    #      **The two branches are disjoint on their first character** — one excludes the
+    #      backslash, the other requires it — so the alternation inside the quantifier is
+    #      deterministic and adds no backtracking cost.
+    #
+    #      **AND THE ESCAPE BRANCH IS JSON's ESCAPE SET AND NOT `\\.`, WHICH WAS THE THIRD THING
+    #      REVIEW FOUND.** *`\\.` took ANY backslash pair whole, including a backslash sitting in
+    #      front of what was meant to be the terminating quote — so in RAW log text, where a
+    #      trailing backslash is just a character, the run swallowed the closing quote and ran on
+    #      to the next one, eating the field between them.* Measured:
+    #      `session_token='abcdefgh\\' keep='dont-eat-me'` lost `keep`. **Naming the eight
+    #      escapes JSON actually defines ends it**: a backslash followed by anything else is no
+    #      longer part of the value, the run stops there, and the unquoted branch redacts what it
+    #      can without reaching past the quote. *Bounded to one line either way by the newline
+    #      exclusion — this makes it bounded to the value.*
+    #   2. an unquoted value, which is the `KEY=VALUE` environment spelling. The opening group
+    #      matches empty, so the output is `access_key_id=<redacted>` — **byte for byte what the
+    #      old pattern produced on this input**, which is the case it was written for and the one
+    #      it got right.
+    #   3. the same, where an opening quote was found but its closing one was not — a truncated
+    #      log tail. **The value still goes**, and the reissued quote closes a string the input
+    #      had left open. *Losing the secret matters more than declining to touch a document that
+    #      was already unparseable.*
+    #
+    # **The key's OWN leading quote is deliberately not matched**, so it is never consumed and
+    # never has to be put back.
+    (re.compile(r"(?i)(?P<lead>(?:secret_access_key|session_token|access_key_id)[\"']?"
+                r"\s*[:=]\s*)"
+                r"(?:(?P<q>[\"'])(?P<quoted>(?:[^\"'\\\n]|\\[\"\\/bfnrtu]){8,})(?P=q)"
+                r"|(?P<oq>[\"']?)(?P<bare>[A-Za-z0-9/+=_.-]{8,})(?P=oq)?)"),
+     lambda m: "{}{}<redacted>{}".format(
+         m.group("lead"), m.group("q") or m.group("oq") or "",
+         m.group("q") or m.group("oq") or "")),
 )
 
 
