@@ -321,7 +321,20 @@ def validate(job_input):
     for field in REQUIRED_TOP_LEVEL:
         _require(job_input, field, "at the top level of 'input'")
 
-    # Checked and then dropped on the floor — see the comment on `TOP_LEVEL_PRODUCTION`.
+    request_id = _as_str(job_input["request_id"], "request_id")
+    if not request_id.strip():
+        raise WorkerError(INVALID_FIELD_VALUE, "field 'request_id' must not be empty")
+
+    params = job_input["params"]
+    if not isinstance(params, dict):
+        raise WorkerError(INVALID_FIELD_VALUE, "field 'params' must be an object")
+
+    # **Checked and then dropped on the floor** — see the comment on `TOP_LEVEL_PRODUCTION`.
+    # **LAST OF THE TOP LEVEL, AND BELOW EVERY REQUIRED NAME'S VALUE ON PURPOSE** (F-2026-09-09-4).
+    # *An optional, inert field's value cannot be checked before a required field's; the file is
+    # outside-in, so it also stays above everything nested.* **The kit cannot see this placement**
+    # — every value row sends an otherwise-valid base, so no case distinguishes it from the one
+    # four lines up. *Recorded here because a green run does not witness it.*
     execution_timeout_ms = job_input.get("execution_timeout_ms")
     if execution_timeout_ms is not None:
         execution_timeout_ms = _as_int(execution_timeout_ms, "execution_timeout_ms")
@@ -333,13 +346,6 @@ def validate(job_input):
                 ),
             )
 
-    request_id = _as_str(job_input["request_id"], "request_id")
-    if not request_id.strip():
-        raise WorkerError(INVALID_FIELD_VALUE, "field 'request_id' must not be empty")
-
-    params = job_input["params"]
-    if not isinstance(params, dict):
-        raise WorkerError(INVALID_FIELD_VALUE, "field 'params' must be an object")
     # Strict inside `params`, as it has always been — what is new is that a DEBUG name here is
     # refused for its state rather than accepted, and that the deleted names are gone from the
     # list rather than listed in order to be refused.
