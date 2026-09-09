@@ -54,11 +54,13 @@ from errors import (
 #: **AND IT IS WHAT MAKES A DELETION A DELETION.** *Under leniency, dropping a name from this set
 #: did not refuse it; it made it silently ignored, which is the state the deletion was meant to
 #: end.* **So the long roll of dead upscaler names is simply GONE** — `derive`,
-#: `execution_timeout_ms`, `pin`, `plan_only`, `force_rung`, `keep_alpha_in_model`, the six
+#: `pin`, `plan_only`, `force_rung`, `keep_alpha_in_model`, the six
 #: `force_vae_*`, `force_batch_size`, `force_chunk_size`, `force_temporal_overlap`,
 #: `force_blocks_to_swap`, `force_swap_io_components` — together with `_rung_name`,
 #: `_refused_upscale_field`, `RETIRED_FIELD_NAMES` and `KNOWN_FIELD_NAMES`, every one of which
 #: existed only to refuse a name that leniency would otherwise have swallowed.
+#: *`execution_timeout_ms` was on that roll until 2026-09-09 and came back onto the accepted set
+#: below by CF's ruling — `decisions.md` §17. A name is on exactly one of the two lists.*
 #:
 #: **THE PRICE IS FORWARD COMPATIBILITY AND IT WAS DELIBERATELY BOUGHT ONCE.**
 #: *`diagnostics_reserve` and `run_record` were both accepted BEFORE CF sent them, on the
@@ -87,6 +89,14 @@ TOP_LEVEL_PRODUCTION = (
     # outside both lists refuses every request that sets it — so no debug field would be
     # reachable on any request and the flag would refuse itself.*
     "debug",
+    # **ACCEPTED AND READ BY NOTHING** (CF, 2026-09-09, `decisions.md` §17). RunPod's own
+    # `executionTimeout` for the endpoint this worker runs on, in milliseconds, sent by every one
+    # of CF's services on every request. The name is admitted so a caller need not special-case
+    # this endpoint; the value is type- and range-checked like every other name on this list and
+    # then discarded. **No refusal is keyed to it and no limit moves when it changes** — §11's
+    # frame maxima are computed against a fixed 3,600-second wall and are this worker's only
+    # deadline defence.
+    "execution_timeout_ms",
 )
 
 #: **Accepted ONLY with `debug: true`, and refused BY NAME without it** — not ignored, and not
@@ -310,6 +320,18 @@ def validate(job_input):
 
     for field in REQUIRED_TOP_LEVEL:
         _require(job_input, field, "at the top level of 'input'")
+
+    # Checked and then dropped on the floor — see the comment on `TOP_LEVEL_PRODUCTION`.
+    execution_timeout_ms = job_input.get("execution_timeout_ms")
+    if execution_timeout_ms is not None:
+        execution_timeout_ms = _as_int(execution_timeout_ms, "execution_timeout_ms")
+        if execution_timeout_ms <= 0:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "field 'execution_timeout_ms' must be positive, got {!r}".format(
+                    execution_timeout_ms
+                ),
+            )
 
     request_id = _as_str(job_input["request_id"], "request_id")
     if not request_id.strip():
