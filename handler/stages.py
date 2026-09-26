@@ -33,8 +33,14 @@ import time
 #: the host arithmetic after it), `convert_in_s` is `routec._to_tensor` (the strided gather over
 #: the decoder's negative-stride BGR view), and `convert_dev_s` is `interpolate._load_pair` (the
 #: device-side cast, upload and pad, once per PAIR and cached).
+#: **`derive_s` JOINED 2026-09-26** (`decisions.md` §19f): the seconds spent MAKING the poster,
+#: the proxy and the spritesheet, on either operation. *Their UPLOADS are `upload_s`'s, like every
+#: other byte this worker pushes out* — so `wall_s = fetch_s + upload_s + compute_s` still closes,
+#: and `compute_s = stages + drain + residual` closes with this as an eighth named stage rather
+#: than as time the residual silently absorbs. **Zero on a job that asked for no derive**, never
+#: absent: an absent key and a measured zero must not read alike.
 STAGES = ("load_s", "decode_s", "model_s",
-          "convert_out_s", "convert_in_s", "convert_dev_s", "write_wait_s")
+          "convert_out_s", "convert_in_s", "convert_dev_s", "write_wait_s", "derive_s")
 
 #: What the stages did not account for. **Reported, never absorbed** (§9a): `compute_s` also covers
 #: the probe, validation, the plan, the output probe and the frame count — and a residual folded

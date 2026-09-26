@@ -123,12 +123,16 @@ def master_name(is_still, width=None, height=None, name=None):
 #: successful job, because the response does not outlive the job record and this does.
 MANIFEST = "manifest.json"
 
-#: Derive roles → their single deterministic key. `crop` is the exception: it writes `count`
-#: files, so its name is a function of the ordinal rather than a constant. Still deterministic —
-#: `crop_0.webp` is always the highest-energy region of a given request.
+#: **§19e's three roles → the suffix each puts on the MASTER's stem**: `<stem>_poster.webp`,
+#: `<stem>_proxy.mp4`, `<stem>_spritesheet.webp`, all under the same prefix and none outside it.
+#: *The stem is the master's — the caller's `output.name` sanitised, or `master` — so a derive is
+#: findable from the master's key by construction, and two jobs' derives cannot share a name
+#: unless their masters do.* **These were `poster.webp` and `proxy.mp4`, bare, from the upscale
+#: path; nothing wrote them after the excision and nothing read this table.**
 DERIVE = {
-    "poster": "poster.webp",
-    "proxy": "proxy.mp4",
+    "poster": "_poster.webp",
+    "proxy": "_proxy.mp4",
+    "spritesheet": "_spritesheet.webp",
 }
 
 CROP_PREFIX = "crop_"
@@ -152,10 +156,10 @@ CONTENT_TYPES = {
 }
 
 
-def for_role(role):
-    """The key a derive role writes. Raises KeyError on an unknown role, which validation
-    refuses long before this is reached."""
-    return DERIVE[role]
+def for_role(role, name=None):
+    """The name a derive role writes, beside the master named by the same `name`. Raises KeyError
+    on an unknown role, which validation refuses long before this is reached."""
+    return (sanitize_stem(name) or DEFAULT_STEM) + DERIVE[role]
 
 
 def content_type(name):
@@ -178,5 +182,5 @@ def content_type(name):
 #: one. The caller chose that name, so the caller can predict it; everything else in the prefix
 #: stays derivable, and `manifest.json` (itself always named) carries the master's key for anyone
 #: who arrives without the request. That is why the field names the master and nothing else.
-ALL = (MASTER,) + STILL_MASTERS + (MANIFEST,) + tuple(sorted(DERIVE.values())) \
+ALL = (MASTER,) + STILL_MASTERS + (MANIFEST,) + tuple(sorted(for_role(r) for r in DERIVE)) \
     + tuple(crop_name(i) for i in range(8))

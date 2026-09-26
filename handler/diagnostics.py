@@ -469,6 +469,31 @@ def _request_summary(request):
     source = _source_reference(request)
     if source:
         summary["source"] = source
+    # **§19f: the operation, a repair's items, and the derive ROLES — still a summary, not an
+    # echo.** *Each segment carries its own `source_url`, and it is as much a presigned read grant
+    # as the top-level one*, so it goes through the same rule: the path identifies the clip, the
+    # query authorises the bearer and is dropped.
+    if request.get("op"):
+        summary["op"] = request["op"]
+    items = (request.get("frame_repair") or {}).get("items")
+    if items:
+        summary["items"] = [_item_summary(item) for item in items]
+    roles = [entry.get("role") for entry in request.get("derive") or ()]
+    if roles:
+        summary["derive"] = roles
+    return summary
+
+
+#: A repair item's fields that reach a summary. **Named, like `_REQUEST_FIELDS`**: `source_url`
+#: is not among them and is carried as `source`, stripped, below.
+_ITEM_FIELDS = ("id", "type", "a", "b", "trim_head", "trim_tail", "fit")
+
+
+def _item_summary(item):
+    summary = {field: item[field] for field in _ITEM_FIELDS if item.get(field) is not None}
+    source = _source_reference(item)
+    if source:
+        summary["source"] = source
     return summary
 
 

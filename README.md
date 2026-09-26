@@ -1,7 +1,9 @@
 # cf-rife-image
 
-A RunPod serverless GPU worker that **changes a clip's frame rate by synthesising the frames
-between the ones it was given.** Nothing else — no upscaler, no second capability. Bytes move
+A RunPod serverless GPU worker that **does what RIFE can do, one operation per job**: `retime`
+changes a clip's frame rate by synthesising the frames between the ones it was given, and
+`frame_repair` replaces damaged frames in place — by RIFE between the good frames either side, or
+by frames from a clip the caller supplies. No upscaler. Bytes move
 through S3-compatible object storage in both directions: a job names a source URL and an output
 destination, and no image data travels in the job envelope.
 
@@ -23,11 +25,15 @@ and the derive-and-manifest half are gone; `handler/` is 20 modules and carries 
 plan that governed the removal and the evidence for each disposition are in `cf-rife-project`,
 which is private.
 
-**What the worker serves is route C and only route C.** A request must ask for a retime
-explicitly with `"upscale": false` in `params`; anything resolving to an upscale is refused by
-name with `field_not_supported`, as are the fields that belonged to the departed path. A field
+**Every request names its operation in `op`, and there is no default.** Each operation owns its
+own `params`; a name belonging to the other one, a name belonging to the departed upscale path,
+and any name the contract does not define are refused by name with `field_not_supported`. A field
 that validates and then does nothing reads as supported to every client, which is why they are
 refused rather than ignored.
+
+**Either operation may ask for `derive`** — a WebP poster, a 1280-px h264 proxy and a spritesheet,
+each made from the delivered master and uploaded beside it. A derive that fails is reported in
+the run record's `warnings[]` and does not cost the master.
 
 ## Building
 
@@ -68,9 +74,13 @@ docker build handler/
 reading a predictor most needs, and a run is not repeatable — an 8K job costs twenty minutes of
 an A40 whether or not anyone remembered to bank its padded area. So every envelope carries:
 
-- `retime` — `n_out`, `n_synth`, `n_copy`, `n_hold`, `real_share`, `variant`, `scale`,
-  `snap_tolerance`, `peak_vram_gb`, `encoder_peak_rss_gb`, and all five encode settings
-  (`crf`, `preset`, `x264_params`)
+- `op`, and `retime` or `frame_repair` beside it — for a retime `n_out`, `n_synth`, `n_copy`,
+  `n_hold`, `real_share`, `variant`, `scale`, `snap_tolerance`; for a repair each item's `id`,
+  `type`, `a`, `b` and `n`; for both `peak_vram_gb`, `encoder_peak_rss_gb` and all five encode
+  settings (`crf`, `preset`, `x264_params`)
+- `source` and `output` — each file's ffprobe, the rate as its exact rational and the frames
+  counted from its packets, so a repair's claim to have changed nothing but frames is checkable
+- `derived[]` — one entry per derive delivered, when any was asked for
 - `source.padded_megapixels` — the padded area, **computed by `interp_plan`, which owns the
   padding rule**, rather than restated. Raw dimensions and padded area differ by
   `max(128, 128/scale)` per dimension, and a corpus banked on one against a predicate written

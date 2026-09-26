@@ -128,7 +128,8 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           progress=None, job=None, error=None, warnings=None, phase=PHASE_FINAL,
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
           convert_check=None, input_check=None, decode_probe=None, encode_defaults=None,
-          codec=None, bit_depth=None, reference=None, cap=None):
+          codec=None, bit_depth=None, reference=None, cap=None, op=None, frame_repair=None,
+          derived=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -188,6 +189,10 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # `_request_summary`'s own tolerance of a falsy `request` one line down rather than
         # asserting a stronger precondition than its neighbour.
         "request_id": (request or {}).get("request_id"),
+        # **§19f: which operation, at the top level, beside the id.** *Read off the argument and
+        # then off the validated request, so a caller that passes neither files null rather than
+        # a guess.*
+        "op": op or (request or {}).get("op"),
         "request": diagnostics._request_summary(request),
         # What the planner decided and why — the half that makes a measurement re-derivable
         # instead of merely recorded. Lifted off the *winning* attempt rather than the first,
@@ -261,6 +266,17 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     # record in the corpus saying nothing. The kit's `--tie-check` REQUIRES the block and grades
     # its absence, which is the behaviour that makes "the sweep did not happen" distinguishable
     # from "the sweep found nothing" — the distinction `F-2026-08-25-2` is about.
+    # **§19f: a repair's block sits WHERE `retime` sits on the other operation, and replaces it.**
+    # *A repair record carrying `retime: null` beside `frame_repair` would say a retime was
+    # attempted and produced nothing; it was not attempted.* A retime record is unchanged.
+    if body["op"] == "frame_repair":
+        del body["retime"]
+        body["frame_repair"] = frame_repair
+    # **§19e/§19f: one entry per derive DELIVERED, and ABSENT when none was asked for** — so a
+    # job with no `derive` files exactly what it filed before the wave. *Asked for and none
+    # delivered is an empty list, and `warnings[]` says why.*
+    if derived is not None:
+        body["derived"] = derived
     if tie_check:
         body["tie_check"] = tie_check
     # **`docs/archive/conversion-wave-archive.md` §5-0, omitted rather than nulled**, exactly as `tie_check` is:

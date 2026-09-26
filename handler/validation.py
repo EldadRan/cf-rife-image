@@ -32,6 +32,7 @@ re-derives leniency from the comments that argue for it.*
 
 import encoder
 import envelope
+import repair_plan
 from errors import (
     FIELD_NOT_SUPPORTED,
     INVALID_FIELD_VALUE,
@@ -53,8 +54,8 @@ from errors import (
 #:
 #: **AND IT IS WHAT MAKES A DELETION A DELETION.** *Under leniency, dropping a name from this set
 #: did not refuse it; it made it silently ignored, which is the state the deletion was meant to
-#: end.* **So the long roll of dead upscaler names is simply GONE** — `derive`,
-#: `pin`, `plan_only`, `force_rung`, `keep_alpha_in_model`, the six
+#: end.* **So the long roll of dead upscaler names is simply GONE** — `derive` (back on the list
+#: above since 2026-09-26, §19e, as a different feature under the same name), `pin`, `plan_only`, `force_rung`, `keep_alpha_in_model`, the six
 #: `force_vae_*`, `force_batch_size`, `force_chunk_size`, `force_temporal_overlap`,
 #: `force_blocks_to_swap`, `force_swap_io_components` — together with `_rung_name`,
 #: `_refused_upscale_field`, `RETIRED_FIELD_NAMES` and `KNOWN_FIELD_NAMES`, every one of which
@@ -70,6 +71,13 @@ from errors import (
 #: silence. *A refusal is the better failure and it is still a cost; written here so nobody
 #: re-derives leniency later from the comments that argue for it.*
 TOP_LEVEL_PRODUCTION = (
+    # **WHICH OPERATION, REQUIRED AND NEVER DEFAULTED** (CF, 2026-09-26, `decisions.md` §19a). *Not
+    # defaulted to `retime`: pre-production, and CF accepts that the caller changes.* It decides
+    # which `params` list applies, so it is read before anything inside `params` is.
+    "op",
+    # **§19e — poster, proxy, spritesheet, made from the DELIVERED MASTER.** *It was on the
+    # deleted roll below as a dead upscaler name; it is production on both operations now.*
+    "derive",
     "request_id",
     "source_url",
     "output",
@@ -125,7 +133,18 @@ TOP_LEVEL_DEBUG = (
 #: is addressed from the VALIDATED request, and `runrecord` echoes an allowlist built for the
 #: normalised shape whose names do not exist on a raw `job_input` — which carries
 #: `output.secret_access_key` and a presigned `source_url` whole.
-REQUIRED_TOP_LEVEL = ("request_id", "source_url", "output", "params", "run_record")
+REQUIRED_TOP_LEVEL = ("op", "request_id", "source_url", "output", "params", "run_record")
+
+#: §19a — the operations this worker performs, one per job. **An unknown value is
+#: `invalid_field_value`**, including `upscale`: the name is refused, not routed.
+OPERATIONS = ("retime", "frame_repair")
+
+#: **The top-level debug names that mean something on a `frame_repair`** (§19b, the builder's to
+#: enumerate). *`force_scale` is RIFE's flow resolution and a range is RIFE; `force_variant` picks
+#: one of retime's four cascade strategies and there is no cascade here*, so it is refused on this
+#: operation like any unlisted name — a debug name the OTHER operation defines is not one this
+#: operation defines.
+REPAIR_TOP_LEVEL_DEBUG = ("force_scale",)
 
 # Everything that changes the output. Strict: a name here that this worker does not implement is
 # refused by name rather than ignored.
@@ -185,6 +204,46 @@ PARAMS_DEBUG = (
     # plan as the ruled answer before the benchmark that decides it has run.
     "snap_tolerance",
 )
+
+#: **`frame_repair`'s own `params`** (§19c). *Each operation owns its list, and a name belonging
+#: to the other one is refused like any unlisted name* — `target_fps` here is refused, not
+#: ignored (§19a). `keep_audio`, `crf`, `preset` and `output` are retime's, with retime's rules
+#: verbatim (§19b).
+REPAIR_PARAMS_PRODUCTION = (
+    "ranges",
+    "segments",
+    "keep_audio",
+    "crf",
+    "preset",
+    "output",
+)
+
+#: **The debug half of a `frame_repair`'s `params`: retime's, less the one that is about
+#: retime's plan.** *The five instruments sit on the same decode, the same conversions and the same
+#: encoder this operation runs through (§19g), and the three x264 fields are that encoder's.*
+#: **`snap_tolerance` is not here**: it bends retime's output grid, and a repair has none.
+REPAIR_PARAMS_DEBUG = (
+    "convert_check",
+    "tie_check",
+    "input_check",
+    "decode_probe",
+    "reference_score",
+    "threads",
+    "sliced_threads",
+    "rc_lookahead",
+)
+
+#: §19e's roles and the fields each takes — **the ffmpeg service's, `ffmpeg@9d7495b`
+#: `handler/validation.py:57-77`**, renamed to nothing: the three roles and their field names are
+#: the same words here. *Every role is accepted on both operations; that service's per-operation
+#: table has no equivalent because both of ours write a video.*
+DERIVE_FIELDS_BY_ROLE = {
+    "poster": ("role", "at_fraction"),
+    "proxy": ("role", "max_duration_s"),
+    "spritesheet": ("role",),
+}
+DERIVE_ROLES = ("poster", "proxy", "spritesheet")
+DEFAULT_AT_FRACTION = 0.25
 
 # **Default `true`, and it inverts the platform's `keep_audio: false` deliberately.** That default
 # exists because several generators invent a soundtrack nobody asked for, so silence is the safe
@@ -293,6 +352,71 @@ def _validate_output(output):
     return output
 
 
+def _as_number(value, field):
+    """A real number, **never a `bool`** — `True` is an `int` in Python."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise WorkerError(INVALID_FIELD_VALUE, "field '{}' must be a number".format(field))
+    return value
+
+
+def _validate_derive(derive):
+    """§19e — the `derive` array, normalised. **Ported from `ffmpeg@9d7495b`
+    `handler/validation.py:303-381`** (`_validate_derive` and the three per-role validators).
+
+    *What changed in the port:* **every role is accepted on both operations**, so the service's
+    `field_not_supported` for a role its operation does not take has no case here, and an unknown
+    role is `invalid_field_value` as it is there. **`at_fraction` and `max_duration_s` refuse a
+    `bool`**, which that service's `_as_number` is not asked about here and this worker's every
+    other numeric field already does.
+    """
+    if derive is None:
+        return []
+    if not isinstance(derive, list):
+        raise WorkerError(INVALID_FIELD_VALUE, "field 'derive' must be an array")
+    entries = []
+    for entry in derive:
+        if not isinstance(entry, dict):
+            raise WorkerError(INVALID_FIELD_VALUE, "each 'derive' entry must be an object")
+        # Role first, then the fields, because which fields are accepted depends on it.
+        role = _require(entry, "role", "on a 'derive' entry")
+        if role not in DERIVE_ROLES:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "derive role {!r} is not one this worker makes; it makes {}".format(
+                    role, ", ".join(DERIVE_ROLES)))
+        _refuse_unknown(entry, DERIVE_FIELDS_BY_ROLE[role],
+                        "on a '{}' derive entry".format(role))
+        if any(existing["role"] == role for existing in entries):
+            # Both would be written under one deterministic key and the second would overwrite
+            # the first in silence — one file, and a response claiming two.
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "derive role '{}' is requested twice; each role writes one deterministic key, so "
+                "the second would overwrite the first".format(role))
+        if role == "poster":
+            at_fraction = DEFAULT_AT_FRACTION if entry.get("at_fraction") is None else \
+                _as_number(entry["at_fraction"], "at_fraction")
+            if not 0.0 <= at_fraction <= 1.0:
+                raise WorkerError(INVALID_FIELD_VALUE,
+                                  "field 'at_fraction' must be between 0 and 1, got {!r}".format(
+                                      at_fraction))
+            entries.append({"role": "poster", "at_fraction": at_fraction})
+        elif role == "proxy":
+            # **Absent means the whole master**; present means at most that many seconds from the
+            # start, so a value past the end clamps rather than refusing — the service's rule.
+            seconds = entry.get("max_duration_s")
+            if seconds is not None:
+                seconds = _as_number(seconds, "max_duration_s")
+                if seconds <= 0:
+                    raise WorkerError(INVALID_FIELD_VALUE,
+                                      "field 'max_duration_s' must be greater than 0, got "
+                                      "{!r}".format(seconds))
+            entries.append({"role": "proxy", "max_duration_s": seconds})
+        else:
+            entries.append({"role": "spritesheet"})
+    return entries
+
+
 def _english_list(items):
     """`a`, `a and b`, `a, b and c`. **A refusal a caller reads once has to parse on that read**,
     and three names joined by two `and`s is a sentence they have to re-read to count."""
@@ -315,11 +439,26 @@ def validate(job_input):
     if debug is not None:
         debug = _as_bool(debug, "debug")
     debug = bool(debug)
-    envelope.refuse_unlisted(job_input, TOP_LEVEL_PRODUCTION, TOP_LEVEL_DEBUG,
+    # **The top level's debug list is per operation, so `op` is PEEKED at before the strict check
+    # and VALIDATED after it** — an absent or unknown `op` falls back to retime's list, which is
+    # the wider of the two, and is then refused for itself below. *A request is never told a
+    # name is unknown because its `op` was.*
+    peeked_op = job_input.get("op")
+    top_debug = REPAIR_TOP_LEVEL_DEBUG if peeked_op == "frame_repair" else TOP_LEVEL_DEBUG
+    envelope.refuse_unlisted(job_input, TOP_LEVEL_PRODUCTION, top_debug,
                              "at the top level of 'input'", debug)
 
     for field in REQUIRED_TOP_LEVEL:
         _require(job_input, field, "at the top level of 'input'")
+
+    op = job_input["op"]
+    if op not in OPERATIONS:
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'op' must be one of {}, got {!r}. Each job is one operation, and there is no "
+            "default: a request that does not name one has not said what to do.".format(
+                ", ".join("'{}'".format(name) for name in OPERATIONS), op))
+    repair = op == "frame_repair"
 
     request_id = _as_str(job_input["request_id"], "request_id")
     if not request_id.strip():
@@ -349,7 +488,14 @@ def validate(job_input):
     # Strict inside `params`, as it has always been — what is new is that a DEBUG name here is
     # refused for its state rather than accepted, and that the deleted names are gone from the
     # list rather than listed in order to be refused.
-    envelope.refuse_unlisted(params, PARAMS_PRODUCTION, PARAMS_DEBUG, "in 'params'", debug)
+    # **Each operation's own two lists** (§19a). *Retime's `where` is unchanged word for word — the
+    # refusal probe pins its fragments — and a repair's names the operation, because "not a field
+    # this worker accepts" about `target_fps` is only true of one of the two.*
+    if repair:
+        envelope.refuse_unlisted(params, REPAIR_PARAMS_PRODUCTION, REPAIR_PARAMS_DEBUG,
+                                 "in 'params' of a frame_repair", debug)
+    else:
+        envelope.refuse_unlisted(params, PARAMS_PRODUCTION, PARAMS_DEBUG, "in 'params'", debug)
 
     # **Release 3's surface, derived before the sizing rule because it can suspend it.**
     # `upscale: false` is the explicit retime spelling, and a retime does not resize — so the
@@ -359,7 +505,9 @@ def validate(job_input):
     # **The flag reaches `envelope` because `params.output`'s two lists live there** — that
     # module owns what may appear inside the encode block, and splitting the knowledge would put
     # a name's level in one file and its gating in another.
-    release_3 = envelope.derive(params, debug)
+    # **A repair takes the encode half only** — §19b: the output rate is the source's, so there is
+    # no `target_fps` to require and no `snap_tolerance` to bound.
+    release_3 = envelope.encode_block(params, debug) if repair else envelope.derive(params, debug)
 
     # **§6e UNSEALED THIS SURFACE RATHER THAN BUILDING IT.** `envelope.CODECS` has carried all
     # three names since `rife-seed`; what moved is this refusal, from *"only h264"* to the pair
@@ -639,11 +787,16 @@ def validate(job_input):
                     "" if len(crossed) == 1 else "s",
                     "has" if len(crossed) == 1 else "have"))
 
-    # **Refused rather than validated-then-dropped**, and this one read as supported harder than
-    # any other: `_validate_derive` checked role uniqueness, per-role field strictness and
-    # `at_fraction` bounds, so a client probing the surface got a detailed acknowledgement of a
-    # feature that produced nothing. A caller asking for a poster and a proxy received
-    # `status: DELIVERED`, one file, and no word about the other two.
+    # **§19c/§19d — a repair's items, AFTER every scalar field and every cross-field rule.** *What
+    # the request alone can settle is refused here and writes no record; the bound on `b`, the
+    # source's cadence and each segment's M need the files and are `handler._repair`'s.*
+    items = repair_plan.validate_items(params) if repair else None
+
+    # **§19e — `derive`, on BOTH operations.** *It was refused here by name until 2026-09-26,
+    # because the validator this replaces acknowledged roles in detail and then produced nothing;
+    # it is validated now because it produces what it acknowledges.*
+    derive = _validate_derive(job_input.get("derive"))
+
     diagnostics = job_input.get("diagnostics")
     if diagnostics is not None:
         diagnostics = _as_str(diagnostics, "diagnostics")
@@ -669,8 +822,14 @@ def validate(job_input):
     # everything downstream reads, so the nesting exists exactly once — here — rather than being
     # threaded through every caller.
     return {
+        "op": op,
         "request_id": request_id,
         "source_url": _as_str(job_input["source_url"], "source_url"),
+        # §19c. `None` on a retime, so a retime's normalised request has nothing a repair reads.
+        "frame_repair": {"items": items} if repair else None,
+        # §19e. **An empty list when none was asked for**, and `handler` then writes exactly what
+        # it wrote before the wave (`decisions.md` §19e's last line).
+        "derive": derive,
         # The normalised config, one object rather than six loose keys, so a caller downstream
         # cannot read `target_fps` without also having what decided it.
         "release_3": release_3,

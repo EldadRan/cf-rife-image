@@ -285,7 +285,12 @@ COPY *.py ./
 # **AND AN IMPORT CHECK COVERS IMPORTS.** It catches a module that will not parse and a
 # module-scope import that will not resolve. It does not enter `run`, `_pass` or any of the three
 # ffmpeg argument lists, and it is not evidence about any of them.
-RUN python3 -c "import handler, decodeprobe; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler + decodeprobe import OK, torch still lazy')"
+#
+# **`derives` joins it for `decodeprobe`'s reason** (`decisions.md` §19e): `handler` imports it
+# inside `_make_derives`, so nothing else would parse it before a delivered master reached it.
+# It imports `os`, `subprocess`, `keys`, `probe` and `errors` — the lazy-torch property is
+# unchanged. *`repair` and `repair_plan` need no name here: `handler` imports both at module scope.*
+RUN python3 -c "import handler, decodeprobe, derives; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler + decodeprobe + derives import OK, torch still lazy')"
 
 # **THE LINE ABOVE'S OWN SCOPE LIMIT, CLOSED BY ONE STDLIB PASS** (`docs/gate-findings.md`
 # `F-2026-08-29-4`). An import proves a module parses and that its module-scope imports resolve;

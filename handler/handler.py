@@ -17,9 +17,11 @@ is written in the `finally`, because that is the only point a delivered, a refus
 run all pass through.
 """
 
+import contextlib
 import datetime
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -38,6 +40,8 @@ import ladder
 import phasewatch
 import probe
 import progress as progress_module
+import repair
+import repair_plan
 import runrecord
 import stages
 import storage
@@ -167,6 +171,13 @@ _SAID_BOOT = []
 #: fetches costs nothing, and a transfer that publishes less often than the client polls is a
 #: transfer the client watches go stale.
 BYTE_REPORT_INTERVAL_S = 3.0
+
+#: **The platform's kill, fixed** — `decisions.md` §17, and the figure §11's frame caps are
+#: computed against. *Read by the derive step alone, which is the one stretch that runs after a
+#: master is delivered and so the one whose overrun costs a record rather than a master.*
+PLATFORM_WALL_S = 3600
+#: What is kept back from the wall for the upload of the last derive and the run record's PUT.
+DERIVE_WALL_MARGIN_S = 120
 
 
 def _byte_reporter(progress, phase_name, pct=None, bytes_per_s=None):
@@ -306,6 +317,8 @@ def handle(job_input, job=None):
     # and its whole `compute_s` really is residual — both are facts, and both are now filed.
     clock = stages.StageClock()
     trace["clock"] = clock
+    # When this job began, for the one step that must budget against the platform's wall.
+    trace["started"] = started
     # **Per call, which is what makes the concurrency question go away.** `trace` is created here
     # and reaches nothing outside this invocation, so two jobs in one process cannot write each
     # other's host readings — the reason the module-level banner list was retired above.
@@ -349,8 +362,11 @@ def handle(job_input, job=None):
             # `_run` left with the upscale path and `validation` now refuses anything that
             # resolves to an upscale, so the else arm was both unreachable and a call to a name
             # that no longer exists — a latent NameError preserved in the shape of a step.
-            response = _retime(request, machine, warnings, workdir, progress, started, trace,
-                               clock)
+            # **§19a: one operation per job, chosen by `op` and by nothing else.** `validation`
+            # has refused every other value, so there is no third arm to fall through to.
+            operation = _repair if request["op"] == "frame_repair" else _retime
+            response = operation(request, machine, warnings, workdir, progress, started, trace,
+                                 clock)
             outcome["status"] = "refused" if response.get("cf_error") else "ok"
             outcome["error"] = response.get("cf_error")
             return response
@@ -441,9 +457,19 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # for exactly this — a crashed run's most diagnostic numbers are the ones it learned before
     # it died — and `_retime` never wrote to it, so EVERY route-C run record filed `source` and
     # `output` as null, on success as much as on failure. The numbers were in hand both times.
+    # **§19f: the source block carries the source's ffprobe, counted frames included.** *For a
+    # retime the count is a READING and not a rule — the plan is still sized from duration × rate
+    # with retime's own tolerance — so a count that cannot be read costs a warning and a null,
+    # never the job.* It costs one demux of the file and nothing is decoded.
+    try:
+        source_frames = probe.counted_frames(source_path)["frames"]
+    except Exception as exc:  # noqa: BLE001 — a reading must not refuse a retime
+        source_frames = None
+        warnings.append("the source's packets could not be counted ({}: {}); source.frames is "
+                        "null".format(type(exc).__name__, exc))
+    source_block = _source_block(source, source_frames, source_path)
     if trace is not None:
-        trace["source"] = {"width": source["width"], "height": source["height"],
-                           "fps": source["fps"], "duration_s": source["duration_s"]}
+        trace["source"] = source_block
 
     # **The retime's own fields sit flat in the normalised config now.** *They arrived inside an
     # `interpolate` sub-object that existed to distinguish a retime from an upscale; with one
@@ -738,6 +764,479 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         audio_source=source_path if request["keep_audio"] else None,
         variant=request.get("force_variant") or "direct", scale=scale, clock=clock)
 
+    output_entry, derived = _deliver(request, master, master_path, source_path, stats, trace,
+                                     progress, warnings, workdir)
+
+    # **The stats and what they were measured on, and nothing shaped like a plan.** A
+    # `configuration` block here would look, to anything reading the envelope, exactly like a
+    # planned upscale — and there is no plan, because there is no model to plan for.
+    _note(trace, "estimate", "time", stats.get("estimate"))
+    if trace is not None:
+        # **Deliberately left, and it is a no-op.** `output_entry` was banked into the trace the
+        # instant the upload returned, and this is the same dict object mutated in place — so
+        # this line rebinds what is already there. It stays because deleting it would leave the
+        # one place a reader looks for "where does output reach the record" empty, and a fact
+        # with no visible home is how the next reader concludes there isn't one.
+        trace["output"] = output_entry
+        # **The retime stats have NO honest slot in `runrecord.build`.** `plan` and `rationale`
+        # are the estimator's fields and route C has no estimator, so putting them there would
+        # make a record borrow a slot that means something else — and a record that borrows a slot
+        # is worse than one with a gap, because the gap is visible. Filed to the gate rather than
+        # forced; `load_strip` is the nearest thing and it is not that either.
+        # **Without `estimate`, which has one home and it is the `estimate` block.** The time
+        # answer travels out of `routec` inside the stats because that is the only channel it
+        # has, and filing it here as well would put one fact in two places in one document — the
+        # duplication that makes a stale copy indistinguishable from a live one.
+        # **`convert_check` is excluded alongside `estimate` and lifted to the top level.** The
+        # kit grades `convert_check.frames` AGAINST `retime.n_out`, and a check nested inside the
+        # block it is checked against reads as part of that measurement rather than as the check
+        # on it.
+        # **`codec` is lifted out for §15's reason and not `convert_check`'s.** §15c's
+        # inference rule reads `record.get("codec", "h264")` at the record's TOP level — a
+        # `codec` nested inside `retime` is invisible to it, and a row that carries the field
+        # somewhere the rule does not look is a row the rule reads as h264.
+        trace["retime"] = {k: v for k, v in stats.items()
+                           if k not in ("estimate", "convert_check", "input_check",
+                                        "codec", "bit_depth", "reference")}
+        # **What RAN, replacing what was asked for.** They are the same value today — §6e leaves
+        # `codec: "source"` refused, so there is no resolution step between the ask and the
+        # outcome — and this line is what makes that a fact about the writer rather than a fact
+        # about the request that happens to hold.
+        trace["codec"] = stats.get("codec", trace["codec"])
+        trace["bit_depth"] = stats.get("bit_depth", trace["bit_depth"])
+        # **§17a: banked ONLY when the instrument produced one**, and banked ABOVE, as soon as
+        # the uploaded keys exist. This is the fallback for a run that produced scores and never
+        # reached the upload — the same dict either way, so it cannot disagree with itself.
+        if stats.get("reference") is not None and "reference" not in trace:
+            trace["reference"] = stats["reference"]
+
+    response = {
+        "status": "DELIVERED",
+        # §19f — which operation, at the top level of the response as of the record.
+        "op": "retime",
+        "route": "C",
+        "output": output_entry,
+        # **`crf` and `preset` beside the x264 params** (instrumentation §2). §6a rules five
+        # encode settings changeable with today's values as defaults; the record carried three, so
+        # a corpus could not attribute a difference between two runs to the settings that differed.
+        # Read from the same place the encoder reads them, so a default cannot be restated wrongly.
+        # **The stats, whole, with nothing restated here.** This block used to add `target_fps`,
+        # `snap_tolerance`, the request's `crf` and the module's `DEFAULT_PRESET` — to the
+        # ENVELOPE only. `trace["retime"]` is built from `stats`, so all four were null in every
+        # run record ever written while the envelope beside them carried values: the corpus could
+        # not attribute a difference to the settings that differed, which is exactly what §2 says
+        # recording three of five costs. `routec` now reads all five off the writer that ran and
+        # returns them, so both artefacts carry one set of numbers that cannot disagree.
+        # **`codec` STAYS HERE, AND THIS TUPLE DELIBERATELY DIFFERS FROM THE RECORD'S ABOVE.**
+        # The record lifts it out because §15c's inference rule reads `record["codec"]` at the
+        # top level and a nested copy would be both invisible to the rule and a second home for
+        # one fact. **The envelope has no such rule and no top level to lift to**, so stripping
+        # it here would leave a caller holding `x265_params` non-null, `x264_params` null and
+        # nothing that names the codec — a response whose codec has to be INFERRED from which of
+        # two strings came back empty. *One fact, one home, per document: the record's home is
+        # its top level and the envelope's is here.*
+        "retime": {k: v for k, v in stats.items()
+                   if k not in ("estimate", "convert_check", "input_check", "reference")},
+        # **`padded_megapixels` is the fit's independent variable and nothing computed it**
+        # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
+        # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
+        # written against padded area are two axes that agree on nothing in particular, and the
+        # difference is recoverable only by someone who remembers the padding rule of the day the
+        # row was written. READ FROM `interp_plan`, which owns the rule, so the two cannot disagree.
+        "source": dict(source_block, padded_megapixels=interp_plan.padded_megapixels(
+            source["width"], source["height"], scale)),
+        "build": build_identity(),
+    }
+    # §19e — absent when no derive was asked for, so such a response is what it was before.
+    if derived is not None:
+        response["derived"] = derived
+    return _decorate(response, machine, [], warnings, progress, started)
+
+
+def _source_block(source, frames, source_path):
+    """§19f's `source` block: the source's ffprobe, in the block that already existed.
+
+    **The four fields it always carried come first and are unchanged**; the rest are what it
+    lacked — codec, pixel format, the rate as its exact rational string, the COUNTED frames, audio
+    and alpha, faststart and the container. *`faststart` is read off the bytes, as the output's
+    is; a read that fails files null, never a guess.*
+    """
+    return {"width": source["width"], "height": source["height"],
+            "fps": source["fps"], "duration_s": source["duration_s"],
+            "codec": source.get("codec"), "pix_fmt": source.get("pix_fmt"),
+            "r_frame_rate": source.get("r_frame_rate"), "frames": frames,
+            "has_audio": source.get("has_audio"), "has_alpha": source.get("has_alpha"),
+            "faststart": probe.is_faststart(source_path),
+            "container": source.get("container")}
+
+
+def _make_derives(request, master, master_path, client, trace, progress, warnings, workdir):
+    """§19e: every role asked for, made from the DELIVERED MASTER and uploaded beside it.
+
+    **A FAILED DERIVE DOES NOT COST THE MASTER.** *The master is already uploaded when this runs;
+    a role that fails is dropped from `derived[]` and named in `warnings[]` as `derive_failed`
+    with its role and reason, and the job is still `DELIVERED`* — §0 decides it: the master is the
+    expensive, irreplaceable object and a derive can be re-made from it.
+
+    **The making is `derive_s`, a stage inside `compute_s`; the uploads are `upload_s`** and
+    `upload_bytes`, like every other byte this worker pushes out — so both of `wall_s`'s identities
+    still close. Returns the list of what was DELIVERED, in the order asked.
+    """
+    import derives  # noqa: PLC0415 — stdlib-only; imported where it is used, like its neighbours
+
+    clock = (trace or {}).get("clock")
+    # **Bounded by the platform's wall, which is fixed** (`decisions.md` §17: 3,600 s, and
+    # `execution_timeout_ms` is read by nothing). *A derive still running when the container is
+    # reaped costs the response and the record of a job whose master is already delivered*, so
+    # no derive may start or run past the wall less a margin for the record. Found in review.
+    started = (trace or {}).get("started")
+    derives.begin(None if started is None
+                  else started + PLATFORM_WALL_S - DERIVE_WALL_MARGIN_S)
+    # **Banked before the first role, and filled in place** — a run that dies mid-derive still
+    # files what it delivered, which is the `trace` rule every other block here follows.
+    delivered = []
+    if trace is not None:
+        trace["derived"] = delivered
+    try:
+        progress.phase("deriving", force=True,
+                       roles=[entry["role"] for entry in request["derive"]])
+    except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
+        print("[progress] deriving phase not emitted ({}: {})".format(
+            type(exc).__name__, exc), flush=True)
+    # **The master's own reading, once, for every role** — its counted packets for the poster's
+    # index and the sheet's layout, and its probe for the proxy's rate and audio. *Never the
+    # source's: a derive describes what was delivered* (§19e). Inside `derive_s`, because it is
+    # derive work and the residual is for what nothing clocks.
+    try:
+        with (clock.timing("derive_s") if clock is not None else _no_clock()):
+            written = probe.counted_frames(master_path, errors.INTERNAL,
+                                           "counting the master's packets for its derives")
+            described = probe.probe_output(master_path)
+        reading = {"frames": written["frames"], "fps": described.get("fps"),
+                   "has_audio": described.get("has_audio")}
+    except Exception as exc:  # noqa: BLE001 — a derive must never cost a delivered master
+        for entry in request["derive"]:
+            warnings.append({"code": "derive_failed", "role": entry["role"],
+                             "reason": "the delivered master could not be read ({}: {})".format(
+                                 type(exc).__name__, str(exc)[:300])})
+        return delivered
+    name = request["output"].get("name")
+    # **Liveness while the roles run**, as the decode probe below has: without it a client polls a
+    # payload whose `at` froze when the phase began. Entered here rather than around the whole
+    # function because the reading above is quick and cannot hang.
+    with (progress.keeping_the_promise() if hasattr(progress, "keeping_the_promise")
+          else _no_clock()):
+        _derive_roles(request, master_path, reading, workdir, name, client, clock, trace,
+                      warnings, delivered, derives)
+    return delivered
+
+
+def _derive_roles(request, master_path, reading, workdir, name, client, clock, trace, warnings,
+                  delivered, derives):
+    """`_make_derives`' loop: make, upload and report each role; contain each failure."""
+    for entry in request["derive"]:
+        role = entry["role"]
+        try:
+            if clock is not None:
+                with clock.timing("derive_s"):
+                    path, made = derives.make(entry, master_path, reading, workdir, name=name)
+            else:
+                path, made = derives.make(entry, master_path, reading, workdir, name=name)
+            upload_started = time.time()
+            try:
+                made["key"] = storage.upload(client, request["output"], made["key"], path,
+                                             made["content_type"])
+            finally:
+                _add(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
+            _add(trace, "transfer", "upload_bytes", made["bytes"])
+            delivered.append(made)
+        except Exception as exc:  # noqa: BLE001 — a derive must never cost a delivered master
+            print("[derive] {} failed ({}: {})".format(role, type(exc).__name__, exc), flush=True)
+            warnings.append({"code": "derive_failed", "role": role,
+                             "reason": "{}: {}".format(type(exc).__name__, str(exc)[:300])})
+
+
+@contextlib.contextmanager
+def _no_clock():
+    yield
+
+
+def _fetch_into(url, destination, trace, progress, what="source"):
+    """Fetch one file for a repair — the source or a segment — `_retime`'s fetch, as a function.
+
+    **The same `storage.fetch_source`, the same phase and the same throttled byte reports**, and
+    the seconds and bytes ACCUMULATE into `fetch_s` and `fetch_bytes` rather than replacing them,
+    so a job that fetches a source and three segments files four downloads' worth under the two
+    names `wall_s`'s identity already reads. *`_retime`'s own block is left inline and untouched
+    (§19a).* Returns the path with its sniffed extension.
+    """
+    try:
+        progress.phase("fetching", force=True)
+    except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
+        print("[progress] fetching phase not emitted ({}: {})".format(
+            type(exc).__name__, exc), flush=True)
+    fetch_started = time.time()
+    try:
+        fetch_bytes = storage.fetch_source(
+            url, destination, on_bytes=_byte_reporter(progress, "fetching",
+                                                      bytes_per_s=ladder.FETCH_BYTES_PER_S))
+    finally:
+        _add(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))
+    _add(trace, "transfer", "fetch_bytes", fetch_bytes)
+    return probe.named_with_extension(destination, probe.detect_extension(destination))
+
+
+#: A URL's query, wherever it appears in a message. `requests` quotes the whole URL in an HTTP
+#: error, and a segment's query is a presigned grant exactly as the source's is.
+_URL_QUERY = re.compile(r"(https?://[^\s?'\"]+)\?[^\s'\"]*")
+
+
+def _segment_refusal(item_id, exc):
+    """A segment's fetch or probe failure, re-raised NAMING the item (§19d). *Same code, same
+    remedy: `source_fetch_failed` stays retryable and `invalid_source` stays not.*
+
+    **The message's URL queries are cut here, before it can reach the record or the bundle.**
+    *`diagnostics.redact` catches `X-Amz-` and a few generic names and not, for one, GCS V4's
+    `X-Goog-Signature` — found in review.* Cutting the query whole needs no list of names.
+    """
+    message = _URL_QUERY.sub(r"\1?<query removed>", exc.message)
+    return repair_plan.Refused(exc.code, "segment '{}': {}".format(item_id, message),
+                               item_id, remedy=exc.remedy, shortfall=exc.shortfall)
+
+
+def _repair(request, machine, warnings, workdir, progress, started, trace=None, clock=None):
+    """`frame_repair` end to end — `decisions.md` §19c, §19d, §19g.
+
+        fetch + probe the source   → §19d's source refusals: VFR, b past the end
+        fit, cap                   → retime's §11 table, counting the source's frames (§19g)
+        fetch + probe each segment → §19d's segment refusals: unreadable, wrong size, M
+        plan                       → the mapping, and `near_ranges` into warnings[]
+        load RIFE, one decode, one encode           (`repair.run`)
+        §19g's pre-upload check                      (`repair.verify_master`)
+        upload, derives, read-back                   (`_deliver`, shared with retime)
+
+    **Every refusal after the fetch writes a record**, as `capacity_exceeded` does on a retime,
+    because this function runs inside `handle`'s record `try`.
+    """
+    import interpolate as interpolate_module  # noqa: PLC0415 — GPU-box imports, like _retime's
+    import rife  # noqa: PLC0415
+
+    source_path = _fetch_into(request["source_url"], os.path.join(workdir, "source"), trace,
+                              progress)
+    source = probe.probe_source(source_path)
+    counted = probe.counted_frames(source_path)
+    frame_count = counted["frames"]
+    if trace is not None:
+        trace["source"] = _source_block(source, frame_count, source_path)
+
+    # ── §19d, AFTER THE PROBE: WHAT NEEDS THE FILE ──────────────────────────────────────────
+    #
+    # **Cadence in INTEGER ticks, the reading `delivery_witness` makes.** *A frame index means a
+    # moment only on a constant-rate stream; on a variable one, "frame 40" and "the 40th
+    # interval" are different frames, and a repair addressed by index would land beside the
+    # damage.* A packet with no PTS has no cadence to establish, and is refused the same way.
+    if counted["missing_pts"] or counted["tick_spread"] > 1:
+        raise WorkerError(
+            errors.INVALID_SOURCE,
+            "the source is not constant frame rate: its packet timestamps step by {} ticks{}. "
+            "frame_repair addresses frames by index, and on a variable-rate stream an index does "
+            "not name one moment — convert it to a constant rate first.".format(
+                counted["tick_gaps"],
+                "" if not counted["missing_pts"] else ", and {} packet(s) carry no timestamp"
+                .format(counted["missing_pts"])))
+    # **No declared rate is refused HERE rather than discovered by ffmpeg after the model load**,
+    # where it would read as the worker's fault. Found in review.
+    if not (counted["r_frame_rate"] or source.get("r_frame_rate")):
+        raise WorkerError(errors.INVALID_SOURCE,
+                          "the source declares no frame rate, and a repair's output is held to "
+                          "the source's rate exactly (§19g)")
+    items = request["frame_repair"]["items"]
+    repair_plan.check_bounds(frame_count, items)
+
+    scale = request.get("force_scale") or rife.DEFAULT_SCALE
+    ok, fit = estimator.fits(source["width"], source["height"], machine, scale=scale)
+    _note(trace, "estimate", "fit", fit)
+    # **§19g: retime's cap, COUNTING THE SOURCE's FRAMES AS DELIVERED** — a repair delivers every
+    # frame of the source, and the table prices the encode of each.
+    delivered_pixels = int(source["width"]) * int(source["height"])
+    frame_cap = ladder.max_delivered_frames(delivered_pixels)
+    for field, value in (("planned_frames", frame_count), ("frame_cap", frame_cap),
+                         ("probed_height", source["height"]),
+                         ("probed_pixels", delivered_pixels),
+                         ("step", ladder.step_for(delivered_pixels))):
+        _note(trace, "cap", field, value)
+    if frame_count > frame_cap:
+        raise WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "this repair would deliver {} frames — every frame of the source — and the limit for "
+            "a {} frame is {}. Refused before the model was loaded rather than killed at the "
+            "platform's 3,600-second wall. Split the clip and repair each part.".format(
+                frame_count, ladder.step_for(delivered_pixels), frame_cap))
+    if ok is False:
+        raise WorkerError(
+            errors.CAPACITY_EXCEEDED,
+            "{}x{} at scale {} needs about {} GiB at the peak and this card offers {} GiB "
+            "usable — short by {}. RIFE holds one frame pair whatever the clip length, so a "
+            "larger card is the only thing that changes this answer. {}".format(
+                source["width"], source["height"], scale, fit["needed_gb"], fit["usable_gb"],
+                fit["shortfall_gb"], fit["basis"]),
+            remedy=Remedy.LARGER_GPU, shortfall=fit)
+    if ok is None:
+        warnings.append("the fit predicate could not price this job: the hardware snapshot "
+                        "reports no vram_total_gb, so nothing was checked")
+
+    # ── the segments: fetched exactly as the source is, then probed ─────────────────────────
+    segments = {}
+    ranges, segment_items = [], []
+    for item in items:
+        if item["type"] == "range":
+            ranges.append(item)
+            continue
+        sid = item["id"]
+        try:
+            # **Their own directory, as the master has** — a caller's `output.name` is free
+            # text, and a master named `segment-0` would otherwise be written over the file the
+            # decoder is still reading. Found in review.
+            segment_dir = os.path.join(workdir, "segments")
+            os.makedirs(segment_dir, exist_ok=True)
+            path = _fetch_into(item["source_url"],
+                               os.path.join(segment_dir, "segment-{}".format(len(segments))),
+                               trace, progress, what="segment '{}'".format(sid))
+            seg = probe.probe_source(path)
+            seg_counted = probe.counted_frames(path, errors.INVALID_SOURCE,
+                                               "counting the segment's packets")
+        except WorkerError as exc:
+            raise _segment_refusal(sid, exc) from exc
+        if (seg["width"], seg["height"]) != (source["width"], source["height"]):
+            raise repair_plan.Refused(
+                errors.INVALID_SOURCE,
+                "segment '{}' is {}x{} and the source is {}x{}; a segment replaces frames in "
+                "place and is not resized.".format(sid, seg["width"], seg["height"],
+                                                   source["width"], source["height"]), sid)
+        segments[sid] = {"path": path, "m_file": seg_counted["frames"]}
+        segment_items.append(dict(item, m_file=seg_counted["frames"]))
+    mapping, near, summary = repair_plan.plan(frame_count, ranges, segment_items)
+    warnings.extend(near)
+    # **Banked before the model loads**, so a run that dies in the encode still files what it was
+    # asked to repair and how each item was fitted.
+    repair_block = {"items": summary}
+    if trace is not None:
+        trace["frame_repair"] = repair_block
+
+    if request.get("tie_check"):
+        import tiecheck  # noqa: PLC0415 — the import IS the cost being avoided, as in _retime
+
+        progress.phase("load", pct=2, force=True, note="tie check")
+        with progress.keeping_the_promise():
+            swept, why_not = tiecheck.run()
+        if trace is not None:
+            trace["tie_check"] = swept
+        if why_not:
+            warnings.append(why_not)
+
+    progress.phase("load", pct=3, force=True, note="interpolator")
+    if clock is None:
+        clock = stages.StageClock()
+    with clock.timing("load_s"):
+        interpolator = interpolate_module.Interpolator(
+            rife.Rife.load(scale=scale), scale=scale).prepare()
+
+    master = keys.master_name(False, source["width"], source["height"],
+                              name=request["output"].get("name"))
+    # **Not beside the source**: a caller's stem of `source` would make the master the file the
+    # decoder and the audio mux are reading. *Retime writes beside it and is not changed (§19a).*
+    master_dir = os.path.join(workdir, "master")
+    os.makedirs(master_dir, exist_ok=True)
+    master_path = os.path.join(master_dir, master)
+    checker = None
+    input_checker = None
+    if request.get("convert_check") or request.get("input_check"):
+        import routec  # noqa: PLC0415 — the live checkers are retime's objects, hoisted the same way
+
+        checker = routec.ConvertCheck() if request.get("convert_check") else None
+        input_checker = routec.InputCheck() if request.get("input_check") else None
+    if trace is not None:
+        if checker is not None:
+            trace[CONVERT_CHECK_LIVE] = checker
+        if input_checker is not None:
+            trace[INPUT_CHECK_LIVE] = input_checker
+    encode_defaults = {}
+    if trace is not None:
+        trace["encode_defaults"] = encode_defaults
+        trace["codec"] = request["release_3"]["codec"]
+        trace["bit_depth"] = request["release_3"]["bit_depth"]
+
+    progress.phase("interpolate", pct=10, force=True)
+    stats = repair.run(
+        source, source_path, frame_count, mapping,
+        {item["id"]: (item["a"], item["b"]) for item in ranges}, segments, master_path,
+        interpolator,
+        # **The source's r_frame_rate AS ITS RATIONAL STRING** — §19g holds the output to it
+        # exactly, and `MasterWriter` hands it to ffmpeg's `-r` as it arrives.
+        counted["r_frame_rate"] or source["r_frame_rate"],
+        identity_tags(request, source["width"], source["height"]),
+        crf=request.get("crf"), preset=request.get("preset"), threads=request.get("threads"),
+        sliced_threads=request.get("sliced_threads"), rc_lookahead=request.get("rc_lookahead"),
+        codec=request["release_3"]["codec"], bit_depth=request["release_3"]["bit_depth"],
+        frame_threads=request["release_3"].get("frame_threads"),
+        pools=request["release_3"].get("pools"),
+        convert_check=checker, input_check=input_checker,
+        reference_score=request.get("reference_score"), encode_defaults=encode_defaults,
+        progress=progress, audio_source=source_path if request["keep_audio"] else None,
+        scale=scale, clock=clock,
+        armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe",
+                                   "reference_score") if request.get(field)],
+        cap_note=(trace.setdefault("cap", {}) if trace is not None else None))
+    # **The record's block and the response's, split the way `_retime` splits `retime`'s**: the
+    # record lifts `codec` and `bit_depth` to its top level (§15c) and the three instruments out
+    # beside it; the response keeps the codec, because it has no top level to lift it to. *Banked
+    # BEFORE the upload rather than after it, as `_retime` does it — an upload that fails is a
+    # run whose encode stats are still true, and they should reach its record.*
+    repair_block.update({k: v for k, v in stats.items()
+                         if k not in ("estimate", "convert_check", "input_check", "codec",
+                                      "bit_depth", "reference")})
+    _note(trace, "estimate", "time", stats.get("estimate"))
+    if trace is not None:
+        trace["codec"] = stats.get("codec", trace["codec"])
+        trace["bit_depth"] = stats.get("bit_depth", trace["bit_depth"])
+        if stats.get("reference") is not None and "reference" not in trace:
+            trace["reference"] = stats["reference"]
+
+    # **§19g: BEFORE UPLOAD, OR THE JOB FAILS AND NOTHING IS DELIVERED** — and AFTER the stats are
+    # banked, because a master that fails this check is the run whose encode numbers are the
+    # diagnosis. Found in review.
+    repair.verify_master(master_path, counted)
+
+    output_entry, derived = _deliver(request, master, master_path, source_path, stats, trace,
+                                     progress, warnings, workdir)
+    response = {
+        "status": "DELIVERED",
+        "op": "frame_repair",
+        "output": output_entry,
+        "frame_repair": dict({"items": summary},
+                             **{k: v for k, v in stats.items()
+                                if k not in ("estimate", "convert_check", "input_check",
+                                             "reference")}),
+        "source": dict(_source_block(source, frame_count, source_path),
+                       padded_megapixels=interp_plan.padded_megapixels(
+                           source["width"], source["height"], scale)),
+        "build": build_identity(),
+    }
+    if derived is not None:
+        response["derived"] = derived
+    return _decorate(response, machine, [], warnings, progress, started)
+
+
+def _deliver(request, master, master_path, source_path, stats, trace, progress, warnings,
+             workdir):
+    """Everything after the master exists, for BOTH operations: upload it, bank its key, upload
+    §6g's evidence, make and upload §19e's derives, run §11's decode probe, and read the delivered
+    file back. Returns `(output_entry, derived)`.
+
+    **Moved out of `_retime` verbatim when `frame_repair` arrived**, because a second operation
+    that writes a master needs exactly this and a copy would be two places to fix each finding
+    below. *The one addition is the derive step; every paragraph around it is `_retime`'s own.*
+    """
     client = storage.client_for(request["output"])
     # **The upload's own clock and byte count, same rule as the fetch** (§8a). The size is read
     # before the PUT rather than after it: the object on the far side is what the byte count is
@@ -861,6 +1360,17 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         if trace is not None:
             trace["reference"] = reference_block
 
+    # ── §19e's DERIVES, AFTER THE MASTER AND ITS EVIDENCE ARE UP ──────────────────────────────
+    #
+    # **Made from the DELIVERED MASTER, uploaded beside it, and never at its cost.** *Above the
+    # decode probe for the reason the PNGs are above it: that probe is three full re-decodes at a
+    # half-hour timeout each, and a product a caller asked for should not wait behind an
+    # instrument, or die with it.*
+    derived = None
+    if request.get("derive"):
+        derived = _make_derives(request, master, master_path, client, trace, progress, warnings,
+                                workdir)
+
     # **`docs/archive/instrumentation-archive.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
     # It sat between the finished master and its upload, where three full re-decodes at a
     # half-hour timeout each put **up to 5400 seconds between a master existing on disk and
@@ -923,86 +1433,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     for field, value in delivered.items():
         output_entry.setdefault(field, value)
 
-    # **The stats and what they were measured on, and nothing shaped like a plan.** A
-    # `configuration` block here would look, to anything reading the envelope, exactly like a
-    # planned upscale — and there is no plan, because there is no model to plan for.
-    _note(trace, "estimate", "time", stats.get("estimate"))
-    if trace is not None:
-        # **Deliberately left, and it is a no-op.** `output_entry` was banked into the trace the
-        # instant the upload returned, and this is the same dict object mutated in place — so
-        # this line rebinds what is already there. It stays because deleting it would leave the
-        # one place a reader looks for "where does output reach the record" empty, and a fact
-        # with no visible home is how the next reader concludes there isn't one.
-        trace["output"] = output_entry
-        # **The retime stats have NO honest slot in `runrecord.build`.** `plan` and `rationale`
-        # are the estimator's fields and route C has no estimator, so putting them there would
-        # make a record borrow a slot that means something else — and a record that borrows a slot
-        # is worse than one with a gap, because the gap is visible. Filed to the gate rather than
-        # forced; `load_strip` is the nearest thing and it is not that either.
-        # **Without `estimate`, which has one home and it is the `estimate` block.** The time
-        # answer travels out of `routec` inside the stats because that is the only channel it
-        # has, and filing it here as well would put one fact in two places in one document — the
-        # duplication that makes a stale copy indistinguishable from a live one.
-        # **`convert_check` is excluded alongside `estimate` and lifted to the top level.** The
-        # kit grades `convert_check.frames` AGAINST `retime.n_out`, and a check nested inside the
-        # block it is checked against reads as part of that measurement rather than as the check
-        # on it.
-        # **`codec` is lifted out for §15's reason and not `convert_check`'s.** §15c's
-        # inference rule reads `record.get("codec", "h264")` at the record's TOP level — a
-        # `codec` nested inside `retime` is invisible to it, and a row that carries the field
-        # somewhere the rule does not look is a row the rule reads as h264.
-        trace["retime"] = {k: v for k, v in stats.items()
-                           if k not in ("estimate", "convert_check", "input_check",
-                                        "codec", "bit_depth", "reference")}
-        # **What RAN, replacing what was asked for.** They are the same value today — §6e leaves
-        # `codec: "source"` refused, so there is no resolution step between the ask and the
-        # outcome — and this line is what makes that a fact about the writer rather than a fact
-        # about the request that happens to hold.
-        trace["codec"] = stats.get("codec", trace["codec"])
-        trace["bit_depth"] = stats.get("bit_depth", trace["bit_depth"])
-        # **§17a: banked ONLY when the instrument produced one**, and banked ABOVE, as soon as
-        # the uploaded keys exist. This is the fallback for a run that produced scores and never
-        # reached the upload — the same dict either way, so it cannot disagree with itself.
-        if stats.get("reference") is not None and "reference" not in trace:
-            trace["reference"] = stats["reference"]
-
-    return _decorate({
-        "status": "DELIVERED",
-        "route": "C",
-        "output": output_entry,
-        # **`crf` and `preset` beside the x264 params** (instrumentation §2). §6a rules five
-        # encode settings changeable with today's values as defaults; the record carried three, so
-        # a corpus could not attribute a difference between two runs to the settings that differed.
-        # Read from the same place the encoder reads them, so a default cannot be restated wrongly.
-        # **The stats, whole, with nothing restated here.** This block used to add `target_fps`,
-        # `snap_tolerance`, the request's `crf` and the module's `DEFAULT_PRESET` — to the
-        # ENVELOPE only. `trace["retime"]` is built from `stats`, so all four were null in every
-        # run record ever written while the envelope beside them carried values: the corpus could
-        # not attribute a difference to the settings that differed, which is exactly what §2 says
-        # recording three of five costs. `routec` now reads all five off the writer that ran and
-        # returns them, so both artefacts carry one set of numbers that cannot disagree.
-        # **`codec` STAYS HERE, AND THIS TUPLE DELIBERATELY DIFFERS FROM THE RECORD'S ABOVE.**
-        # The record lifts it out because §15c's inference rule reads `record["codec"]` at the
-        # top level and a nested copy would be both invisible to the rule and a second home for
-        # one fact. **The envelope has no such rule and no top level to lift to**, so stripping
-        # it here would leave a caller holding `x265_params` non-null, `x264_params` null and
-        # nothing that names the codec — a response whose codec has to be INFERRED from which of
-        # two strings came back empty. *One fact, one home, per document: the record's home is
-        # its top level and the envelope's is here.*
-        "retime": {k: v for k, v in stats.items()
-                   if k not in ("estimate", "convert_check", "input_check", "reference")},
-        # **`padded_megapixels` is the fit's independent variable and nothing computed it**
-        # (instrumentation §1). Raw `width × height` and padded area differ by the padding rule —
-        # `max(128, 128/scale)` per dimension — so a corpus banked on dimensions and a predicate
-        # written against padded area are two axes that agree on nothing in particular, and the
-        # difference is recoverable only by someone who remembers the padding rule of the day the
-        # row was written. READ FROM `interp_plan`, which owns the rule, so the two cannot disagree.
-        "source": {"width": source["width"], "height": source["height"],
-                   "fps": source["fps"], "duration_s": source["duration_s"],
-                   "padded_megapixels": interp_plan.padded_megapixels(
-                       source["width"], source["height"], scale)},
-        "build": build_identity(),
-    }, machine, [], warnings, progress, started)
+    return output_entry, derived
 
 
 def _timings(trace, started):
@@ -1131,6 +1562,10 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             attempts=attempts,
             output=(trace or {}).get("output"),
             retime=(trace or {}).get("retime"),
+            # §19f: which operation, a repair's block in retime's place, and the derives delivered.
+            op=(request or {}).get("op"),
+            frame_repair=(trace or {}).get("frame_repair"),
+            derived=(trace or {}).get("derived"),
             # §13. **Read out of `trace`, which is where the branch banked it before the encode
             # began**, so a run reaped in ffmpeg still files what its settings were resolved from.
             # Null on any run that died before the branch, which is the honest shape of a job

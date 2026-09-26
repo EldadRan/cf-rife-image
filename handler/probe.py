@@ -235,6 +235,11 @@ def probe_source(path):
         # why one field survived this long and why the fixtures cannot catch it.
         "fps": _rate(video.get("r_frame_rate")) or _rate(video.get("avg_frame_rate")),
         "measured_fps": _rate(video.get("avg_frame_rate")) or _rate(video.get("r_frame_rate")),
+        # **The declared cadence AS THE RATIONAL STRING ffprobe gave** (`decisions.md` §19f). *`fps`
+        # above is that value as a float, which is what every plan reads; this is what a
+        # frame_repair's output is held to EXACTLY (§19g), and `30000/1001` and `29.97002997` are
+        # not the same claim.*
+        "r_frame_rate": video.get("r_frame_rate"),
         "duration_s": float(duration) if duration else None,
         # The *video stream's* own duration, not the container's. The container's is the longest
         # stream, so on a source whose audio outruns its picture it reports the audio -- exactly
@@ -313,6 +318,13 @@ def probe_output(path):
         "width": int(video["width"]),
         "height": int(video["height"]),
         "duration_s": float(duration) if duration else None,
+        # **§19f: what the output block lacked of the source's reading**, off the same stream
+        # object — `r_frame_rate` as the exact rational string, the pixel format, alpha from it,
+        # and the container.
+        "r_frame_rate": video.get("r_frame_rate"),
+        "pix_fmt": video.get("pix_fmt"),
+        "has_alpha": _pix_fmt_has_alpha(video.get("pix_fmt")),
+        "container": (data.get("format", {}).get("format_name") or "").split(",")[0] or None,
         # Split the same way as `probe_source`, and split at the same time: one call site changed
         # and the other left is the shape this project keeps finding. Here the declared rate also
         # reads back what this worker's own encoder was told to write, where an average over a
@@ -347,6 +359,63 @@ def probe_output(path):
         # disagree with the `codec` beside it — both come off the one stream object read once.
         "codec_tag_string": video.get("codec_tag_string"),
     }
+
+
+def counted_frames(path, failure_code=INVALID_SOURCE, what="counting the source's packets"):
+    """The video stream's PACKETS, counted, and their cadence in INTEGER ticks (§19d, §19f).
+
+    **The reading `gate_scripts/delivery_witness.read_video` makes, made here independently** —
+    packets rather than the header's `nb_frames`, and PTS in the stream's own ticks rather than in
+    seconds, because a 1 µs decimal rounding read as a gap calls an exactly-CFR file variable.
+
+    Returns `{"frames", "tick_spread", "tick_gaps", "missing_pts", "r_frame_rate",
+    "stream_duration_s"}`. `tick_spread` is the largest gap between consecutive sorted PTS less the
+    smallest: **0 or 1 is constant frame rate**, and `missing_pts` counts packets that carried
+    none, whose cadence nobody can establish. The last two come off the same call, so §19g's three
+    pre-upload comparisons read one snapshot of one file.
+    """
+    data = _ffprobe(["-select_streams", "v:0", "-show_entries",
+                     "packet=pts,duration:stream=r_frame_rate,duration,time_base", path],
+                    failure_code, what)
+    packets = data.get("packets") or []
+    stream = (data.get("streams") or [{}])[0]
+    ticks = []
+    ends = []
+    missing = 0
+    for packet in packets:
+        try:
+            ticks.append(int(packet["pts"]))
+        except (KeyError, TypeError, ValueError):
+            missing += 1
+            continue
+        try:
+            ends.append(ticks[-1] + int(packet["duration"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    ticks.sort()
+    gaps = [ticks[i] - ticks[i - 1] for i in range(1, len(ticks))]
+    try:
+        stream_duration = float(stream["duration"])
+    except (KeyError, TypeError, ValueError):
+        stream_duration = None
+    # **Matroska and WebM carry no stream-level duration** — ffprobe prints none for either — so
+    # it is read off the packets instead: the span from the first PTS to the end of the last
+    # packet, in the stream's own ticks. *Found in review: without it every repair of an .mkv
+    # source failed §19g's check after the whole GPU cost.* The container's duration is NOT the
+    # fallback, because on a clip whose audio outruns its picture it is the audio's.
+    if stream_duration is None and ticks and ends:
+        try:
+            from fractions import Fraction  # noqa: PLC0415
+            span = (max(ends) - ticks[0]) * Fraction(stream["time_base"])
+            stream_duration = float(span)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            stream_duration = None
+    return {"frames": len(packets),
+            "tick_spread": (max(gaps) - min(gaps)) if gaps else 0,
+            "tick_gaps": sorted(set(gaps))[:8],
+            "missing_pts": missing,
+            "r_frame_rate": stream.get("r_frame_rate"),
+            "stream_duration_s": stream_duration}
 
 
 def is_faststart(path):

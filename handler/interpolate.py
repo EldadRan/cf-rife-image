@@ -394,6 +394,32 @@ class Interpolator:
         # fail on some frames and not others, which is the worst shape a bug can have.
         return self._crop(out, cache["geometry"]).clone()
 
+    def between(self, cache, key, frame_a, frame_b, timestep, clock=None):
+        """One synthesis between two frames the CALLER chose — `frame_repair`'s entry (§19c).
+
+        **The same two steps `_emit`'s synth branch takes, charged to the same two clocks**, so a
+        repair's `convert_dev_s` and `model_s` mean exactly what a retime's do. *What differs is
+        only who picks the pair*: `_emit` walks a retime plan over consecutive source frames; a
+        repair names anchors `a` and `b` that may be far apart, or two frames of a segment file.
+
+        `cache` belongs to the caller's one pass, never to this object (§5d(a)); `key` names the
+        pair, so N syntheses between one pair pad it once. `timestep` is handed to the model as
+        a float — the caller keeps it exact up to here.
+        """
+        # **Checked here and not left to `_load_pair`, whose refusal formats `index + 1`** — an
+        # integer there and a tuple here, so its own message would raise `TypeError` in place of
+        # the refusal. *Unreachable today: segments are refused at the probe for a size that
+        # differs from the source's, and the decoder checks every stream's first frame.*
+        if frame_a.shape != frame_b.shape:
+            raise ValueError("the pair {!r} differs in shape ({} vs {})".format(
+                key, tuple(frame_a.shape), tuple(frame_b.shape)))
+        if clock is None:
+            self._load_pair(cache, key, frame_a, frame_b)
+        else:
+            with clock.timing("convert_dev_s"):
+                self._load_pair(cache, key, frame_a, frame_b, synchronise=True)
+        return self._synthesise(cache, float(timestep), clock)
+
     def stream(self, frames, n_in, src_fps, dst_fps, tol=0.0, clock=None):
         """Return a `RetimeResult` — `.frames` is the generator, `.stats` is the plan's stats.
 

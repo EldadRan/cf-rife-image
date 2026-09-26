@@ -194,6 +194,61 @@ def derive(params, debug=False):
 
     `debug` gates the DEBUG names in `params.output`; the levels above are `validation`'s, which
     is the module that reads the flag off the top level.
+
+    **`frame_repair` shares the encode half and not the retime half** (`decisions.md` §19b), so
+    that half is `encode_block` and this adds `target_fps` and `snap_tolerance` to it. *The dict
+    this returns is unchanged key for key.*
+    """
+    params = dict(params or {})
+    encode = encode_block(params, debug)
+    # **`params.target_fps`, and the block it used to live in is gone.** *`envelope` REFUSED this
+    # name at the top level until today, for want of the `interpolate` object it belonged to —
+    # so the field a caller most obviously wants to send was the one spelling the contract would
+    # not take.*
+    # **REQUIRED, and absent is its own refusal rather than a bad value** (CF, 2026-09-04). The
+    # two codes are two different facts about the request and the caller's next action differs:
+    # `missing_required_field` says send the field, `invalid_field_value` says the field you sent
+    # is not a rate. *Collapsing them into the positive-number check below would tell a caller
+    # who sent nothing that their nothing was not positive.* Same split `refuse_field` makes one
+    # screen up between a gated name and an unknown one.
+    #
+    # **`is None` rather than `not in params`, which is `validation._require`'s test exactly**
+    # (`validation.py:239`). An explicit `"target_fps": null` is a caller declining to choose,
+    # which is the state this ruling refuses, and reading it as "present, therefore check the
+    # type" would refuse it with the wrong code.
+    target_fps = params.get("target_fps")
+    if target_fps is None:
+        raise WorkerError(
+            MISSING_REQUIRED_FIELD,
+            "field 'target_fps' is required in 'params'. It is the rate this worker exists to "
+            "produce and there is no default: a job that does not name one has not said what to "
+            "do.")
+    # **Unchanged by the ruling above**, and it still rejects `bool` before the numeric test
+    # because `True` is an `int` in Python and would otherwise retime a clip to 1 fps.
+    if isinstance(target_fps, bool) or not isinstance(target_fps, (int, float)) \
+            or target_fps <= 0:
+        raise WorkerError(
+            INVALID_FIELD_VALUE, "field 'target_fps' must be a positive number")
+
+    # **No default, and absent is not zero** (§5c). A `snap_tolerance` defaulted to 0 would ship
+    # the unsnapped plan as the ruled answer before the benchmark that decides it has run.
+    # Unruled must be visible as unruled, including in the code.
+    tolerance = params.get("snap_tolerance")
+    if tolerance is not None and (isinstance(tolerance, bool)
+                                  or not isinstance(tolerance, (int, float))
+                                  or not 0.0 <= tolerance < 0.5):
+        raise WorkerError(
+            INVALID_FIELD_VALUE,
+            "field 'snap_tolerance' is a fraction of one source interval, in [0, 0.5)")
+
+    return dict(encode, target_fps=float(target_fps), snap_tolerance=tolerance)
+
+
+def encode_block(params, debug=False):
+    """`params.output` — codec, bit depth and the two x265 levers — for EITHER operation.
+
+    **Retime's rules verbatim** (§19b: *"if we give the option to change format in retime, we
+    should give it in repair"*), which is why this is the retime code moved rather than a copy.
     """
     params = dict(params or {})
     # **TYPE-CHECKED BEFORE IT IS WALKED, AND IT WAS NOT.** *`dict(params["output"])` on an `int`
@@ -262,54 +317,5 @@ def derive(params, debug=False):
             "not a codec name — 10 selects HEVC main10 and is refused on h264.".format(
                 BIT_DEPTHS, bit_depth))
 
-    # **`params.target_fps`, and the block it used to live in is gone.** *`envelope` REFUSED this
-    # name at the top level until today, for want of the `interpolate` object it belonged to —
-    # so the field a caller most obviously wants to send was the one spelling the contract would
-    # not take.*
-    # **REQUIRED, and absent is its own refusal rather than a bad value** (CF, 2026-09-04). The
-    # two codes are two different facts about the request and the caller's next action differs:
-    # `missing_required_field` says send the field, `invalid_field_value` says the field you sent
-    # is not a rate. *Collapsing them into the positive-number check below would tell a caller
-    # who sent nothing that their nothing was not positive.* Same split `refuse_field` makes one
-    # screen up between a gated name and an unknown one.
-    #
-    # **`is None` rather than `not in params`, which is `validation._require`'s test exactly**
-    # (`validation.py:239`). An explicit `"target_fps": null` is a caller declining to choose,
-    # which is the state this ruling refuses, and reading it as "present, therefore check the
-    # type" would refuse it with the wrong code.
-    target_fps = params.get("target_fps")
-    if target_fps is None:
-        raise WorkerError(
-            MISSING_REQUIRED_FIELD,
-            "field 'target_fps' is required in 'params'. It is the rate this worker exists to "
-            "produce and there is no default: a job that does not name one has not said what to "
-            "do.")
-    # **Unchanged by the ruling above**, and it still rejects `bool` before the numeric test
-    # because `True` is an `int` in Python and would otherwise retime a clip to 1 fps.
-    if isinstance(target_fps, bool) or not isinstance(target_fps, (int, float)) \
-            or target_fps <= 0:
-        raise WorkerError(
-            INVALID_FIELD_VALUE, "field 'target_fps' must be a positive number")
-
-    # **No default, and absent is not zero** (§5c). A `snap_tolerance` defaulted to 0 would ship
-    # the unsnapped plan as the ruled answer before the benchmark that decides it has run.
-    # Unruled must be visible as unruled, including in the code.
-    tolerance = params.get("snap_tolerance")
-    if tolerance is not None and (isinstance(tolerance, bool)
-                                  or not isinstance(tolerance, (int, float))
-                                  or not 0.0 <= tolerance < 0.5):
-        raise WorkerError(
-            INVALID_FIELD_VALUE,
-            "field 'snap_tolerance' is a fraction of one source interval, in [0, 0.5)")
-
-    return {
-        "codec": codec,
-        "bit_depth": bit_depth,
-        "frame_threads": frame_threads,
-        "pools": pools,
-        # **FLAT, where an `interpolate` sub-object used to sit.** *Keeping the nesting for
-        # readers downstream would leave the record and the wire disagreeing about the shape of
-        # the request, which is the one thing a normalised form exists to prevent.*
-        "target_fps": float(target_fps),
-        "snap_tolerance": tolerance,
-    }
+    return {"codec": codec, "bit_depth": bit_depth, "frame_threads": frame_threads,
+            "pools": pools}
