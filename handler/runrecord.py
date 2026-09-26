@@ -129,7 +129,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
           convert_check=None, input_check=None, decode_probe=None, encode_defaults=None,
           codec=None, bit_depth=None, reference=None, cap=None, op=None, frame_repair=None,
-          derived=None):
+          derived=None, derive_failed=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -158,7 +158,11 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # block have their own absence rules — §15a's inference and §17a's armed-instrument skip
         # — and neither needs the version. `drain_s` is the only field this wave makes MANDATORY
         # on a path that already ran.
-        "record_version": 2,
+        # **3 FROM 2026-09-26, ON BOTH OPERATIONS** (`decisions.md` §19f). *A repair record has no
+        # `retime` block and a `frame_repair` one in its place, and `op` and `derive_s` are
+        # mandatory from 3* — **a shape that moved under an unchanged version is what the
+        # harvester's version gate exists to stop.** The 2026-09-26 build shipped this at 2.
+        "record_version": 3,
         "utc": diagnostics._now(),
         "status": status,
         "build": build_identity,
@@ -277,6 +281,10 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
     # delivered is an empty list, and `warnings[]` says why.*
     if derived is not None:
         body["derived"] = derived
+    # §19f: `{role, reason}` per derive NOT delivered — **absent when every one was**. The
+    # sentence for each is in `warnings[]`, which stays a list of strings.
+    if derive_failed:
+        body["derive_failed"] = derive_failed
     if tie_check:
         body["tie_check"] = tie_check
     # **`docs/archive/conversion-wave-archive.md` §5-0, omitted rather than nulled**, exactly as `tie_check` is:

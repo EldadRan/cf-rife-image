@@ -285,6 +285,10 @@ def handle(job_input, job=None):
         payload = exc.to_dict()
         payload["hardware"] = machine
         payload["execution_ms"] = int((time.time() - started) * 1000)
+        # **§19f: every response carries `warnings[]`**, and this exit skips `_decorate`. Nothing
+        # has run, so it is empty — but a caller indexing it must not meet a KeyError on the one
+        # exit a bad field takes. Found in review.
+        payload["warnings"] = []
         return payload
 
     warnings = []
@@ -379,6 +383,7 @@ def handle(job_input, job=None):
             # The code and the reason, never the log tail: this is a record, not a bundle, and a
             # tail is the bundle's job.
             outcome["error"] = {k: v for k, v in payload["cf_error"].items() if k != "log_tail"}
+            _failed_derives_onto(payload, trace)
             return _decorate(payload, machine, attempts, warnings, progress, started)
         except Exception as exc:  # noqa: BLE001 — a job must return an envelope, never raise
             traceback.print_exc()
@@ -392,6 +397,7 @@ def handle(job_input, job=None):
             outcome["status"] = "internal"
             outcome["error"] = {"code": errors.INTERNAL,
                                 "message": "{}: {}".format(type(exc).__name__, exc)}
+            _failed_derives_onto(payload, trace)
             return _decorate(payload, machine, attempts, warnings, progress, started)
         finally:
             _write_run_record(outcome, request, machine, attempts, warnings, progress,
@@ -764,8 +770,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         audio_source=source_path if request["keep_audio"] else None,
         variant=request.get("force_variant") or "direct", scale=scale, clock=clock)
 
-    output_entry, derived = _deliver(request, master, master_path, source_path, stats, trace,
-                                     progress, warnings, workdir)
+    output_entry, derived, derive_failed = _deliver(request, master, master_path, source_path,
+                                                    stats, trace, progress, warnings, workdir)
 
     # **The stats and what they were measured on, and nothing shaped like a plan.** A
     # `configuration` block here would look, to anything reading the envelope, exactly like a
@@ -850,6 +856,9 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # §19e — absent when no derive was asked for, so such a response is what it was before.
     if derived is not None:
         response["derived"] = derived
+    # §19f — absent when every derive asked for was delivered.
+    if derive_failed:
+        response["derive_failed"] = derive_failed
     return _decorate(response, machine, [], warnings, progress, started)
 
 
@@ -874,13 +883,13 @@ def _make_derives(request, master, master_path, client, trace, progress, warning
     """§19e: every role asked for, made from the DELIVERED MASTER and uploaded beside it.
 
     **A FAILED DERIVE DOES NOT COST THE MASTER.** *The master is already uploaded when this runs;
-    a role that fails is dropped from `derived[]` and named in `warnings[]` as `derive_failed`
-    with its role and reason, and the job is still `DELIVERED`* — §0 decides it: the master is the
-    expensive, irreplaceable object and a derive can be re-made from it.
+    a role that fails is dropped from `derived[]`, filed as `{role, reason}` in `derive_failed[]`
+    and said as a sentence in `warnings[]`, and the job is still `DELIVERED`* — §0 decides it: the
+    master is the expensive, irreplaceable object and a derive can be re-made from it.
 
     **The making is `derive_s`, a stage inside `compute_s`; the uploads are `upload_s`** and
     `upload_bytes`, like every other byte this worker pushes out — so both of `wall_s`'s identities
-    still close. Returns the list of what was DELIVERED, in the order asked.
+    still close. Returns `(delivered, failed)`, each in the order asked.
     """
     import derives  # noqa: PLC0415 — stdlib-only; imported where it is used, like its neighbours
 
@@ -895,8 +904,10 @@ def _make_derives(request, master, master_path, client, trace, progress, warning
     # **Banked before the first role, and filled in place** — a run that dies mid-derive still
     # files what it delivered, which is the `trace` rule every other block here follows.
     delivered = []
+    failed = []
     if trace is not None:
         trace["derived"] = delivered
+        trace["derive_failed"] = failed
     try:
         progress.phase("deriving", force=True,
                        roles=[entry["role"] for entry in request["derive"]])
@@ -916,10 +927,10 @@ def _make_derives(request, master, master_path, client, trace, progress, warning
                    "has_audio": described.get("has_audio")}
     except Exception as exc:  # noqa: BLE001 — a derive must never cost a delivered master
         for entry in request["derive"]:
-            warnings.append({"code": "derive_failed", "role": entry["role"],
-                             "reason": "the delivered master could not be read ({}: {})".format(
-                                 type(exc).__name__, str(exc)[:300])})
-        return delivered
+            _derive_failure(warnings, failed, entry["role"],
+                            "the delivered master could not be read ({}: {})".format(
+                                type(exc).__name__, str(exc)[:300]))
+        return delivered, failed
     name = request["output"].get("name")
     # **Liveness while the roles run**, as the decode probe below has: without it a client polls a
     # payload whose `at` froze when the phase began. Entered here rather than around the whole
@@ -927,12 +938,20 @@ def _make_derives(request, master, master_path, client, trace, progress, warning
     with (progress.keeping_the_promise() if hasattr(progress, "keeping_the_promise")
           else _no_clock()):
         _derive_roles(request, master_path, reading, workdir, name, client, clock, trace,
-                      warnings, delivered, derives)
-    return delivered
+                      warnings, delivered, failed, derives)
+    return delivered, failed
+
+
+def _derive_failure(warnings, failed, role, reason):
+    """§19f: the failure in its own block for a program, and as a sentence for a person.
+    **`warnings[]` stays a list of strings** (CF, 2026-09-26) — nothing is parsed out of it."""
+    failed.append({"role": role, "reason": reason})
+    warnings.append("derive_failed: the {} was not delivered — {}. The master is delivered and "
+                    "the {} can be re-made from it.".format(role, reason, role))
 
 
 def _derive_roles(request, master_path, reading, workdir, name, client, clock, trace, warnings,
-                  delivered, derives):
+                  delivered, failed, derives):
     """`_make_derives`' loop: make, upload and report each role; contain each failure."""
     for entry in request["derive"]:
         role = entry["role"]
@@ -952,8 +971,8 @@ def _derive_roles(request, master_path, reading, workdir, name, client, clock, t
             delivered.append(made)
         except Exception as exc:  # noqa: BLE001 — a derive must never cost a delivered master
             print("[derive] {} failed ({}: {})".format(role, type(exc).__name__, exc), flush=True)
-            warnings.append({"code": "derive_failed", "role": role,
-                             "reason": "{}: {}".format(type(exc).__name__, str(exc)[:300])})
+            _derive_failure(warnings, failed, role,
+                            "{}: {}".format(type(exc).__name__, str(exc)[:300]))
 
 
 @contextlib.contextmanager
@@ -1116,10 +1135,18 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
         segments[sid] = {"path": path, "m_file": seg_counted["frames"]}
         segment_items.append(dict(item, m_file=seg_counted["frames"]))
     mapping, near, summary = repair_plan.plan(frame_count, ranges, segment_items)
-    warnings.extend(near)
+    # **§19d/§19f: the pair for a program in `frame_repair.near_ranges[]`, and a sentence naming
+    # both ids for a person in `warnings[]`** — which stays a list of strings (CF, 2026-09-26).
+    near_ranges = [{"ids": pair["ids"], "good_gap": pair["good_gap"]} for pair in near]
+    for pair in near_ranges:
+        warnings.append("near_ranges: '{}' and '{}' are {} good frame(s) apart; each is repaired "
+                        "from its own anchors, and merging them is the caller's decision.".format(
+                            pair["ids"][0], pair["ids"][1], pair["good_gap"]))
     # **Banked before the model loads**, so a run that dies in the encode still files what it was
     # asked to repair and how each item was fitted.
     repair_block = {"items": summary}
+    if near_ranges:
+        repair_block["near_ranges"] = near_ranges
     if trace is not None:
         trace["frame_repair"] = repair_block
 
@@ -1207,13 +1234,14 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     # diagnosis. Found in review.
     repair.verify_master(master_path, counted)
 
-    output_entry, derived = _deliver(request, master, master_path, source_path, stats, trace,
-                                     progress, warnings, workdir)
+    output_entry, derived, derive_failed = _deliver(request, master, master_path, source_path,
+                                                    stats, trace, progress, warnings, workdir)
     response = {
         "status": "DELIVERED",
         "op": "frame_repair",
         "output": output_entry,
         "frame_repair": dict({"items": summary},
+                             **({"near_ranges": near_ranges} if near_ranges else {}),
                              **{k: v for k, v in stats.items()
                                 if k not in ("estimate", "convert_check", "input_check",
                                              "reference")}),
@@ -1224,6 +1252,8 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     }
     if derived is not None:
         response["derived"] = derived
+    if derive_failed:
+        response["derive_failed"] = derive_failed
     return _decorate(response, machine, [], warnings, progress, started)
 
 
@@ -1231,7 +1261,7 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
              workdir):
     """Everything after the master exists, for BOTH operations: upload it, bank its key, upload
     §6g's evidence, make and upload §19e's derives, run §11's decode probe, and read the delivered
-    file back. Returns `(output_entry, derived)`.
+    file back. Returns `(output_entry, derived, derive_failed)`.
 
     **Moved out of `_retime` verbatim when `frame_repair` arrived**, because a second operation
     that writes a master needs exactly this and a copy would be two places to fix each finding
@@ -1367,9 +1397,10 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
     # half-hour timeout each, and a product a caller asked for should not wait behind an
     # instrument, or die with it.*
     derived = None
+    derive_failed = None
     if request.get("derive"):
-        derived = _make_derives(request, master, master_path, client, trace, progress, warnings,
-                                workdir)
+        derived, derive_failed = _make_derives(request, master, master_path, client, trace,
+                                               progress, warnings, workdir)
 
     # **`docs/archive/instrumentation-archive.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
     # It sat between the finished master and its upload, where three full re-decodes at a
@@ -1433,7 +1464,7 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
     for field, value in delivered.items():
         output_entry.setdefault(field, value)
 
-    return output_entry, derived
+    return output_entry, derived, derive_failed
 
 
 def _timings(trace, started):
@@ -1566,6 +1597,7 @@ def _write_run_record(outcome, request, machine, attempts, warnings, progress, t
             op=(request or {}).get("op"),
             frame_repair=(trace or {}).get("frame_repair"),
             derived=(trace or {}).get("derived"),
+            derive_failed=(trace or {}).get("derive_failed"),
             # §13. **Read out of `trace`, which is where the branch banked it before the encode
             # began**, so a run reaped in ffmpeg still files what its settings were resolved from.
             # Null on any run that died before the branch, which is the honest shape of a job
@@ -1676,6 +1708,16 @@ def _write_diagnostics(request, machine, attempts, exception, captured, failed,
         pass
 
 
+def _failed_derives_onto(payload, trace):
+    """§19f on a FAILURE envelope: a `derive_failed:` sentence in `warnings[]` never arrives
+    without the `derive_failed[]` block beside it. *A job can fail AFTER its derives ran — the
+    decode probe is the step after them — and the envelope then carried the sentence and not the
+    block.* Found in review. Absent when no derive failed, as on a delivery."""
+    failed = (trace or {}).get("derive_failed")
+    if failed:
+        payload["derive_failed"] = list(failed)
+
+
 def _decorate(payload, machine, attempts, warnings, progress, started):
     # **THE THREE CPU NUMBERS MOVED INTO `hardware.read`, WHERE THE RECORD CAN SEE THEM.**
     # This block added `usable_cores` and `affinity_cores` to the RETURNED PAYLOAD, and the run
@@ -1696,6 +1738,11 @@ def _decorate(payload, machine, attempts, warnings, progress, started):
     # dict, and a mutation visible in the one nobody was looking at.
     payload["hardware"] = dict(machine or {})
     payload["execution_ms"] = int((time.time() - started) * 1000)
+    # **§19f (CF, 2026-09-26, the builder's C5): `warnings[]` on the RESPONSE as well as the
+    # record, on both operations, and still a list of sentences.** *A caller sees a near-items
+    # hint or a failed derive without fetching the record.* **A copy**, for `hardware`'s reason:
+    # the record is built from the same list afterwards and must not share the object.
+    payload["warnings"] = list(warnings or [])
     if attempts:
         payload.setdefault("attempts", attempts)
     if progress.emitted:
