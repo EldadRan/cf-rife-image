@@ -587,7 +587,7 @@ class MasterWriter:
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None, bit_depth=None,
                  threads=None, sliced_threads=None, rc_lookahead=None,
                  reference_path=None, frame_threads=None, pools=None,
-                 delivered_frames=None):
+                 delivered_frames=None, source_format=False):
         self.path = path
         #: **Where ffmpeg writes contract §6g's raw reference, or None for an unarmed run.**
         #: A SECOND OUTPUT of this same command rather than a copy of what crossed the pipe: the
@@ -687,7 +687,12 @@ class MasterWriter:
         #: **The two parameter strings are the pair, and each is null under the other's codec.**
         #: The column exists on every row either way, which is what lets a reader ask "what
         #: bounded this encode" without first knowing which codec answered.
-        if self.bit_depth != envelope.DEFAULT_BIT_DEPTH and self.codec != "h265":
+        # **`source_format` is the one way past it** (`decisions.md` §20a): a repair whose
+        # source IS h264 High10 keeps that format when no other was asked for — "as the
+        # source's own format it is the caller's choice". The door still refuses it as a
+        # REQUESTED output, so this flag is set by `handler._repair` from the probe alone.
+        if (self.bit_depth != envelope.DEFAULT_BIT_DEPTH and self.codec != "h265"
+                and not source_format):
             raise WorkerError(INTERNAL, (
                 "the master writer was constructed for {}-bit under codec {!r}; §6f refuses that "
                 "pair at the door because h264 High10 is hardware-decoded almost nowhere, so "

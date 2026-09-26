@@ -230,6 +230,22 @@ class Progress:
         if ladder:
             self._eta_ladder = str(ladder)
 
+    def restart_frames(self, note=None):
+        """Start the frame count over, for a job that has thrown its first attempt away.
+
+        **`frames` latches `_work_fraction` with `max()`**, which is right for one attempt and
+        wrong for two: a `frame_repair` whose copy fell back to the full path (`decisions.md`
+        §20e) had already counted every frame, so the full path's count would sit under the latch
+        and the published percentage would read ~100 through the whole re-encode. *Found in
+        review.* Public, for `plan_frames`' reason: the caller learns the fact.
+        """
+        self._work_fraction = 0.0
+        self._frames_done = 0
+        self._seconds_per_frame = None
+        self._phase_started = time.time()
+        if note:
+            self.phase("interpolate", pct=0.0, force=True, note=note)
+
     def plan_frames(self, count):
         """Name the planned output count once it is known, rather than at construction.
 

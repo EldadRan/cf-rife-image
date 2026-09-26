@@ -21,6 +21,9 @@ loops is owed to the other**; they are named here so the next reader looks.
 this module on a box with no torch and `verify_master` runs on the tests tree.
 """
 import os
+import subprocess
+import tempfile
+import time
 from fractions import Fraction
 
 import probe
@@ -46,7 +49,7 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
         rc_lookahead=None, codec=None, bit_depth=None, frame_threads=None, pools=None,
         convert_check=None, input_check=None, reference_score=False, encode_defaults=None,
         progress=None, audio_source=None, scale=None, clock=None, armed=None, cap_note=None,
-        tensors=None, to_bytes=None):
+        tensors=None, to_bytes=None, source_format=False):
     """Write the repaired master. Returns the stats the record's `frame_repair` block carries.
 
     `frame_count` is the source's COUNTED packets, which the plan was built from; `mapping` is
@@ -168,7 +171,7 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
             audio_limit_s=source.get("video_duration_s"), codec=codec, bit_depth=bit_depth,
             frame_threads=frame_threads, pools=pools, delivered_frames=frame_count,
             reference_path=reference_path, crf=encode_crf, preset=encode_preset,
-            **encode_settings)
+            source_format=source_format, **encode_settings)
         if progress is not None:
             progress.begin_phase()
         checker = convert_check if isinstance(convert_check, routec.ConvertCheck) else (
@@ -213,7 +216,11 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
                 remedy=exc.remedy, shortfall=exc.shortfall) from exc
         finally:
             if clock is not None:
-                clock.drain_s = writer_cm.drain_s
+                # **Added to, not replaced**: a repair whose copy fell back (§20e) already
+                # drained its span encoders into this clock, and that time belongs in the
+                # identity rather than in the residual. On every other run it starts at None.
+                banked = [d for d in (clock.drain_s, writer_cm.drain_s) if d is not None]
+                clock.drain_s = sum(banked) if banked else None
             print("[encode] ffmpeg peak RSS {} GiB over {} frame(s)".format(
                 writer_cm.encoder_peak_rss_gb, writer_cm.frames_written), flush=True)
             routec._print_write_distribution(writer_cm)  # noqa: SLF001
@@ -289,6 +296,332 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
             except Exception as exc:  # noqa: BLE001 — a release must never displace a delivery
                 print("[decode] capture.release() failed ({}: {})".format(
                     type(exc).__name__, exc), flush=True)
+
+
+def _frames_of(argv, width, height, count=None, clock=None, what="a decode"):
+    """Raw BGR frames off an ffmpeg pipe, as cv2-layout `(height, width, 3)` uint8 arrays —
+    the shape `routec._tensors` takes from `decode.open_source`. A generator; the process is
+    closed when the generator is. `count` is a `routec.DecodeCount`-like object or None."""
+    import numpy as np  # noqa: PLC0415 — GPU-box import, as everywhere on this path
+
+    size = width * height * 3
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while True:
+            if clock is None:
+                raw = _read_exactly(proc.stdout, size)
+            else:
+                with clock.timing("decode_s"):
+                    raw = _read_exactly(proc.stdout, size)
+            if len(raw) != size:
+                return
+            if count is not None:
+                count.decoded += 1
+            yield np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+    finally:
+        proc.stdout.close()
+        proc.kill()
+        proc.wait()
+
+
+def _read_exactly(stream, size):
+    chunks, got = [], 0
+    while got < size:
+        chunk = stream.read(size - got)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
+class _Count:
+    def __init__(self):
+        self.decoded = 0
+
+
+def _died(proc, what, err_file):
+    """A writer closed its input before it was done: wait for it and raise `CheckFailed` with
+    its own words, so the fallback files ffmpeg's reason rather than a bare BrokenPipeError.
+    Found in review."""
+    import splice  # noqa: PLC0415
+
+    proc.wait()
+    err_file.seek(0)
+    raise splice.CheckFailed("{} stopped reading (exit {}): {}".format(
+        what, proc.returncode, err_file.read().decode(errors="replace").strip()[-300:]))
+
+
+def _finish(proc, what, err_file):
+    """Close a writer's stdin, wait, and raise `splice.CheckFailed` on a non-zero exit. Returns
+    the seconds the close and the wait took: the encoder's drain (`stages.DRAIN`)."""
+    import splice  # noqa: PLC0415
+
+    started = time.perf_counter()
+    try:
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    proc.wait()
+    drained = time.perf_counter() - started
+    if proc.returncode != 0:
+        err_file.seek(0)
+        raise splice.CheckFailed("{} exited {}: {}".format(
+            what, proc.returncode, err_file.read().decode(errors="replace").strip()[-300:]))
+    return drained
+
+
+def run_copy(pmap, spans, delay, mapping, anchors, segments, master_path, interpolator,
+             workdir, crf, preset, audio_source=None, progress=None, clock=None,
+             tensors=None, to_bytes=None, threading=None):
+    """`frame_repair`'s copy path — `decisions.md` §20. Writes the spliced master; returns the
+    stats the record's `frame_repair` block carries. Raises `splice.CheckFailed` for anything
+    the fallback should catch, `WorkerError` for what the full path would refuse too.
+
+    **PER SPAN, TWO PASSES, AND NEITHER HOLDS THE SPAN** (the gate's order: stream everything at
+    8K):
+
+      1. The window [start-1, end] is decoded as BGR — both anchors of every item in the span
+         lie inside it — and walked by `repair_plan.emit`, the full path's own order, over a
+         window of the mapping. Each REPLACED frame goes through the model and `to_bytes`, then
+         to one ffmpeg that turns rgb24 into the source's pixel format with the source's matrix
+         and range stated (§20c), writing a spool file. *Held at once: `emit`'s two frames.*
+      2. The span is decoded again in the source's own pixel format and piped to the span
+         encoder, a replaced frame read off the spool in its place. **Untouched frames never go
+         through RGB.** *Held at once: one frame.*
+
+    `tensors` and `to_bytes` default to retime's conversions, and are parameters so this runs
+    with the stand-in model on a box without torch, as `run` does.
+    """
+    import routec  # noqa: PLC0415
+    import splice  # noqa: PLC0415
+
+    tensors = tensors or routec._tensors  # noqa: SLF001 — the full path's conversion, by design
+    to_bytes = to_bytes or routec._to_rgb24_device  # noqa: SLF001
+    if len(mapping) != pmap.count:
+        # The plan counted the packets one way and the splice another; indices would not name
+        # the same frames. Found in review.
+        raise splice.NotEligible("the plan holds {} frames and the packet map {}".format(
+            len(mapping), pmap.count))
+    matrix, rng = pmap.matrix()
+    runs = splice.layout(pmap.count, spans)
+    parts_dir = os.path.join(workdir, "splice")
+    os.makedirs(parts_dir, exist_ok=True)
+    parts, copy_argv = splice.copy_parts(pmap, runs, parts_dir)
+    recipe = {"copy": copy_argv, "spans": []}
+    size = pmap.frame_bytes
+    staging = routec.PinnedStaging() if hasattr(routec, "PinnedStaging") else None
+    frames_encoded = sum(end - start for start, end, _ in spans)
+    replaced_total = 0
+    written = 0
+    drain_s = 0.0
+    span_sets = []
+    files = []
+    if progress is not None:
+        progress.begin_phase()
+    for kind, start, end in runs:
+        if kind == "copy":
+            files.append((parts[start], end - start))
+            # **Progress counts the source's frames, copied ones included** — the ETA was
+            # planned on all of them (§20g), and a copied run is done the moment it is cut.
+            written += end - start
+            if progress is not None:
+                try:
+                    # **`boundary=False`: counted, never timed.** A copied frame costs nothing,
+                    # so a rate taken over it would publish a "measured" ETA short by the share
+                    # copied. The seed (§20g: the full path's, conservative) stands. Found in
+                    # review.
+                    progress.frames(written, phase="interpolate", boundary=False)
+                except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                    print("[progress] frame emit failed at {} ({}: {})".format(
+                        written, type(exc).__name__, exc), flush=True)
+            continue
+        lo, hi = max(0, start - 1), min(pmap.count - 1, end)
+        window = []
+        for n in range(lo, hi + 1):
+            entry = mapping[n]
+            window.append((repair_plan.SRC, n - lo) if entry[0] == repair_plan.SRC else entry)
+        replaced = [n for n in range(start, end) if mapping[n][0] != repair_plan.SRC]
+        replaced_total += len(replaced)
+        window_anchors = {rid: (a - lo, b - lo) for rid, (a, b) in anchors.items()
+                          if start <= a + 1 and b - 1 < end}
+        # ── pass 1: the replaced frames, through the model, to the spool ────────────────────
+        spool = os.path.join(parts_dir, "span{:05d}.yuv".format(start))
+        if replaced:
+            inputs, select = pmap.from_frame(lo)
+            source_rgb = _frames_of(splice.rgb_decoder(pmap.path, inputs, select, hi - lo + 1,
+                                                       matrix, rng),
+                                    pmap.width, pmap.height, clock=clock)
+            seg_frames, seg_counts, seg_gens = {}, {}, []
+            used = sorted({entry[1] for entry in window if entry[0] == repair_plan.SEG})
+            for sid in used:
+                seg = segments[sid]
+                seg_counts[sid] = _Count()
+                # **The segment's OWN matrix and range**, not the source's: its frames go to RGB
+                # by its tags and come back by the source's, which is the conversion a caller's
+                # clip needs to sit beside the source's frames.
+                gen = _frames_of(splice.rgb_decoder(seg["path"], ["-i", seg["path"]], None,
+                                                    seg["m_file"] + 1,
+                                                    *splice.colour_of(seg["path"])),
+                                 pmap.width, pmap.height, count=seg_counts[sid], clock=clock)
+                seg_gens.append(gen)
+                seg_frames[sid] = tensors(gen, interpolator.device, clock=clock)
+            cache = {}
+            stream = repair_plan.emit(
+                window, window_anchors, tensors(source_rgb, interpolator.device, clock=clock),
+                seg_frames,
+                lambda key, frame_a, frame_b, t: interpolator.between(cache, key, frame_a,
+                                                                      frame_b, t, clock))
+            with tempfile.TemporaryFile() as err:
+                converter = subprocess.Popen(
+                    splice.rgb_to_source(pmap, len(replaced)) + [spool],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err)
+                failed = True
+                try:
+                    for offset, frame in enumerate(stream):
+                        n = lo + offset
+                        if n >= end:
+                            break
+                        if mapping[n][0] == repair_plan.SRC:
+                            continue
+                        if clock is None:
+                            payload = to_bytes(frame, staging)
+                        else:
+                            with clock.timing("convert_out_s"):
+                                payload = to_bytes(frame, staging)
+                        try:
+                            converter.stdin.write(payload)
+                        except BrokenPipeError:
+                            _died(converter, "the RGB-to-source conversion", err)
+                        if staging is not None:
+                            staging.released()
+                    # **§19d's count agreement, on each segment this span read**: the plan's M
+                    # was counted from its packets, so the rest of its frames are drained and
+                    # counted — a segment is at most a range's length.
+                    for sid, gen in zip(used, seg_gens):
+                        for _ in gen:
+                            pass
+                        if seg_counts[sid].decoded != segments[sid]["m_file"]:
+                            raise repair_plan.Refused(
+                                INVALID_SOURCE,
+                                "segment '{}' decodes to {} frames and its container holds {} "
+                                "video packets, and its M was counted from the packets — so the "
+                                "frames it contributed are not the ones the plan named.".format(
+                                    sid, seg_counts[sid].decoded, segments[sid]["m_file"]), sid)
+                    failed = False
+                except repair_plan.Refused as exc:
+                    # **The source window running short is the splice's seek, not the caller's
+                    # source**: the plan's count was checked against the packets already. A
+                    # segment's own count (item set) stays a refusal. Found in review.
+                    if exc.item is not None:
+                        raise
+                    raise splice.CheckFailed("the span window at [{}, {}] decoded short: {}"
+                                             .format(lo, hi, exc.message))
+                finally:
+                    stream.close()
+                    source_rgb.close()
+                    for gen in seg_gens:
+                        gen.close()
+                    if failed:
+                        converter.kill()
+                        converter.wait()
+                if not failed:
+                    _finish(converter, "the RGB-to-source conversion", err)
+            if os.path.getsize(spool) != size * len(replaced):
+                raise splice.CheckFailed("the spool for the span at {} holds {} bytes, not {}"
+                                         .format(start, os.path.getsize(spool),
+                                                 size * len(replaced)))
+        # ── pass 2: the span, in the source's own YUV, to its encoder ───────────────────────
+        span_ts = os.path.join(parts_dir, "span{:05d}.ts".format(start))
+        argv = splice.span_encoder(pmap, end - start, span_ts, delay, crf, preset, threading)
+        decode_argv = splice.span_decoder(pmap, start, end - start)
+        recipe["spans"].append({"span": [start, end], "decode": decode_argv, "encode": argv})
+        with tempfile.TemporaryFile() as enc_err:
+            decoder = subprocess.Popen(decode_argv, stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL)
+            encoder_proc = subprocess.Popen(argv, stdin=subprocess.PIPE,
+                                            stdout=subprocess.DEVNULL, stderr=enc_err)
+            spool_file = open(spool, "rb") if replaced else None
+            failed = True
+            try:
+                for n in range(start, end):
+                    if clock is None:
+                        frame = _read_exactly(decoder.stdout, size)
+                    else:
+                        with clock.timing("decode_s"):
+                            frame = _read_exactly(decoder.stdout, size)
+                    if len(frame) != size:
+                        raise splice.CheckFailed(
+                            "the span decode at [{}, {}) ended at frame {}".format(start, end, n))
+                    if mapping[n][0] != repair_plan.SRC:
+                        frame = spool_file.read(size)
+                    try:
+                        if clock is None:
+                            encoder_proc.stdin.write(frame)
+                        else:
+                            with clock.timing("write_wait_s"):
+                                encoder_proc.stdin.write(frame)
+                    except BrokenPipeError:
+                        _died(encoder_proc, "the span encoder at [{}, {})".format(start, end),
+                              enc_err)
+                    written += 1
+                    if progress is not None:
+                        try:
+                            progress.frames(written, phase="interpolate", boundary=False)
+                        except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                            print("[progress] frame emit failed at {} ({}: {})".format(
+                                written, type(exc).__name__, exc), flush=True)
+                failed = False
+            finally:
+                if spool_file is not None:
+                    spool_file.close()
+                decoder.stdout.close()
+                decoder.kill()
+                decoder.wait()
+                if failed:
+                    encoder_proc.kill()
+                    encoder_proc.wait()
+            drained = _finish(encoder_proc, "the span encoder at [{}, {})".format(start, end),
+                              enc_err)
+            drain_s += drained
+            if clock is not None:
+                # **Banked per span**, so a copy that fails at a later span, the join or the
+                # avcC still files the drains it paid for. Found in review.
+                clock.drain_s = round((clock.drain_s or 0.0) + drained, 3)
+        if replaced:
+            os.remove(spool)
+        span_sets.append(splice.span_param_sets(span_ts))
+        files.append((span_ts, end - start))
+    if progress is not None:
+        try:
+            # The join, the mux, the avcC rewrite and the check run after the last frame; the
+            # full path's name for "frames done, file not yet" is this one.
+            progress.phase("draining", force=True)
+        except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+            print("[progress] draining phase not emitted ({}: {})".format(
+                type(exc).__name__, exc), flush=True)
+    joined, join_argv = splice.join(pmap, files, parts_dir)
+    mux_argv = splice.mux(pmap, joined, master_path, audio_source)
+    head, source_sps, source_pps, _ = splice.read_avcc(pmap.path)
+    sps, pps = splice.avcc_sets(source_sps, source_pps, span_sets)
+    delta = splice.rewrite_avcc(master_path, sps, pps, head)
+    recipe.update(join=join_argv, mux=mux_argv,
+                  avcc={"sps_ids": [splice.param_id(u) for u in sps], "delta_bytes": delta})
+    return dict(
+        n_in=pmap.count,
+        n_out=pmap.count,
+        n_synth=repair_plan.synthesised(mapping),
+        n_replaced=replaced_total,
+        frames_copied=pmap.count - frames_encoded,
+        frames_encoded=frames_encoded,
+        codec="h264",
+        bit_depth=pmap.depth,
+        x264_params=splice.x264_params(threading),
+        x265_params=None,
+        crf=crf,
+        preset=preset,
+        recipe=recipe,
+    )
 
 
 def verify_master(master_path, source_counted):

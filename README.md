@@ -31,6 +31,16 @@ and any name the contract does not define are refused by name with `field_not_su
 that validates and then does nothing reads as supported to every client, which is why they are
 refused rather than ignored.
 
+**A repair re-encodes only the GOPs it touches and copies every other packet bit for bit.** On an
+h264 MP4 or MOV source in 4:2:0 at 8 or 10 bits, each item's span runs from the clean IDR at or
+before its first replaced frame to the next one after its last; those spans are re-encoded and
+everything outside them is the source's own packets, joined through MPEG-TS into an `avc1` MP4
+whose `avcC` carries the source's parameter sets and the spans'. The spliced file is checked
+before upload — frame count, rate, every PTS and every DTS equal to the source's, and a clean
+decode across every seam — and anything that is not eligible, or fails that check, is re-encoded
+in full instead and says why. `params.reencode: "full"` forces the full re-encode, and a repair
+with no `params.output` keeps the source's format. The splice is `handler/splice.py`.
+
 **Either operation may ask for `derive`** — a WebP poster, a 1280-px h264 proxy and a spritesheet,
 each made from the delivered master and uploaded beside it. A derive that fails is reported in
 the run record's `warnings[]` and does not cost the master.
@@ -76,8 +86,10 @@ an A40 whether or not anyone remembered to bank its padded area. So every envelo
 
 - `op`, and `retime` or `frame_repair` beside it — for a retime `n_out`, `n_synth`, `n_copy`,
   `n_hold`, `real_share`, `variant`, `scale`, `snap_tolerance`; for a repair each item's `id`,
-  `type`, `a`, `b` and `n`; for both `peak_vram_gb`, `encoder_peak_rss_gb` and all five encode
-  settings (`crf`, `preset`, `x264_params`)
+  `type`, `a`, `b` and `n`, which `path` it took (`copy` or `full`) and why (`path_reason`), the
+  re-encoded `spans[]` on a copy, and `frames_copied` and `frames_encoded`; for both
+  `peak_vram_gb`, `encoder_peak_rss_gb` and all five encode settings (`crf`, `preset`,
+  `x264_params`)
 - `source` and `output` — each file's ffprobe, the rate as its exact rational and the frames
   counted from its packets, so a repair's claim to have changed nothing but frames is checkable
 - `derived[]` — one entry per derive delivered, when any was asked for
@@ -93,7 +105,9 @@ an A40 whether or not anyone remembered to bank its padded area. So every envelo
 
 Progress is **frame-level**: frames written against the planned count. Decode, interpolation and
 encode are one streaming loop — the writer pulls each frame through the whole chain — so
-*"decode complete"* is never true and the only quantity true per frame is the frame count.
+*"decode complete"* is never true and the only quantity true per frame is the frame count. A
+repair that copies counts a copied run as done the moment it is cut, and each re-encoded frame as
+it reaches its span's encoder.
 
 ## Tests
 

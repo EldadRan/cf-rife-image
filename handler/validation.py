@@ -216,7 +216,13 @@ REPAIR_PARAMS_PRODUCTION = (
     "crf",
     "preset",
     "output",
+    # §20a: "auto" copies what the repair does not change where it can; "full" forces the
+    # full re-encode. *A repair's name only, so on a retime it is refused as unlisted.*
+    "reencode",
 )
+
+#: §20a. The first is the default.
+REENCODE_VALUES = ("auto", "full")
 
 #: **The debug half of a `frame_repair`'s `params`: retime's, less the one that is about
 #: retime's plan.** *The five instruments sit on the same decode, the same conversions and the same
@@ -724,6 +730,12 @@ def validate(job_input):
     if release_3["codec"] != "h265":
         crossed_265 = [name for name in ("frame_threads", "pools")
                        if release_3.get(name) is not None]
+        # **§20a: a repair that names no codec encodes in the SOURCE's**, which only the probe
+        # knows — so "sent together with h264" would be false here, and the check is
+        # `handler._repair_path`'s, made against the codec the job will actually use. Found in
+        # review.
+        if repair and (params.get("output") or {}).get("codec") is None:
+            crossed_265 = []
         if crossed_265:
             raise WorkerError(
                 FIELD_NOT_SUPPORTED,
@@ -792,6 +804,20 @@ def validate(job_input):
     # source's cadence and each segment's M need the files and are `handler._repair`'s.*
     items = repair_plan.validate_items(params) if repair else None
 
+    # **§20a — `reencode`, a string from two.** *A bool is refused rather than read as "full":
+    # `true` says "yes" to a question the field does not ask.*
+    reencode = None
+    if repair:
+        reencode = params.get("reencode")
+        if reencode is None:
+            reencode = REENCODE_VALUES[0]
+        elif isinstance(reencode, bool) or reencode not in REENCODE_VALUES:
+            raise WorkerError(
+                INVALID_FIELD_VALUE,
+                "field 'reencode' must be one of {}, got {!r}. 'auto' copies every GOP the "
+                "repair does not touch where the source allows it; 'full' re-encodes every "
+                "frame.".format(", ".join("'{}'".format(v) for v in REENCODE_VALUES), reencode))
+
     # **§19e — `derive`, on BOTH operations.** *It was refused here by name until 2026-09-26,
     # because the validator this replaces acknowledged roles in detail and then produced nothing;
     # it is validated now because it produces what it acknowledges.*
@@ -826,7 +852,13 @@ def validate(job_input):
         "request_id": request_id,
         "source_url": _as_str(job_input["source_url"], "source_url"),
         # §19c. `None` on a retime, so a retime's normalised request has nothing a repair reads.
-        "frame_repair": {"items": items} if repair else None,
+        # §20a: `output_given` is which encode fields the caller SENT — an absent
+        # `params.output` on a repair means the source's format, and only the probe knows it,
+        # so `release_3`'s defaults cannot say it (they are retime's h264 8-bit).
+        "frame_repair": {"items": items, "reencode": reencode,
+                         "output_given": {name: (params.get("output") or {}).get(name)
+                                          for name in ("codec", "bit_depth")}}
+        if repair else None,
         # §19e. **An empty list when none was asked for**, and `handler` then writes exactly what
         # it wrote before the wave (`decisions.md` §19e's last line).
         "derive": derive,

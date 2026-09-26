@@ -168,6 +168,13 @@ RUN curl -fsSL --retry 12 --retry-delay 15 --retry-all-errors --retry-max-time 6
 # then propagates and `set -e` turns into a failed build. It is a race against ffmpeg finishing
 # its write, so it passes on a fast machine and fails on a slow one; it passed in CI and failed
 # here on the same commit. Grepping a file cannot race.
+#
+# **THE COPY PATH ADDS THREE (`decisions.md` §20a, §20i), ASSERTED HERE FOR libx265's REASON**: a
+# pin that moved to a build without them would fail at RUN time on every eligible repair instead
+# of here. `setts` shifts a span's DTS (§20i R3) and `filter_units` strips what the join adds
+# (R2). **And x264 must encode High10**, because §20a keeps a High10 source's format on the full
+# path — "the builder confirms the image's x264 can encode it". *An 8-bit-only x264 would write
+# this file as High and the grep would fail; that is the confirmation, made by the build.*
 RUN set -eux; \
     python3 -c "import sys; assert sys.version_info[:2] == (3, 11), 'expected Python 3.11, got %s' % sys.version"; \
     ffmpeg -hide_banner -encoders > /tmp/encoders.txt; \
@@ -182,9 +189,18 @@ RUN set -eux; \
       -lavfi "[0:v][1:v]libvmaf=feature=name=cambi|name=psnr|name=float_ssim:log_path=/tmp/vmaf.json:log_fmt=json" \
       -f null -; \
     python3 -c "import json,sys; K=('cambi','psnr_y','float_ssim'); f=json.load(open('/tmp/vmaf.json'))['frames']; assert len(f)==2, 'scored %d frames, expected 2' % len(f); [ (lambda m: [ (k in m) or sys.exit('frames[%d].metrics lacks %s; it reports %s' % (i,k,sorted(m))) for k in K ] + [ float(m[k]) for k in K ])(e['metrics']) for i,e in enumerate(f) ]; [ e.get('frameNum') in (None,i) or sys.exit('frameNum %r at position %d; the parser needs zero-based contiguous' % (e.get('frameNum'),i)) for i,e in enumerate(f) ]; print('libvmaf ok: %d frames, %s' % (len(f), sorted(f[0]['metrics'])))"; \
+    ffmpeg -hide_banner -bsfs > /tmp/bsfs.txt; \
+    grep -q setts /tmp/bsfs.txt; \
+    grep -q filter_units /tmp/bsfs.txt; \
+    ffmpeg -hide_banner -loglevel error -f lavfi -i "testsrc2=size=320x184:rate=24:duration=1" \
+      -c:v libx264 -pix_fmt yuv420p10le /tmp/high10.mp4; \
+    ffprobe -v error -select_streams v:0 -show_entries stream=profile,pix_fmt -of csv=p=0 \
+      /tmp/high10.mp4 > /tmp/high10.txt; \
+    grep -q "High 10,yuv420p10le" /tmp/high10.txt; \
     ffmpeg -version > /tmp/ffver.txt; \
-    echo "toolchain: $(python3 -V), $(head -1 /tmp/ffver.txt)"; \
-    rm -f /tmp/encoders.txt /tmp/mp4muxer.txt /tmp/ffver.txt /tmp/vmaf.json
+    echo "toolchain: $(python3 -V), $(head -1 /tmp/ffver.txt), x264 High10: $(cat /tmp/high10.txt)"; \
+    rm -f /tmp/encoders.txt /tmp/mp4muxer.txt /tmp/ffver.txt /tmp/vmaf.json /tmp/bsfs.txt \
+      /tmp/high10.mp4 /tmp/high10.txt
 
 # ── Python dependencies ─────────────────────────────────────────────────────────────────────
 # **Nothing here pins `torch` or `torchvision`, and that is load-bearing rather than an omission.**
@@ -290,7 +306,11 @@ COPY *.py ./
 # inside `_make_derives`, so nothing else would parse it before a delivered master reached it.
 # It imports `os`, `subprocess`, `keys`, `probe` and `errors` — the lazy-torch property is
 # unchanged. *`repair` and `repair_plan` need no name here: `handler` imports both at module scope.*
-RUN python3 -c "import handler, decodeprobe, derives; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler + decodeprobe + derives import OK, torch still lazy')"
+#
+# **`splice` joins it for the same reason** (`decisions.md` §20): `handler` imports it inside
+# `_repair_path` and `_repair_copy`. It imports `json`, `os`, `struct`, `subprocess`, `fractions`
+# and `repair_plan` — no numpy, no torch.
+RUN python3 -c "import handler, decodeprobe, derives, splice; import sys; assert 'torch' not in sys.modules, 'handler imported torch eagerly'; print('handler + decodeprobe + derives + splice import OK, torch still lazy')"
 
 # **THE LINE ABOVE'S OWN SCOPE LIMIT, CLOSED BY ONE STDLIB PASS** (`docs/gate-findings.md`
 # `F-2026-08-29-4`). An import proves a module parses and that its module-scope imports resolve;

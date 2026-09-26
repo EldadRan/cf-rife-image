@@ -1023,6 +1023,188 @@ def _segment_refusal(item_id, exc):
                                item_id, remedy=exc.remedy, shortfall=exc.shortfall)
 
 
+#: §20a: the source codec names ffprobe prints, as this worker's `output.codec` spells them.
+_SOURCE_CODECS = {"h264": "h264", "hevc": "h265"}
+#: What the full path's encoder can write, by pixel format: 4:2:0 at 8 or 10 bits.
+_SOURCE_DEPTHS = {"yuv420p": 8, "yuvj420p": 8, "yuv420p10le": 10}
+
+
+def _repair_path(request, source):
+    """§20a/§20b: which path a repair takes, decided before anything is encoded.
+
+    Returns `{path, reason, codec, bit_depth, source_format, warning}`. `path` is "copy" when a
+    copy will be ATTEMPTED — it can still fall back (`_repair_copy`). **An absent
+    `params.output` means the source's format** (§20a), and a source format the full path's
+    encoder cannot produce is refused `field_not_supported` naming it, rather than silently
+    changed.
+    """
+    block = request["frame_repair"]
+    given = block.get("output_given") or {}
+    source_codec = _SOURCE_CODECS.get(source.get("codec"))
+    source_depth = _SOURCE_DEPTHS.get(source.get("pix_fmt"))
+    same_format = source_codec is not None and source_depth is not None
+    if given.get("codec") is None and given.get("bit_depth") is None:
+        if not same_format:
+            raise WorkerError(
+                errors.FIELD_NOT_SUPPORTED,
+                "the source is {} {}, and with no 'params.output' a repair keeps the source's "
+                "format (§20a) — which this worker cannot encode: it writes h264 or h265 in "
+                "4:2:0 at 8 or 10 bits. Send 'params.output' to choose one, and the repair "
+                "re-encodes in it.".format(source.get("codec"), source.get("pix_fmt")))
+        codec, depth = source_codec, source_depth
+    else:
+        codec, depth = request["release_3"]["codec"], request["release_3"]["bit_depth"]
+    changed = (codec, depth) != (source_codec, source_depth)
+    # **The door checked the codec's own debug fields against `release_3`'s default, h264**,
+    # because the source's format was not known there. Now it is: a field the RESOLVED codec does
+    # not have is refused here, by name, as the door refuses it — rather than reaching the
+    # writer as a plumbing fault after the model load. Found in review.
+    foreign = ([n for n in ("threads", "sliced_threads", "rc_lookahead")
+                if request.get(n) is not None] if codec == "h265" else
+               [n for n in ("frame_threads", "pools")
+                if request["release_3"].get(n) is not None])
+    if foreign:
+        raise WorkerError(
+            errors.FIELD_NOT_SUPPORTED,
+            "{} {} not a setting of {}, which is the codec this repair encodes in — the "
+            "source's, because 'params.output' named none (§20a). Send 'params.output.codec' to "
+            "choose the codec these belong to.".format(
+                ", ".join("'{}'".format(n) for n in foreign),
+                "is" if len(foreign) == 1 else "are", codec))
+    # **h264 10-bit is refused as a REQUESTED output at the door (§19b); as the source's own
+    # format it is kept** (§20a), so the writer is told it is the source's.
+    choice = {"codec": codec, "bit_depth": depth, "warning": None,
+              "source_format": not changed and codec == "h264" and depth == 10}
+    if block.get("reencode") == "full":
+        return dict(choice, path="full", reason="requested")
+    if changed:
+        return dict(choice, path="full", reason="codec_change", warning=(
+            "frame_repair re-encoded every frame because the output format differs from the "
+            "source's: {} {}-bit was asked for and the source is {} ({}). A copy cannot change "
+            "codec.".format(codec, depth, source.get("codec"), source.get("pix_fmt"))))
+    import splice  # noqa: PLC0415 — stdlib and ffmpeg only; imported where it is used
+
+    why = splice.eligibility(source, keep_audio=request.get("keep_audio"))
+    armed = [name for name in ("convert_check", "input_check", "reference_score")
+             if request.get(name)]
+    if why is None and armed:
+        # **The three instruments are wired into the full path's write loop**, and a copy
+        # would file them as having run over frames they never saw.
+        why = "{} armed, and {} instrument{} the full path's write loop".format(
+            ", ".join(armed), "that" if len(armed) == 1 else "those",
+            " is wired into" if len(armed) == 1 else "s are wired into")
+    if why is not None:
+        return dict(choice, path="full", reason="not_eligible: " + why,
+                    warning=_full_instead(why))
+    return dict(choice, path="copy", reason=None)
+
+
+def _full_instead(why):
+    return ("frame_repair re-encoded every frame instead of copying the GOPs it did not touch: "
+            "{}.".format(why))
+
+
+def _repair_copy(request, source, source_path, items, mapping, ranges, segments, master_path,
+                 interpolator, workdir, progress, clock, trace, warnings, repair_block, scale,
+                 frame_count, counted):
+    """§20: plan, splice and check a copy. Returns its stats, or None after filing why it fell
+    back (CF ruling C) — `path` "full", `path_reason` and a warning sentence — so the caller
+    runs the full path into the same `master_path`.
+
+    **What falls back and what does not:** `splice.NotEligible` (the plan's declines) and
+    `splice.CheckFailed` (§20e's check, or any ffmpeg step of the splice) fall back. **A
+    `WorkerError` does not**: a segment that decodes to the wrong count is refused on the full
+    path too (§19d), and running it again would spend the GPU twice to say the same thing.
+    """
+    import routec  # noqa: PLC0415 — GPU-box import, like the rest of this path
+    import splice  # noqa: PLC0415
+
+    anchors = {item["id"]: (item["a"], item["b"]) for item in ranges}
+    try:
+        pmap = splice.PacketMap(source_path)
+        spans, delay = splice.plan(pmap, [{"id": i["id"], "a": i["a"], "b": i["b"]}
+                                          for i in items])
+        repair_block["spans"] = [{"start": a, "end": b, "items": ids} for a, b, ids in spans]
+        crf = request.get("crf") if request.get("crf") is not None else encoder.DEFAULT_CRF
+        preset = (request.get("preset") if request.get("preset") is not None
+                  else encoder.DEFAULT_PRESET)
+        delivered_pixels = int(source["width"]) * int(source["height"])
+        # **The full path's x264 bound, resolved the full path's way** (§6d): the area row
+        # fills what the caller did not send. *A span encoder with none ran 128 frame threads on
+        # the 96-core host — the configuration that filled 46 GiB at 8K.* Found in review.
+        settings, provenance = encoder.resolve_defaults(
+            delivered_pixels, codec="h264", threads=request.get("threads"),
+            sliced_threads=request.get("sliced_threads"),
+            rc_lookahead=request.get("rc_lookahead"))
+        threading = encoder.x264_params(settings["threads"], settings["sliced_threads"],
+                                        settings["rc_lookahead"])
+        estimate = None
+        if progress is not None:
+            # **§20g: the source's frames against §11's table, unchanged**, so a copy's ETA is
+            # the full path's, and conservative by the share it copies — priced with the
+            # arguments `repair.run` gives the same call, so the estimate describes this job's
+            # arm and not an unthreaded, unarmed one. Found in review.
+            progress.plan_frames(frame_count)
+            estimate = routec._seed_estimate(  # noqa: SLF001 — the full path's own seeding
+                progress, source, {"n_out": frame_count,
+                                   "n_synth": repair_plan.synthesised(mapping)},
+                scale, dict(settings, crf=crf, preset=preset),
+                [field for field in ("convert_check", "input_check", "tie_check",
+                                     "decode_probe", "reference_score") if request.get(field)],
+                [name for name in ("crf", "preset") if request.get(name) is None],
+                delivered_pixels=delivered_pixels, codec="h264")
+        peak_reset = routec._reset_peak()  # noqa: SLF001
+        with routec._held_alive(progress):  # noqa: SLF001
+            stats = repair.run_copy(
+                pmap, spans, delay, mapping, anchors, segments, master_path, interpolator,
+                workdir, crf, preset,
+                audio_source=source_path if request["keep_audio"] else None,
+                progress=progress, clock=clock, threading=threading)
+            splice.verify(master_path, pmap, spans)
+        try:
+            repair.verify_master(master_path, counted)
+        except WorkerError as exc:
+            raise splice.CheckFailed(exc.message)
+    except WorkerError:
+        # **A refusal the full path would make too** — a segment decoding to the wrong count
+        # (§19d). Running it again would spend the GPU twice to say the same thing.
+        raise
+    except Exception as exc:  # noqa: BLE001 — ruling C: a copy that fails falls back, and says why
+        # **Every other failure of the splice falls back**, not only the two it names: a
+        # BrokenPipeError from a span encoder that died, a timeout, an avcC this module cannot
+        # parse. *Any of them is the copy failing, and ruling C answers a failed copy with the
+        # full path and a reason — never with a failed job.* Found in review.
+        kind = ("not_eligible" if isinstance(exc, splice.NotEligible) else "check_failed")
+        if not isinstance(exc, (splice.NotEligible, splice.CheckFailed)):
+            exc = "{}: {}".format(type(exc).__name__, exc)
+        repair_block.pop("spans", None)
+        repair_block.update(path="full", path_reason="{}: {}".format(kind, exc))
+        warnings.append(_full_instead("the copy {} ({})".format(
+            "was not possible" if kind == "not_eligible" else "failed its check before upload",
+            exc)))
+        print("[splice] falling back to the full path — {}: {}".format(kind, exc), flush=True)
+        if os.path.exists(master_path):
+            os.remove(master_path)
+        if progress is not None:
+            try:
+                progress.restart_frames(note="the copy fell back; re-encoding every frame")
+            except Exception as problem:  # noqa: BLE001 — never at the cost of the fallback
+                print("[progress] restart not emitted ({}: {})".format(
+                    type(problem).__name__, problem), flush=True)
+        return None
+    finally:
+        shutil.rmtree(os.path.join(workdir, "splice"), ignore_errors=True)
+    print("[splice] {}".format(json.dumps(stats.pop("recipe"))), flush=True)
+    stats.update(settings)
+    stats["encode_provenance"] = provenance
+    stats.update(spans=repair_block["spans"], scale=scale, estimate=estimate,
+                 peak_vram_gb=routec._read_peak(peak_reset),  # noqa: SLF001
+                 decoder_threads=None, encoder_peak_rss_gb=None, convert_check=None,
+                 input_check=None, reference=None)
+    return stats
+
+
+
 def _repair(request, machine, warnings, workdir, progress, started, trace=None, clock=None):
     """`frame_repair` end to end — `decisions.md` §19c, §19d, §19g.
 
@@ -1150,6 +1332,14 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     if trace is not None:
         trace["frame_repair"] = repair_block
 
+    # ── §20a/§20b: WHICH PATH, decided from the request and the probe alone ─────────────────
+    choice = _repair_path(request, source)
+    request["release_3"] = dict(request["release_3"], codec=choice["codec"],
+                                bit_depth=choice["bit_depth"])
+    repair_block.update(path=choice["path"], path_reason=choice["reason"])
+    if choice["warning"]:
+        warnings.append(choice["warning"])
+
     if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — the import IS the cost being avoided, as in _retime
 
@@ -1194,26 +1384,40 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
         trace["bit_depth"] = request["release_3"]["bit_depth"]
 
     progress.phase("interpolate", pct=10, force=True)
-    stats = repair.run(
-        source, source_path, frame_count, mapping,
-        {item["id"]: (item["a"], item["b"]) for item in ranges}, segments, master_path,
-        interpolator,
-        # **The source's r_frame_rate AS ITS RATIONAL STRING** — §19g holds the output to it
-        # exactly, and `MasterWriter` hands it to ffmpeg's `-r` as it arrives.
-        counted["r_frame_rate"] or source["r_frame_rate"],
-        identity_tags(request, source["width"], source["height"]),
-        crf=request.get("crf"), preset=request.get("preset"), threads=request.get("threads"),
-        sliced_threads=request.get("sliced_threads"), rc_lookahead=request.get("rc_lookahead"),
-        codec=request["release_3"]["codec"], bit_depth=request["release_3"]["bit_depth"],
-        frame_threads=request["release_3"].get("frame_threads"),
-        pools=request["release_3"].get("pools"),
-        convert_check=checker, input_check=input_checker,
-        reference_score=request.get("reference_score"), encode_defaults=encode_defaults,
-        progress=progress, audio_source=source_path if request["keep_audio"] else None,
-        scale=scale, clock=clock,
-        armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe",
-                                   "reference_score") if request.get(field)],
-        cap_note=(trace.setdefault("cap", {}) if trace is not None else None))
+    stats = None
+    if choice["path"] == "copy":
+        stats = _repair_copy(request, source, source_path, items, mapping, ranges, segments,
+                             master_path, interpolator, workdir, progress, clock, trace,
+                             warnings, repair_block, scale, frame_count, counted)
+    if stats is None:
+        stats = repair.run(
+            source, source_path, frame_count, mapping,
+            {item["id"]: (item["a"], item["b"]) for item in ranges}, segments, master_path,
+            interpolator,
+            # **The source's r_frame_rate AS ITS RATIONAL STRING** — §19g holds the output to it
+            # exactly, and `MasterWriter` hands it to ffmpeg's `-r` as it arrives.
+            counted["r_frame_rate"] or source["r_frame_rate"],
+            identity_tags(request, source["width"], source["height"]),
+            crf=request.get("crf"), preset=request.get("preset"), threads=request.get("threads"),
+            sliced_threads=request.get("sliced_threads"), rc_lookahead=request.get("rc_lookahead"),
+            codec=request["release_3"]["codec"], bit_depth=request["release_3"]["bit_depth"],
+            frame_threads=request["release_3"].get("frame_threads"),
+            pools=request["release_3"].get("pools"),
+            convert_check=checker, input_check=input_checker,
+            reference_score=request.get("reference_score"), encode_defaults=encode_defaults,
+            progress=progress, audio_source=source_path if request["keep_audio"] else None,
+            scale=scale, clock=clock,
+            armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe",
+                                       "reference_score") if request.get(field)],
+            cap_note=(trace.setdefault("cap", {}) if trace is not None else None),
+            source_format=choice["source_format"])
+        stats.update(frames_copied=0, frames_encoded=stats.get("n_out"))
+    # §20f: the path the master actually took, on the record's block and the response's.
+    stats.update(path=repair_block["path"], path_reason=repair_block["path_reason"])
+    if repair_block["path"] == "copy" and trace is not None:
+        # **The span encoders' provenance**: the same area table resolved their thread bound
+        # (`_repair_copy`), so §13 files who chose it exactly as it does for the full path.
+        trace["encode_defaults"] = stats.get("encode_provenance")
     # **The record's block and the response's, split the way `_retime` splits `retime`'s**: the
     # record lifts `codec` and `bit_depth` to its top level (§15c) and the three instruments out
     # beside it; the response keeps the codec, because it has no top level to lift it to. *Banked
@@ -1221,7 +1425,8 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     # run whose encode stats are still true, and they should reach its record.*
     repair_block.update({k: v for k, v in stats.items()
                          if k not in ("estimate", "convert_check", "input_check", "codec",
-                                      "bit_depth", "reference")})
+                                      "bit_depth", "reference", "recipe",
+                                      "encode_provenance")})
     _note(trace, "estimate", "time", stats.get("estimate"))
     if trace is not None:
         trace["codec"] = stats.get("codec", trace["codec"])
@@ -1231,8 +1436,10 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
 
     # **§19g: BEFORE UPLOAD, OR THE JOB FAILS AND NOTHING IS DELIVERED** — and AFTER the stats are
     # banked, because a master that fails this check is the run whose encode numbers are the
-    # diagnosis. Found in review.
-    repair.verify_master(master_path, counted)
+    # diagnosis. Found in review. *A copy has passed §20e's stricter check already, and this
+    # one too (`_repair_copy`); a copy that failed either is no longer the master.*
+    if repair_block.get("path") == "full":
+        repair.verify_master(master_path, counted)
 
     output_entry, derived, derive_failed = _deliver(request, master, master_path, source_path,
                                                     stats, trace, progress, warnings, workdir)
@@ -1244,7 +1451,7 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
                              **({"near_ranges": near_ranges} if near_ranges else {}),
                              **{k: v for k, v in stats.items()
                                 if k not in ("estimate", "convert_check", "input_check",
-                                             "reference")}),
+                                             "reference", "recipe", "encode_provenance")}),
         "source": dict(_source_block(source, frame_count, source_path),
                        padded_megapixels=interp_plan.padded_megapixels(
                            source["width"], source["height"], scale)),

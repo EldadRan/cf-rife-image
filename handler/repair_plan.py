@@ -289,6 +289,34 @@ def plan(frame_count, ranges=(), segments=()):
     return mapping, warnings, [summary[item["id"]] for item in items]
 
 
+def spans(frame_count, seams, items):
+    """§20c: the re-encoded spans, `[(start, end_exclusive, [ids])]`, sorted and merged where
+    they overlap or touch. `seams` are presentation-order frame indices a copy may start at —
+    the clean IDRs (§20i R1), which `splice.PacketMap.seams` reads; `items` carry `id`, `a`, `b`.
+
+    For each item the greatest seam at or before its first replaced frame `a+1`, and the least
+    seam after its last `b-1`, or the end of the file. **Pure**, like the rest of this module:
+    the builder's conformance test runs it against `gate_scripts/repair_cases.SPAN_CASES`.
+    """
+    keys = sorted(set(seams))
+    if not keys or keys[0] != 0:
+        raise ValueError("frame 0 must be a seam; got {}".format(keys[:3]))
+    raw = []
+    for item in items:
+        first, last = item["a"] + 1, item["b"] - 1
+        start = max(k for k in keys if k <= first)
+        end = next((k for k in keys if k > last), frame_count)
+        raw.append((start, end, item["id"]))
+    raw.sort(key=lambda row: (row[0], row[1]))
+    merged = []
+    for start, end, item_id in raw:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end), merged[-1][2] + [item_id])
+        else:
+            merged.append((start, end, [item_id]))
+    return merged
+
+
 def synthesised(mapping):
     """How many output frames need the model: every range frame and every segment blend."""
     return sum(1 for m in mapping if m[0] == RANGE or (m[0] == SEG and m[5] != 0))
