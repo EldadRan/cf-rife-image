@@ -16,6 +16,7 @@ import threading
 
 import requests
 
+import envelope
 from errors import OUTPUT_WRITE_FAILED, SOURCE_FETCH_FAILED, Remedy, WorkerError
 
 CONNECT_TIMEOUT_S = 10
@@ -37,18 +38,8 @@ R2_REGION = "auto"
 # should set this number rather than the inherited default.
 MULTIPART_THRESHOLD_BYTES = int(os.environ.get("MULTIPART_THRESHOLD_BYTES", 100 * 1024 * 1024))
 
-#: **§24: PARTS GO UP IN PARALLEL.** *`max_concurrency=1` was a trade for memory headroom that is
-#: not at risk: N parts in flight hold ~N x P of buffers — 8 x 32 MiB is 256 MiB against 46-116 GB
-#: hosts whose peaks since §22 are 11-24 GB.* **N bounds the parts HELD IN MEMORY too**
-#: (`max_in_memory_upload_chunks`, which s3transfer otherwise caps at 10 whatever N is — so an arm
-#: of 16 or 32 ran 10 and filed its own number; found in review), plus the one being read. **PROVISIONAL**: Suite 16's sweep sets the ruled
-#: default (the fastest arm whose added host memory stays under 1 GB). The request's debug fields
-#: `upload_concurrency` / `upload_part_mb` move it for the sweep and nothing else. *A part is MiB —
-#: the unit the fixed 32 MiB part it replaces was written in — and is recorded in bytes.*
-UPLOAD_CONCURRENCY_DEFAULT = 8
-UPLOAD_PART_MB_DEFAULT = 32
-UPLOAD_CONCURRENCY_MIN, UPLOAD_CONCURRENCY_MAX = 1, 32
-UPLOAD_PART_MB_MIN, UPLOAD_PART_MB_MAX = 8, 256
+#: **§24's part settings live in `envelope`** (the request surface, importable with no third-party
+#: package, which `validation` and the kit rely on); `upload_settings` below resolves them.
 
 # Errors R2 returns for a credential that has expired or was never valid for this prefix.
 CREDENTIAL_ERROR_CODES = {
@@ -161,9 +152,9 @@ def upload_settings(request=None):
     concurrency = request.get("upload_concurrency")
     part_mb = request.get("upload_part_mb")
     return {"concurrency": int(concurrency if concurrency is not None
-                               else UPLOAD_CONCURRENCY_DEFAULT),
+                               else envelope.UPLOAD_CONCURRENCY_DEFAULT),
             "part_bytes": int(part_mb if part_mb is not None
-                              else UPLOAD_PART_MB_DEFAULT) * 1024 * 1024}
+                              else envelope.UPLOAD_PART_MB_DEFAULT) * 1024 * 1024}
 
 
 class _Relay:
@@ -215,21 +206,52 @@ class _Relay:
         self(0)
 
 
-class _AbortWatch:
-    """s3transfer's failure cleanup — `AbortMultipartUpload` — swallows its own failure (it logs at
-    DEBUG and goes on). **Registered on the client's `after-call` events for one upload**, this
-    sees the abort's own answer, so a failed abort reaches the job's error instead of leaving
-    parts under the caller's prefix with no trace (found in review). Never raises."""
+class _CallWatch:
+    """What one upload's S3 calls said, heard on the client's own events. Never raises.
 
-    EVENTS = ("after-call.s3.AbortMultipartUpload", "after-call-error.s3.AbortMultipartUpload")
+    - **A failed abort.** s3transfer's failure cleanup — `AbortMultipartUpload` — swallows its
+      own failure (it logs at DEBUG and goes on); this sees the abort's answer, so a failed abort
+      reaches the job's error instead of leaving parts under the caller's prefix with no trace
+      (found in review).
+    - **The parts the object is made of** (§24, the gate's ruling on the builder's F2): the part
+      list `CompleteMultipartUpload` sends, kept once that call succeeds, or 1 for a single
+      `PutObject` — **counted, not computed**: s3transfer can resize the parts it was asked for.
+    """
 
     def __init__(self, client):
         self.failures = []
+        self.parts = None
+        self._listed = None
         self._events = getattr(getattr(client, "meta", None), "events", None)
-        self._id = "cf-rife-abort-watch-{}".format(id(self))
+        self._id = "cf-rife-call-watch-{}".format(id(self))
+        self._hooks = (("after-call.s3.AbortMultipartUpload", self._heard),
+                       ("after-call-error.s3.AbortMultipartUpload", self._heard),
+                       ("provide-client-params.s3.CompleteMultipartUpload", self._listing),
+                       ("after-call.s3.CompleteMultipartUpload", self._completed),
+                       ("after-call.s3.PutObject", self._put))
         if self._events is not None:
-            for event in self.EVENTS:
-                self._events.register(event, self._heard, unique_id=self._id + event)
+            for event, hook in self._hooks:
+                self._events.register(event, hook, unique_id=self._id + event)
+
+    def _listing(self, params=None, **_kwargs):
+        try:
+            self._listed = len(((params or {}).get("MultipartUpload") or {}).get("Parts") or ())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _completed(self, http_response=None, **_kwargs):
+        try:
+            if http_response is not None and http_response.status_code < 300:
+                self.parts = self._listed
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _put(self, http_response=None, **_kwargs):
+        try:
+            if http_response is not None and http_response.status_code < 300:
+                self.parts = 1
+        except Exception:  # noqa: BLE001
+            pass
 
     def _heard(self, http_response=None, parsed=None, exception=None, **_kwargs):
         try:
@@ -248,7 +270,7 @@ class _AbortWatch:
 
     def close(self):
         if self._events is not None:
-            for event in self.EVENTS:
+            for event, _hook in self._hooks:
                 try:
                     self._events.unregister(event, unique_id=self._id + event)
                 except Exception:  # noqa: BLE001
@@ -262,7 +284,7 @@ class _AbortWatch:
                 "under the prefix".format("; ".join(self.failures)))
 
 
-def upload(client, output, name, path, content_type, on_bytes=None, settings=None):
+def upload(client, output, name, path, content_type, on_bytes=None, settings=None, stats=None):
     """Write one file under the prefix. The key is deterministic, so a re-run overwrites.
 
     **`on_bytes(done, expected)` reports absolute bytes**, not boto3's per-part delta — the
@@ -275,8 +297,11 @@ def upload(client, output, name, path, content_type, on_bytes=None, settings=Non
     `AbortMultipartUpload` as the failure cleanup the moment the upload is created
     (`s3transfer/tasks.py`, `CreateMultipartUploadTask`), so no parts are left under the caller's
     prefix — **unless the abort fails too** (an expired credential refuses it as it refused the
-    part), and then the error SAYS so (`_AbortWatch`). Witnessed by the builder's
+    part), and then the error SAYS so (`_CallWatch`). Witnessed by the builder's
     `tests/test_upload_wave.py`, both ways.
+
+    **`stats`, a dict or None, receives `parts`**: how many parts the object was made of — 1 for
+    a single PUT — as the calls said, not as the settings predicted.
     """
     import botocore.exceptions
     from boto3.s3.transfer import TransferConfig
@@ -302,7 +327,7 @@ def upload(client, output, name, path, content_type, on_bytes=None, settings=Non
     # default: without this, N above 10 ran 10.
     config.max_in_memory_upload_chunks = settings["concurrency"]
 
-    watch = _AbortWatch(client)
+    watch = _CallWatch(client)
     try:
         # upload_fileobj switches to multipart above the threshold and stays a single PUT below
         # it, so a poster keeps exactly the behaviour a single PUT would have given it.
@@ -316,6 +341,8 @@ def upload(client, output, name, path, content_type, on_bytes=None, settings=Non
                 Config=config,
             )
         relay.flush()
+        if stats is not None:
+            stats["parts"] = watch.parts
     except botocore.exceptions.ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in CREDENTIAL_ERROR_CODES:

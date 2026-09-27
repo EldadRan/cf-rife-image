@@ -1796,6 +1796,7 @@ def _deliver_with(request, master, master_path, source_path, stats, trace, progr
     # **§24: one resolution for every upload of the job**, filed before the first byte moves so
     # a failed upload's record still says what it ran at.
     upload_settings = storage.upload_settings(request)
+    upload_stats = {}
     _note(trace, "transfer", "upload_concurrency", upload_settings["concurrency"])
     _note(trace, "transfer", "upload_part_bytes", upload_settings["part_bytes"])
     upload_started = time.time()
@@ -1805,7 +1806,7 @@ def _deliver_with(request, master, master_path, source_path, stats, trace, progr
                                     on_bytes=_byte_reporter(
                                         progress, "uploading",
                                         bytes_per_s=ladder.UPLOAD_BYTES_PER_S),
-                                    settings=upload_settings)
+                                    settings=upload_settings, stats=upload_stats)
     except BaseException:
         if derive_run is not None:
             derive_run.discard(trace)
@@ -1814,6 +1815,9 @@ def _deliver_with(request, master, master_path, source_path, stats, trace, progr
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
     upload_ended = time.time()
     _note(trace, "transfer", "upload_bytes", upload_bytes)
+    # §24 (the builder's F2, upheld): the parts the MASTER went up in, 1 for a single PUT — so a
+    # small master's row does not read as "N parts bought nothing" when N never applied.
+    _note(trace, "transfer", "upload_parts", upload_stats.get("parts"))
 
     # **THE KEY IS BANKED THE INSTANT THE OBJECT EXISTS, AND EVERYTHING ELSE FILLS IN LATER.**
     # `master_key` lived in exactly two places — the assignment above and `output_entry`, which
@@ -2026,7 +2030,8 @@ def _transfer(trace):
             "upload_bytes": int(measured.get("upload_bytes") or 0),
             # §24: what the uploads ran at; null on a run that never reached one.
             "upload_concurrency": measured.get("upload_concurrency"),
-            "upload_part_bytes": measured.get("upload_part_bytes")}
+            "upload_part_bytes": measured.get("upload_part_bytes"),
+            "upload_parts": measured.get("upload_parts")}
 
 
 def _add(trace, block, field, value):

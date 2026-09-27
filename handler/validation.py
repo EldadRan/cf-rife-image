@@ -33,7 +33,6 @@ re-derives leniency from the comments that argue for it.*
 import encoder
 import envelope
 import repair_plan
-import storage
 from errors import (
     FIELD_NOT_SUPPORTED,
     INVALID_FIELD_VALUE,
@@ -668,10 +667,10 @@ def validate(job_input):
 
     # ── §24: the upload's parts, range-checked here and resolved in `storage` ─────────────────
     upload_fields = {}
-    for name, low, high in (("upload_concurrency", storage.UPLOAD_CONCURRENCY_MIN,
-                             storage.UPLOAD_CONCURRENCY_MAX),
-                            ("upload_part_mb", storage.UPLOAD_PART_MB_MIN,
-                             storage.UPLOAD_PART_MB_MAX)):
+    for name, low, high in (("upload_concurrency", envelope.UPLOAD_CONCURRENCY_MIN,
+                             envelope.UPLOAD_CONCURRENCY_MAX),
+                            ("upload_part_mb", envelope.UPLOAD_PART_MB_MIN,
+                             envelope.UPLOAD_PART_MB_MAX)):
         value = params.get(name)
         if value is not None:
             value = _as_int(value, name)
@@ -681,8 +680,8 @@ def validate(job_input):
                     "field '{}' must be within {}-{}, got {}. It is Suite 16's upload sweep "
                     "(decisions.md §24); send nothing for this worker's default of {}.".format(
                         name, low, high, value,
-                        storage.UPLOAD_CONCURRENCY_DEFAULT if name == "upload_concurrency"
-                        else storage.UPLOAD_PART_MB_DEFAULT))
+                        envelope.UPLOAD_CONCURRENCY_DEFAULT if name == "upload_concurrency"
+                        else envelope.UPLOAD_PART_MB_DEFAULT))
         upload_fields[name] = value
 
     rc_lookahead = params.get("rc_lookahead")
