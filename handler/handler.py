@@ -25,6 +25,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 
@@ -879,21 +880,118 @@ def _source_block(source, frames, source_path):
             "container": source.get("container")}
 
 
-def _make_derives(request, master, master_path, client, trace, progress, warnings, workdir):
-    """§19e: every role asked for, made from the DELIVERED MASTER and uploaded beside it.
+class _DeriveRun:
+    """§21: the derives, made on a thread WHILE the master uploads.
 
-    **A FAILED DERIVE DOES NOT COST THE MASTER.** *The master is already uploaded when this runs;
-    a role that fails is dropped from `derived[]`, filed as `{role, reason}` in `derive_failed[]`
-    and said as a sentence in `warnings[]`, and the job is still `DELIVERED`* — §0 decides it: the
-    master is the expensive, irreplaceable object and a derive can be re-made from it.
-
-    **The making is `derive_s`, a stage inside `compute_s`; the uploads are `upload_s`** and
-    `upload_bytes`, like every other byte this worker pushes out — so both of `wall_s`'s identities
-    still close. Returns `(delivered, failed)`, each in the order asked.
+    Started just before the master's upload and joined just after it; their uploads follow the
+    master's (`_finish_derives`). **A master upload that fails cancels them and discards what they
+    made** (`discard`), and the job fails as it always has. *The thread only makes files: it
+    touches no `trace`, no `progress` and no clock, so nothing it does can race the main thread's
+    bookkeeping.* Made files live in the job's `workdir`, as before.
     """
-    import derives  # noqa: PLC0415 — stdlib-only; imported where it is used, like its neighbours
 
-    clock = (trace or {}).get("clock")
+    def __init__(self, request, master_path, workdir):
+        self.request = request
+        self.master_path = master_path
+        self.workdir = workdir
+        self.results = []
+        self.read_error = None
+        self.started = None
+        self.ended = None
+        #: True when the thread could not start and the derives run inline after the upload.
+        self.deferred = False
+        self._thread = threading.Thread(target=self._run, name="derives", daemon=True)
+
+    def start(self):
+        self.started = time.time()
+        self._thread.start()
+
+    def _run(self):
+        import derives  # noqa: PLC0415 — stdlib and ffmpeg only; imported where it is used
+
+        try:
+            # **The master's own reading, once, for every role** — its counted packets for the
+            # poster's index and the sheet's layout, its probe for the proxy's size, rate and
+            # audio. *Never the source's: a derive describes what was delivered* (§19e).
+            # **The whole body is guarded, not only the reads**: anything escaping a thread
+            # would end it with no result and no error, and `_finish_derives` would file roles
+            # that were asked for as neither delivered nor failed. Found in review.
+            written = probe.counted_frames(self.master_path, errors.INTERNAL,
+                                           "counting the master's packets for its derives")
+            described = probe.probe_output(self.master_path)
+            reading = {"frames": written["frames"], "fps": described.get("fps"),
+                       "has_audio": described.get("has_audio"),
+                       "width": described.get("width"), "height": described.get("height")}
+            self.results = derives.make_all(self.request["derive"], self.master_path, reading,
+                                            self.workdir, name=self.request["output"].get("name"))
+        except Exception as exc:  # noqa: BLE001 — filed per role by `_finish_derives`
+            self.read_error = exc
+        finally:
+            self.ended = time.time()
+
+    def join(self, progress=None):
+        try:
+            keeper = (progress.keeping_the_promise() if progress is not None
+                      and hasattr(progress, "keeping_the_promise") else _no_clock())
+        except Exception:  # noqa: BLE001 — liveness is never worth a derive
+            keeper = _no_clock()
+        with keeper:
+            if self.deferred:
+                self.started = time.time()
+                self._run()
+            else:
+                self._thread.join()
+
+    def finished(self):
+        """Whether nothing of this run can still be running: joined, deferred or never started."""
+        return self.deferred or not self._thread.is_alive()
+
+    def discard(self, trace=None):
+        """The master did not upload, or `_deliver` is leaving early: stop, wait, delete what was
+        made — finished or partial — and clock what it cost. Never raises.
+
+        **Every role's own output path is removed, not only those the thread reported**: a role
+        whose ffmpeg was killed by the cancel reports no path and may have left half a file.
+        **The time is clocked** (`derive_s`, and all of it after the discard began as exposed —
+        nothing was hidden behind an upload that failed), so it does not land unnamed in the
+        residual. Found in review. *The ffprobe calls in a role are not killed by `cancel`, only
+        refused afterwards; the join waits out at most the one in flight, which its own timeout
+        bounds.*
+        """
+        import derives  # noqa: PLC0415
+
+        began = time.time()
+        try:
+            derives.cancel()
+            if self._thread.is_alive():
+                self._thread.join()
+            name = self.request["output"].get("name")
+            for entry in self.request.get("derive") or ():
+                key = keys.for_role(entry["role"], name)
+                for path in (os.path.join(self.workdir, key),
+                             os.path.join(self.workdir, key) + ".faststart.mp4"):
+                    if os.path.exists(path):
+                        os.remove(path)
+        except Exception as exc:  # noqa: BLE001 — the master's own failure is the one to report
+            print("[derive] discarding after a failed master upload: {}: {}".format(
+                type(exc).__name__, exc), flush=True)
+        clock = (trace or {}).get("clock")
+        if clock is not None and self.started is not None:
+            try:
+                ended = self.ended or time.time()
+                clock.add("derive_s", ended - self.started)
+                clock.derive_exposed_s = (clock.derive_exposed_s or 0.0) + max(
+                    0.0, ended - max(self.started, began))
+            except Exception:  # noqa: BLE001 — a measurement must never displace the failure
+                pass
+
+
+def _start_derives(request, master_path, workdir, trace):
+    """Arm the deadline and start the derive thread, or None when no derive was asked for."""
+    if not request.get("derive"):
+        return None
+    import derives  # noqa: PLC0415
+
     # **Bounded by the platform's wall, which is fixed** (`decisions.md` §17: 3,600 s, and
     # `execution_timeout_ms` is read by nothing). *A derive still running when the container is
     # reaped costs the response and the record of a job whose master is already delivered*, so
@@ -901,8 +999,32 @@ def _make_derives(request, master, master_path, client, trace, progress, warning
     started = (trace or {}).get("started")
     derives.begin(None if started is None
                   else started + PLATFORM_WALL_S - DERIVE_WALL_MARGIN_S)
-    # **Banked before the first role, and filled in place** — a run that dies mid-derive still
-    # files what it delivered, which is the `trace` rule every other block here follows.
+    run = _DeriveRun(request, master_path, workdir)
+    try:
+        run.start()
+    except Exception as exc:  # noqa: BLE001 — NOTHING HERE MAY COST THE MASTER
+        # **No thread (a thread limit, say): the derives run after the upload, as before §21.**
+        # Found in review.
+        print("[derive] could not start beside the upload ({}: {}); making them after it".format(
+            type(exc).__name__, exc), flush=True)
+        run.started = None
+        run.deferred = True
+    return run
+
+
+def _finish_derives(run, upload_ended, request, client, trace, progress, warnings):
+    """§19e and §21: wait for the derives, file their time, then upload each after the master.
+
+    **A FAILED DERIVE DOES NOT COST THE MASTER.** *The master is already uploaded when this runs;
+    a role that fails is dropped from `derived[]`, filed as `{role, reason}` in `derive_failed[]`
+    and said as a sentence in `warnings[]`, and the job is still `DELIVERED`* — §0 decides it.
+
+    **§21's two numbers:** `derive_s` is the derives' own wall, first start to last end, and
+    `derive_exposed_s` the part of it after the master's upload ended — the part NOT hidden
+    behind it, which is what `compute_s`' identity takes. *The uploads are `upload_s` and
+    `upload_bytes`, like every other byte this worker pushes out.* Returns `(delivered, failed)`,
+    each in the order asked.
+    """
     delivered = []
     failed = []
     if trace is not None:
@@ -914,53 +1036,23 @@ def _make_derives(request, master, master_path, client, trace, progress, warning
     except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
         print("[progress] deriving phase not emitted ({}: {})".format(
             type(exc).__name__, exc), flush=True)
-    # **The master's own reading, once, for every role** — its counted packets for the poster's
-    # index and the sheet's layout, and its probe for the proxy's rate and audio. *Never the
-    # source's: a derive describes what was delivered* (§19e). Inside `derive_s`, because it is
-    # derive work and the residual is for what nothing clocks.
-    try:
-        with (clock.timing("derive_s") if clock is not None else _no_clock()):
-            written = probe.counted_frames(master_path, errors.INTERNAL,
-                                           "counting the master's packets for its derives")
-            described = probe.probe_output(master_path)
-        reading = {"frames": written["frames"], "fps": described.get("fps"),
-                   "has_audio": described.get("has_audio")}
-    except Exception as exc:  # noqa: BLE001 — a derive must never cost a delivered master
+    run.join(progress)
+    clock = (trace or {}).get("clock")
+    if clock is not None and run.started is not None and run.ended is not None:
+        clock.add("derive_s", run.ended - run.started)
+        clock.derive_exposed_s = (clock.derive_exposed_s or 0.0) + max(
+            0.0, run.ended - max(run.started, upload_ended))
+    if run.read_error is not None:
         for entry in request["derive"]:
             _derive_failure(warnings, failed, entry["role"],
-                            "the delivered master could not be read ({}: {})".format(
-                                type(exc).__name__, str(exc)[:300]))
+                            "the derives could not be made ({}: {})".format(
+                                type(run.read_error).__name__, str(run.read_error)[:300]))
         return delivered, failed
-    name = request["output"].get("name")
-    # **Liveness while the roles run**, as the decode probe below has: without it a client polls a
-    # payload whose `at` froze when the phase began. Entered here rather than around the whole
-    # function because the reading above is quick and cannot hang.
-    with (progress.keeping_the_promise() if hasattr(progress, "keeping_the_promise")
-          else _no_clock()):
-        _derive_roles(request, master_path, reading, workdir, name, client, clock, trace,
-                      warnings, delivered, failed, derives)
-    return delivered, failed
-
-
-def _derive_failure(warnings, failed, role, reason):
-    """§19f: the failure in its own block for a program, and as a sentence for a person.
-    **`warnings[]` stays a list of strings** (CF, 2026-09-26) — nothing is parsed out of it."""
-    failed.append({"role": role, "reason": reason})
-    warnings.append("derive_failed: the {} was not delivered — {}. The master is delivered and "
-                    "the {} can be re-made from it.".format(role, reason, role))
-
-
-def _derive_roles(request, master_path, reading, workdir, name, client, clock, trace, warnings,
-                  delivered, failed, derives):
-    """`_make_derives`' loop: make, upload and report each role; contain each failure."""
-    for entry in request["derive"]:
+    for entry, path, made, error in run.results:
         role = entry["role"]
         try:
-            if clock is not None:
-                with clock.timing("derive_s"):
-                    path, made = derives.make(entry, master_path, reading, workdir, name=name)
-            else:
-                path, made = derives.make(entry, master_path, reading, workdir, name=name)
+            if error is not None:
+                raise error
             upload_started = time.time()
             try:
                 made["key"] = storage.upload(client, request["output"], made["key"], path,
@@ -973,6 +1065,21 @@ def _derive_roles(request, master_path, reading, workdir, name, client, clock, t
             print("[derive] {} failed ({}: {})".format(role, type(exc).__name__, exc), flush=True)
             _derive_failure(warnings, failed, role,
                             "{}: {}".format(type(exc).__name__, str(exc)[:300]))
+    # **Every role asked for is accounted for, one way or the other.** A role the thread never
+    # reported is filed as failed rather than left out of both lists. Found in review.
+    reported = {entry["role"] for entry, _p, _m, _e in run.results}
+    for entry in request["derive"]:
+        if entry["role"] not in reported:
+            _derive_failure(warnings, failed, entry["role"], "the derive thread made no result")
+    return delivered, failed
+
+
+def _derive_failure(warnings, failed, role, reason):
+    """§19f: the failure in its own block for a program, and as a sentence for a person.
+    **`warnings[]` stays a list of strings** (CF, 2026-09-26) — nothing is parsed out of it."""
+    failed.append({"role": role, "reason": reason})
+    warnings.append("derive_failed: the {} was not delivered — {}. The master is delivered and "
+                    "the {} can be re-made from it.".format(role, reason, role))
 
 
 @contextlib.contextmanager
@@ -1519,6 +1626,33 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
     except Exception as exc:  # noqa: BLE001 — never at the cost of a delivery
         print("[progress] uploading phase not emitted ({}: {})".format(
             type(exc).__name__, exc), flush=True)
+    # **§21: the derives start NOW and run while the master uploads**; their uploads follow it.
+    # *A master upload that fails cancels them and discards what they made, and the job fails
+    # as it always has* — a derive of a master nobody received is not a deliverable.
+    start_error = None
+    try:
+        derive_run = _start_derives(request, master_path, workdir, trace)
+    except Exception as exc:  # noqa: BLE001 — NOTHING HERE MAY COST THE MASTER (review, F3)
+        # **Filed only once the master HAS uploaded** (`_deliver_with`): the sentence says the
+        # master is delivered, and before the upload that is not yet true. Found in review.
+        print("[derive] not started ({}: {}); the roles will be filed as failed".format(
+            type(exc).__name__, exc), flush=True)
+        derive_run = None
+        start_error = exc if request.get("derive") else None
+    try:
+        return _deliver_with(request, master, master_path, source_path, stats, trace, progress,
+                             warnings, client, upload_bytes, derive_run, start_error)
+    finally:
+        # **The derive thread never outlives `_deliver`** — whatever raises between the upload
+        # and the join. *`handle`'s `finally` removes the workdir the thread writes into, and a
+        # thread left running would carry into the next job's deadline.* Found in review.
+        if derive_run is not None and not derive_run.finished():
+            derive_run.discard(trace)
+
+
+def _deliver_with(request, master, master_path, source_path, stats, trace, progress, warnings,
+                  client, upload_bytes, derive_run, start_error=None):
+    """`_deliver` from the master's upload on, with the derive thread already running."""
     upload_started = time.time()
     try:
         master_key = storage.upload(client, request["output"], master, master_path,
@@ -1526,8 +1660,13 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
                                     on_bytes=_byte_reporter(
                                         progress, "uploading",
                                         bytes_per_s=ladder.UPLOAD_BYTES_PER_S))
+    except BaseException:
+        if derive_run is not None:
+            derive_run.discard(trace)
+        raise
     finally:
         _note(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
+    upload_ended = time.time()
     _note(trace, "transfer", "upload_bytes", upload_bytes)
 
     # **THE KEY IS BANKED THE INSTANT THE OBJECT EXISTS, AND EVERYTHING ELSE FILLS IN LATER.**
@@ -1605,9 +1744,17 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
     # instrument, or die with it.*
     derived = None
     derive_failed = None
-    if request.get("derive"):
-        derived, derive_failed = _make_derives(request, master, master_path, client, trace,
-                                               progress, warnings, workdir)
+    if start_error is not None:
+        derived, derive_failed = [], []
+        for entry in request["derive"]:
+            _derive_failure(warnings, derive_failed, entry["role"],
+                            "the derives could not be started ({}: {})".format(
+                                type(start_error).__name__, str(start_error)[:300]))
+        if trace is not None:
+            trace["derived"], trace["derive_failed"] = derived, derive_failed
+    if derive_run is not None:
+        derived, derive_failed = _finish_derives(derive_run, upload_ended, request, client,
+                                                 trace, progress, warnings)
 
     # **`docs/archive/instrumentation-archive.md` §11, and it runs AFTER THE UPLOAD — which is a correction.**
     # It sat between the finished master and its upload, where three full re-decodes at a

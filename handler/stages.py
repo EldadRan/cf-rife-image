@@ -67,6 +67,13 @@ RESIDUAL = "stage_residual_s"
 #: keying in the kit to avoid retroactively un-certifying them.*
 DRAIN = "drain_s"
 
+#: **§21: the part of `derive_s` NOT hidden behind the master's upload.** *The derives run while
+#: the master uploads; their hidden seconds are already inside `upload_s`, which `compute_s`
+#: excludes, so the identity takes this term in `derive_s`'s place.* **None on a run that made no
+#: derive**, and then the identity closes on `derive_s` as before (`record_witness` reads it the
+#: same way, `gate_scripts/record_witness.py` `check_stage_split`).
+DERIVE_EXPOSED = "derive_exposed_s"
+
 
 class StageClock:
     """Per-retime accumulator for §9a's stages as amended by §10a. **Never raises.**
@@ -82,6 +89,8 @@ class StageClock:
         #: `MasterWriter.drain_s` by whoever ran the encode; `None` until then, and `totals`
         #: reports it as such rather than as a measured zero.
         self.drain_s = None
+        #: §21. Set by whoever ran the derives beside the upload; None until then.
+        self.derive_exposed_s = None
         #: Names banked against that are not in `STAGES`. **Kept so a typo is visible rather than
         #: absorbed** — see `_bank`.
         self._unknown = {}
@@ -159,6 +168,13 @@ class StageClock:
                 self.drain_s), flush=True)
             drain = None
         out[DRAIN] = drain
+        exposed = None
+        try:
+            if self.derive_exposed_s is not None:
+                exposed = round(float(self.derive_exposed_s), 3)
+                out[DERIVE_EXPOSED] = exposed
+        except Exception:  # noqa: BLE001 — this function must never raise
+            exposed = None
         if compute_s is not None:
             try:
                 # **The remainder is taken from the ROUNDED stages, not the raw ones.**
@@ -174,8 +190,13 @@ class StageClock:
                 # drain landed here unnamed — 8K h264 7.231 s against 8K h265 38.029 s, a 5x
                 # move in a bucket nobody reads, on the wave that introduced it. *A null drain
                 # contributes zero, so a run with no writer reports exactly what it used to.*
+                # **§21: with the derives overlapping the upload, the identity takes their
+                # EXPOSED part and not their wall** — `derive_s` stays reported and leaves the
+                # sum. Absent, everything closes as before.
+                counted = sum(out[n] for n in STAGES
+                              if not (exposed is not None and n == "derive_s"))
                 out[RESIDUAL] = round(
-                    float(compute_s) - sum(out[n] for n in STAGES) - (drain or 0.0), 3)
+                    float(compute_s) - counted - (drain or 0.0) - (exposed or 0.0), 3)
             except Exception:  # noqa: BLE001
                 pass
         return out

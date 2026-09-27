@@ -43,7 +43,10 @@ with no `params.output` keeps the source's format. The splice is `handler/splice
 
 **Either operation may ask for `derive`** — a WebP poster, a 1280-px h264 proxy and a spritesheet,
 each made from the delivered master and uploaded beside it. A derive that fails is reported in
-the run record's `warnings[]` and does not cost the master.
+the run record's `warnings[]` and does not cost the master. The derives are made while the master
+uploads — the proxy and the spritesheet from one decode, the poster by seeking to its exact frame,
+at the worker's own thread bound — and upload after it; `timings.derive_exposed_s` is the part of
+their time the master's upload did not hide.
 
 ## Building
 
