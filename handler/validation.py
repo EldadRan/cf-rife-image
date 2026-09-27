@@ -611,12 +611,14 @@ def validate(job_input):
                 "a large host means up to {} frame-threads and is the setting this worker exists "
                 "to bound — so auto is not reachable through this field. Send nothing and this "
                 "field is not a constant: it is chosen by the DELIVERED frame size against a "
-                "boundary of {} pixels, and the two rows say {} and {} respectively.".format(
+                "boundary of {} pixels, and the two rows say {} and {} respectively ({} above "
+                "it on a frame_repair, §22b).".format(
                     encoder.THREADS_MIN, encoder.THREADS_MAX, threads,
                     encoder.THREADS_MAX,
                     encoder.AREA_BOUNDARY_DELIVERED_PIXELS,
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_SMALL]["threads"],
-                    encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["threads"]),
+                    encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["threads"],
+                    encoder.REPAIR_AREA_DEFAULTS[encoder.REPAIR_AREA_ROW_LARGE]["threads"]),
             )
 
     sliced_threads = params.get("sliced_threads")

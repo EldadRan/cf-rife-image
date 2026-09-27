@@ -610,6 +610,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # **The request field is read BEFORE the module is imported**, which is §2g-1's third
     # constraint and the only part of it that survived: a job nobody asked pays not one module
     # read. `request.get` is a dict lookup; the sweep behind it is a billion comparisons.
+    _seed_early(request, progress, trace, planned_frames, source["width"], source["height"])
     if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — see above; the import IS the cost being avoided
 
@@ -861,6 +862,47 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     if derive_failed:
         response["derive_failed"] = derive_failed
     return _decorate(response, machine, [], warnings, progress, started)
+
+
+def _seed_early(request, progress, trace, frames, width, height):
+    """§23: an ETA from the moment the plan exists, not from the first frame's seed.
+
+    **The caller sees the job through `next_poll_s`, and the payloads before the encode — the
+    tie check, the model load, `interpolate` at 10% — published NO ETA**, so §23's ceiling had
+    nothing to act on and they asked for 90: a 33-second repair was seen at 96 s (Suite 14
+    T2c). *The seed is the ruled table's, exactly what `routec._seed_estimate` sets again later
+    with the estimator's band beside it*; the derives' exposed part is priced here too
+    (`_price_derives`). **Never raises**: without it the job behaves as before.
+    """
+    try:
+        progress.plan_frames(frames)
+        crf = request.get("crf") if request.get("crf") is not None else encoder.DEFAULT_CRF
+        seed, step = ladder.seconds_per_frame(int(width) * int(height), frames,
+                                              codec=request["release_3"]["codec"])
+        if seed is not None and seed > 0:
+            progress.expect(seed, basis=ladder.basis_for(crf), ladder=step)
+    except Exception as exc:  # noqa: BLE001 — an ETA must never cost a delivery
+        print("[eta] not seeded before the load ({}: {})".format(type(exc).__name__, exc),
+              flush=True)
+    _price_derives(request, progress, trace, frames, width, height)
+
+
+def _price_derives(request, progress, trace, frames, width, height):
+    """§23: the derives the request asked for, priced into every ETA the job publishes — their
+    predicted wall less the master upload's, which hides the rest since §21
+    (`ladder.derive_expected`). Filed as `estimate.derives` so a record can grade the pricing
+    against `derive_s` and `derive_exposed_s`. **Never raises**: a price is never worth a job."""
+    if not request.get("derive"):
+        return
+    try:
+        priced = ladder.derive_expected(frames, width, height)
+        progress.expect_derives(priced["added_s"])
+        _note(trace, "estimate", "derives", priced)
+        print("[eta] derives {} s expected against a {} s master upload: {} s added to the "
+              "ETA".format(priced["derive_expected_s"], priced["upload_expected_s"],
+                           priced["added_s"]), flush=True)
+    except Exception as exc:  # noqa: BLE001 — an ETA term must never cost a delivery
+        print("[eta] derives not priced ({}: {})".format(type(exc).__name__, exc), flush=True)
 
 
 def _source_block(source, frames, source_path):
@@ -1242,7 +1284,9 @@ def _repair_copy(request, source, source_path, items, mapping, ranges, segments,
         settings, provenance = encoder.resolve_defaults(
             delivered_pixels, codec="h264", threads=request.get("threads"),
             sliced_threads=request.get("sliced_threads"),
-            rc_lookahead=request.get("rc_lookahead"))
+            rc_lookahead=request.get("rc_lookahead"),
+            # §22b: the repair row — 32 not sliced above the boundary, from Suite 14's sweep.
+            operation="frame_repair")
         threading = encoder.x264_params(settings["threads"], settings["sliced_threads"],
                                         settings["rc_lookahead"])
         estimate = None
@@ -1557,6 +1601,7 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     if choice["warning"]:
         warnings.append(choice["warning"])
 
+    _seed_early(request, progress, trace, frame_count, source["width"], source["height"])
     if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — the import IS the cost being avoided, as in _retime
 

@@ -122,6 +122,13 @@ encode are one streaming loop — the writer pulls each frame through the whole 
 repair that copies counts a copied run as done the moment it is cut, and each re-encoded frame as
 it reaches its span's encoder.
 
+The ETA exists from the moment the frame plan does, before the model loads, and it includes the
+part of any requested derives that the master's upload does not hide. `next_poll_s` never asks for
+longer than that ETA, and never less than 5 seconds. A repair's h264 encode above 4K (the 8K row)
+runs 32 x264 threads, not sliced, as Suite 14's sweep measured; every other row is unchanged, and
+the request's debug fields still override. The rates live in `handler/ladder.py`
+(`derive_expected`) and `handler/encoder.py` (`REPAIR_AREA_DEFAULTS`).
+
 ## Tests
 
 **The contract suite is not in this repository, and that is deliberate rather than missing.** It

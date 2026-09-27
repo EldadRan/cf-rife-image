@@ -290,7 +290,7 @@ def _encode_setup(delivered_pixels, width, height, frame_count, codec, crf, pres
 
     encode_settings, provenance = encoder.resolve_defaults(
         delivered_pixels, codec=codec, threads=threads, sliced_threads=sliced_threads,
-        rc_lookahead=rc_lookahead)
+        rc_lookahead=rc_lookahead, operation="frame_repair")
     if encode_defaults is not None:
         encode_defaults.update(provenance)
     print("[encode] defaults {} at {} delivered pixels ({}x{}, boundary {}): {}".format(
@@ -1093,6 +1093,17 @@ def run_native(source, pmap, frame_count, mapping, anchors, items, segments, mas
                             feeder.join()
                     if write_box["error"] is not None:
                         raise write_box["error"]
+                    # **The count the encoder actually took, reported once it is final.** `put`
+                    # reports `frames_written`, which the writer thread advances after the
+                    # queue — so the last report fell a queue's depth short (235 of 240), and
+                    # the draining and uploading payloads published a stale `eta_s` off it
+                    # (§23's review; the ceiling made it visible).
+                    if progress is not None:
+                        try:
+                            progress.frames(writer_cm.frames_written, phase="interpolate")
+                        except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                            print("[progress] final frame emit failed ({}: {})".format(
+                                type(exc).__name__, exc), flush=True)
                 finally:
                     # **Every exit stops both threads before the writer closes**: the decoder is
                     # killed so the reader's read returns, the encoder so the feeder's write

@@ -120,6 +120,25 @@ AREA_DEFAULTS = {
     AREA_ROW_LARGE: {"threads": 16, "sliced_threads": True, "rc_lookahead": 10},
 }
 
+#: **§22b: A REPAIR's h264 ENCODE HAS ITS OWN ROW ABOVE THE BOUNDARY, MEASURED** (Suite 14's sweep,
+#: W-2026-09-27d: A40, 96 cores, 8K full path, no derives). *§11's rows were ruled for retime, whose
+#: encoder waits on RIFE; on a repair the encoder is the job.*
+#:
+#:     16 sliced       compute 689 s   host memory peak 12.9 GB
+#:     32 not sliced   compute 221 s                    23.6 GB  (51% of 46.57)   <- this row
+#:     64 not sliced   compute 218 s                    32.8 GB  (70%, over §22b's 60%)
+#:
+#: **Only the large row is swept**, so the small row — 4K and 1080p — is §11's, unchanged. Read by
+#: `resolve_defaults(..., operation="frame_repair")`: the full path (both pipelines) and the copy
+#: path's span encoders. *Retime never passes it.* The caller's debug fields still win, as on every
+#: row. **Its own basis name**, so a record says which table chose its threads.
+REPAIR_AREA_ROW_LARGE = "area:large:repair"
+REPAIR_AREA_DEFAULTS = {
+    #                       threads  sliced_threads  rc_lookahead
+    AREA_ROW_SMALL: AREA_DEFAULTS[AREA_ROW_SMALL],
+    REPAIR_AREA_ROW_LARGE: {"threads": 32, "sliced_threads": False, "rc_lookahead": 10},
+}
+
 #: The three fields the table decides. `crf` and `preset` are NOT among them — they are §6a
 #: fields with their own defaults and the table says nothing about either, so a job that sends
 #: neither still gets `DEFAULT_CRF` and `DEFAULT_PRESET`.
@@ -342,7 +361,7 @@ def resolve_codec(codec):
 
 
 def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=None,
-                     rc_lookahead=None):
+                     rc_lookahead=None, operation=None):
     """§6d's branch: **the row fills in what the caller did not send, and never what it did.**
 
     Returns `(settings, provenance)` — the three resolved values, and the
@@ -370,6 +389,8 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
 
     `codec` of `None` means the caller named none, which is `envelope.DEFAULT_CODEC` — resolved
     here rather than at the call site so the default has one home.
+
+    **`operation="frame_repair"` reads `REPAIR_AREA_DEFAULTS`** (§22b); anything else, §11's.
     """
     codec = resolve_codec(codec)
     if codec not in CODEC_LIBRARIES:
@@ -408,9 +429,14 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
             "boundary": AREA_BOUNDARY_DELIVERED_PIXELS,
         }
     row = area_row(delivered_pixels)
+    table = AREA_DEFAULTS
+    if operation == "frame_repair":
+        table = REPAIR_AREA_DEFAULTS
+        if row == AREA_ROW_LARGE:
+            row = REPAIR_AREA_ROW_LARGE
     sent = {"threads": threads, "sliced_threads": sliced_threads, "rc_lookahead": rc_lookahead}
     chosen = {name: value for name, value in sent.items() if value is not None}
-    settings = dict(AREA_DEFAULTS[row])
+    settings = dict(table[row])
     settings.update(chosen)
     # **Three states, and the middle one is the reason `basis` is one field.** Nothing sent is the
     # row; everything sent is the caller; anything else is genuinely mixed and says so rather than

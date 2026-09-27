@@ -69,6 +69,12 @@ MAX_POLL_S = 90
 #: chosen for feel — which is the property that makes it defensible and the property a
 #: replacement would have to keep.
 #:
+#: **§23 (F-2026-09-26-4) PUTS ONE READING OF THE ESTIMATE BACK, AS A CEILING AND NOTHING ELSE**:
+#: `next_poll_s` never exceeds the `eta_s` it is published beside. *The threshold and the ramp below
+#: still key on work done; what changed is that a job expecting to end in 30 s is not told to wait
+#: 90, even when it is behind its schedule.* **That is CF's rule as ruled, and it means the sentence
+#: above is true of the tightening and no longer of the whole cadence.** Found in review.
+#:
 #: *The gate supplied this argument after refuting the first one; the value is CF's to rule.*
 #: **A constant defended by a wrong argument is one somebody later moves for a good-looking wrong
 #: reason.**
@@ -166,6 +172,12 @@ class Progress:
         #: names no row. *Set once by `expect` and never cleared: it describes the seed, and a
         #: payload that has moved to `measured` still answers what the job was priced from.*
         self._eta_ladder = None
+        #: **§23: the seconds the derives add after the frames** — what they cost beyond the
+        #: master's upload, which hides the rest (`ladder.derive_expected`). *Added to the ETA
+        #: that is PUBLISHED, never to `eta_s()`: the work-done cadence compares that one against
+        #: the frames' own clock, and a tail in it would read as the job running ahead.* None
+        #: when no derive was asked for, or all of it hides behind the upload.
+        self._derive_tail_s = None
         # **State lives here, not in `emitted`.** `_emit` is rate-limited, so anything read back
         # out of the emitted history is missing whatever the limiter dropped. Reading
         # `frames_done` from that list made the ETA compute against zero frames done and report
@@ -229,6 +241,17 @@ class Progress:
         # all**, so a label without a rate behind it does not arrive here.
         if ladder:
             self._eta_ladder = str(ladder)
+
+    def expect_derives(self, added_s):
+        """§23: the derives' exposed seconds, added to every ETA this job publishes from now on.
+        `None` or zero adds nothing. Never raises."""
+        try:
+            added = float(added_s) if added_s else 0.0
+            # **Finite as well as positive**: an infinite tail would raise out of `phase()`'s
+            # `ceil`, and `phase("interpolate")` is not wrapped by its callers. Found in review.
+            self._derive_tail_s = added if added > 0 and math.isfinite(added) else None
+        except (TypeError, ValueError):
+            self._derive_tail_s = None
 
     def restart_frames(self, note=None):
         """Start the frame count over, for a job that has thrown its first attempt away.
@@ -348,6 +371,11 @@ class Progress:
                 # does not depend on that being true.*
                 seconds = int(math.ceil(eta))
                 if seconds >= 1:
+                    # **§23: the derives' exposed part rides on a LIVE frame ETA only** — the
+                    # zero test above is the frames' own, so a job whose frame work has lost its
+                    # subject does not have an ETA manufactured out of the derives alone.
+                    if self._derive_tail_s:
+                        seconds = int(math.ceil(eta + self._derive_tail_s))
                     payload["eta_s"] = seconds
                     payload["eta_basis"] = self._eta_basis
                     # **Beside the basis, and only where an ETA is.** *A step with no ETA
@@ -370,8 +398,12 @@ class Progress:
                     # honest answer is no band rather than one this worker invented. *Reported to
                     # the gate rather than resolved here.*
                     if self._band_frac is not None:
-                        payload["eta_low_s"] = int(seconds * (1.0 - self._band_frac))
-                        payload["eta_high_s"] = int(seconds * (1.0 + self._band_frac))
+                        # **The spread is the FRAME estimator's, so it spreads the frames' part
+                        # only**; §23's derive term rides on both edges unspread. Found in review.
+                        tail = self._derive_tail_s or 0.0
+                        frames_part = seconds - tail
+                        payload["eta_low_s"] = int(frames_part * (1.0 - self._band_frac) + tail)
+                        payload["eta_high_s"] = int(frames_part * (1.0 + self._band_frac) + tail)
         if expected_s is not None:
             half = float(expected_s) / 2.0
             payload["next_poll_s"] = int(max(MIN_POLL_S, min(MAX_POLL_S, half)))
@@ -388,6 +420,15 @@ class Progress:
             payload["phase_expected_s"] = round(float(expected_s), 1)
         else:
             payload["next_poll_s"] = self._next_poll_s(eta, payload.get("pct"))
+        # **§23 (F-2026-09-26-4): NEVER ASK FOR LONGER THAN THE ETA JUST PUBLISHED**, and never
+        # under the floor. *CF: "ask for the smaller of your own remaining ETA and 90."* A ceiling
+        # on whatever the rules above answered — the work-done tightening stays — so a job that
+        # expects to finish in 20 s is asked about at ~20 s, not at 90.
+        if payload.get("eta_s") is not None and payload["next_poll_s"] > payload["eta_s"]:
+            payload["next_poll_s"] = int(max(MIN_POLL_S, payload["eta_s"]))
+            # A stated basis must still explain the number beside it (the clamp's own rule).
+            if "poll_basis" in payload:
+                payload["poll_basis"] += " (eta ceiling)"
         # **The basis of the promise, published beside it** (CF ruling, 2026-08-20). A client that
         # can see the cadence the worker measured can check the promise rather than trust it, and
         # the whole cadence investigation had to be run from outside precisely because the

@@ -405,3 +405,48 @@ def derived_pools(delivered_height):
     """
     rows = int((float(delivered_height) / CTU_SIZE) + 0.5)
     return max(1, min(rows, 64))
+
+
+# ── §23: what the derives add to the ETA ─────────────────────────────────────────────────────
+#
+# **`decisions.md` §23 (F-2026-09-26-3): the ETA includes the derives the request asked for**, and
+# since §21 they run while the master uploads, so what they add is the part the upload does not
+# hide: `max(0, derive_expected_s - the upload's expected seconds)`. *These are the builder's seed,
+# on §11's footing: measured rows, refined as records accumulate.*
+
+#: **The derive rate per frame, as a function of the master's area** — the larger of a per-frame
+#: floor and a per-pixel slope. *Small frames are dominated by what does not scale with area (the
+#: three ffmpeg starts, the poster's seek, the proxy's fixed encode cost); large ones by the decode.*
+#: Both from `records/`, all three roles, on the images that run the derives the §21 way:
+#:
+#:   1080p 225 frames   derive_s 2.085   43720c6   records/rife-9e6a8888c5c1-893b7b5d  -> the floor
+#:   8K  1,200 frames   derive_s 42.57   0fb30e8   records/rife-29cf3fa61c4f-96fe86a1  -> the slope
+#:                      (33.984 on 43720c6, records/rife-9d6ca80b8335-9c98b711; the larger is taken)
+#:
+#: *At 720p the floor prices 240 frames at 2.2 s against 0.88 measured (records/rife-e7acd3578680);
+#: at 4K, with no row, the two agree within 5% (0.0093 against 0.0089 s/frame).* **Every derive
+#: request is priced at all three roles' rate**: a poster alone costs less, and an ETA that runs
+#: long by a second is the direction §18 allows.
+DERIVE_S_PER_FRAME_FLOOR = 2.085 / 225
+DERIVE_S_PER_PIXEL_FRAME = 42.57 / (1200 * 7680 * 4320)
+
+#: **The master's size before it exists, for the upload's expected seconds — the SMALLEST real
+#: master per pixel-frame in `records/`**: 8K h265 retimes at 445,075,813 bytes for 480 frames
+#: (0.0279 B per pixel-frame; h264 8K runs 0.047, a repair master 0.091). *The smaller the master,
+#: the less upload there is to hide the derives behind, so the smallest is the estimate that
+#: cannot run short.* The fixtures' flat test patterns compress far below any real clip and are
+#: not a master anyone uploads.
+MASTER_BYTES_PER_PIXEL_FRAME_LOW = 445075813 / (480 * 7680 * 4320)
+
+
+def derive_expected(frames, width, height):
+    """§23 for a master of `frames` at `width` x `height`: `{derive_expected_s,
+    upload_expected_s, added_s}` — the derives' predicted wall, the master upload's predicted
+    wall at `UPLOAD_BYTES_PER_S`, and what the ETA takes: `max(0, derive - upload)`. **Pure.**
+    """
+    pixels = int(width) * int(height)
+    frames = int(frames)
+    derive = frames * max(DERIVE_S_PER_FRAME_FLOOR, pixels * DERIVE_S_PER_PIXEL_FRAME)
+    upload = frames * pixels * MASTER_BYTES_PER_PIXEL_FRAME_LOW / UPLOAD_BYTES_PER_S
+    return {"derive_expected_s": round(derive, 3), "upload_expected_s": round(upload, 3),
+            "added_s": round(max(0.0, derive - upload), 3)}
