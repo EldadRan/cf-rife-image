@@ -1098,7 +1098,8 @@ def _finish_derives(run, upload_ended, request, client, trace, progress, warning
             upload_started = time.time()
             try:
                 made["key"] = storage.upload(client, request["output"], made["key"], path,
-                                             made["content_type"])
+                                             made["content_type"],
+                                             settings=storage.upload_settings(request))
             finally:
                 _add(trace, "timings", "upload_s", round(time.time() - upload_started, 3))
             _add(trace, "transfer", "upload_bytes", made["bytes"])
@@ -1792,13 +1793,19 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
 def _deliver_with(request, master, master_path, source_path, stats, trace, progress, warnings,
                   client, upload_bytes, derive_run, start_error=None):
     """`_deliver` from the master's upload on, with the derive thread already running."""
+    # **§24: one resolution for every upload of the job**, filed before the first byte moves so
+    # a failed upload's record still says what it ran at.
+    upload_settings = storage.upload_settings(request)
+    _note(trace, "transfer", "upload_concurrency", upload_settings["concurrency"])
+    _note(trace, "transfer", "upload_part_bytes", upload_settings["part_bytes"])
     upload_started = time.time()
     try:
         master_key = storage.upload(client, request["output"], master, master_path,
                                     keys.content_type(master),
                                     on_bytes=_byte_reporter(
                                         progress, "uploading",
-                                        bytes_per_s=ladder.UPLOAD_BYTES_PER_S))
+                                        bytes_per_s=ladder.UPLOAD_BYTES_PER_S),
+                                    settings=upload_settings)
     except BaseException:
         if derive_run is not None:
             derive_run.discard(trace)
@@ -1856,7 +1863,8 @@ def _deliver_with(request, master, master_path, source_path, stats, trace, progr
             try:
                 name = os.path.basename(png_path)
                 keys_uploaded.append(storage.upload(client, request["output"], name, png_path,
-                                                    keys.content_type(name)))
+                                                    keys.content_type(name),
+                                                    settings=storage.upload_settings(request)))
                 _add(trace, "transfer", "upload_bytes", os.path.getsize(png_path))
             except Exception as exc:  # noqa: BLE001 — evidence must never cost a delivery
                 print("[reference] worst-frame upload failed for {}: {}".format(
@@ -2015,7 +2023,10 @@ def _transfer(trace):
     """
     measured = (trace or {}).get("transfer") or {}
     return {"fetch_bytes": int(measured.get("fetch_bytes") or 0),
-            "upload_bytes": int(measured.get("upload_bytes") or 0)}
+            "upload_bytes": int(measured.get("upload_bytes") or 0),
+            # §24: what the uploads ran at; null on a run that never reached one.
+            "upload_concurrency": measured.get("upload_concurrency"),
+            "upload_part_bytes": measured.get("upload_part_bytes")}
 
 
 def _add(trace, block, field, value):

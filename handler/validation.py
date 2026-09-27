@@ -33,6 +33,7 @@ re-derives leniency from the comments that argue for it.*
 import encoder
 import envelope
 import repair_plan
+import storage
 from errors import (
     FIELD_NOT_SUPPORTED,
     INVALID_FIELD_VALUE,
@@ -203,6 +204,10 @@ PARAMS_DEBUG = (
     # **No default, and absent is not zero** — a `snap_tolerance` of 0 would ship the unsnapped
     # plan as the ruled answer before the benchmark that decides it has run.
     "snap_tolerance",
+    # **§24: Suite 16's sweep of the upload's parts**, both operations, and for that and nothing
+    # else. Absent means `storage`'s provisional default.
+    "upload_concurrency",
+    "upload_part_mb",
 )
 
 #: **`frame_repair`'s own `params`** (§19c). *Each operation owns its list, and a name belonging
@@ -237,6 +242,9 @@ REPAIR_PARAMS_DEBUG = (
     "threads",
     "sliced_threads",
     "rc_lookahead",
+    # §24, as on retime.
+    "upload_concurrency",
+    "upload_part_mb",
 )
 
 #: §19e's roles and the fields each takes — **the ffmpeg service's, `ffmpeg@9d7495b`
@@ -658,6 +666,25 @@ def validate(job_input):
     reference_score = (False if reference_score is None
                        else _as_bool(reference_score, "reference_score"))
 
+    # ── §24: the upload's parts, range-checked here and resolved in `storage` ─────────────────
+    upload_fields = {}
+    for name, low, high in (("upload_concurrency", storage.UPLOAD_CONCURRENCY_MIN,
+                             storage.UPLOAD_CONCURRENCY_MAX),
+                            ("upload_part_mb", storage.UPLOAD_PART_MB_MIN,
+                             storage.UPLOAD_PART_MB_MAX)):
+        value = params.get(name)
+        if value is not None:
+            value = _as_int(value, name)
+            if not low <= value <= high:
+                raise WorkerError(
+                    INVALID_FIELD_VALUE,
+                    "field '{}' must be within {}-{}, got {}. It is Suite 16's upload sweep "
+                    "(decisions.md §24); send nothing for this worker's default of {}.".format(
+                        name, low, high, value,
+                        storage.UPLOAD_CONCURRENCY_DEFAULT if name == "upload_concurrency"
+                        else storage.UPLOAD_PART_MB_DEFAULT))
+        upload_fields[name] = value
+
     rc_lookahead = params.get("rc_lookahead")
     if rc_lookahead is not None:
         rc_lookahead = _as_int(rc_lookahead, "rc_lookahead")
@@ -873,6 +900,9 @@ def validate(job_input):
         "threads": threads,
         "sliced_threads": sliced_threads,
         "rc_lookahead": rc_lookahead,
+        # §24: None where the caller sent nothing — `storage.upload_settings` fills the default.
+        "upload_concurrency": upload_fields["upload_concurrency"],
+        "upload_part_mb": upload_fields["upload_part_mb"],
         "convert_check": convert_check,
         "tie_check": tie_check,
         "input_check": input_check,

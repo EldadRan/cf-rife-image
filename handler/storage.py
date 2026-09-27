@@ -12,6 +12,7 @@ deterministic, derivable from the request, and identical on a re-run. See `keys.
 """
 
 import os
+import threading
 
 import requests
 
@@ -35,7 +36,19 @@ R2_REGION = "auto"
 # (`docs/decisions.md` 3.2); what is still owed CF is the master's real size, which is what
 # should set this number rather than the inherited default.
 MULTIPART_THRESHOLD_BYTES = int(os.environ.get("MULTIPART_THRESHOLD_BYTES", 100 * 1024 * 1024))
-MULTIPART_CHUNK_BYTES = 32 * 1024 * 1024
+
+#: **§24: PARTS GO UP IN PARALLEL.** *`max_concurrency=1` was a trade for memory headroom that is
+#: not at risk: N parts in flight hold ~N x P of buffers — 8 x 32 MiB is 256 MiB against 46-116 GB
+#: hosts whose peaks since §22 are 11-24 GB.* **N bounds the parts HELD IN MEMORY too**
+#: (`max_in_memory_upload_chunks`, which s3transfer otherwise caps at 10 whatever N is — so an arm
+#: of 16 or 32 ran 10 and filed its own number; found in review), plus the one being read. **PROVISIONAL**: Suite 16's sweep sets the ruled
+#: default (the fastest arm whose added host memory stays under 1 GB). The request's debug fields
+#: `upload_concurrency` / `upload_part_mb` move it for the sweep and nothing else. *A part is MiB —
+#: the unit the fixed 32 MiB part it replaces was written in — and is recorded in bytes.*
+UPLOAD_CONCURRENCY_DEFAULT = 8
+UPLOAD_PART_MB_DEFAULT = 32
+UPLOAD_CONCURRENCY_MIN, UPLOAD_CONCURRENCY_MAX = 1, 32
+UPLOAD_PART_MB_MIN, UPLOAD_PART_MB_MAX = 8, 256
 
 # Errors R2 returns for a credential that has expired or was never valid for this prefix.
 CREDENTIAL_ERROR_CODES = {
@@ -140,12 +153,130 @@ def client_for(output):
     )
 
 
-def upload(client, output, name, path, content_type, on_bytes=None):
+def upload_settings(request=None):
+    """§24: `{"concurrency", "part_bytes"}` for this job's uploads — the request's debug fields
+    where it sent them (validated), the provisional default where it did not. One resolution
+    for every upload of the job, so the record's two fields describe all of them."""
+    request = request or {}
+    concurrency = request.get("upload_concurrency")
+    part_mb = request.get("upload_part_mb")
+    return {"concurrency": int(concurrency if concurrency is not None
+                               else UPLOAD_CONCURRENCY_DEFAULT),
+            "part_bytes": int(part_mb if part_mb is not None
+                              else UPLOAD_PART_MB_DEFAULT) * 1024 * 1024}
+
+
+class _Relay:
+    """boto3's per-part byte deltas to an absolute, MONOTONIC `on_bytes(done, expected)`.
+
+    **§24: the callback runs on boto3's worker threads.** The running total is taken under a lock;
+    **a retried part reports a NEGATIVE delta** (s3transfer rewinds its progress), so the true
+    total can fall, and what is published is the highest total seen — `bytes_done` never goes
+    backwards. A raising `on_bytes` is dropped, never re-raised into the transfer.
+
+    **`on_bytes` runs OUTSIDE the counting lock, and by one thread at a time**: it is a progress
+    publish (the sampler, `progress_update`), and under the counting lock it paused every part's
+    send while it ran (found in review). A thread that finds another publishing skips — the
+    publisher always sends the latest total, and a later callback sends what arrived meanwhile —
+    so the published sequence is still strictly increasing.
+    """
+
+    def __init__(self, on_bytes, expected):
+        self._on_bytes = on_bytes
+        self._expected = expected
+        self._lock = threading.Lock()
+        self._emitting = threading.Lock()
+        self.total = 0
+        self.published = 0
+        self.emitted = 0
+
+    def __call__(self, delta):
+        with self._lock:
+            self.total += int(delta)
+            if self.total > self.published:
+                self.published = self.total
+        if self._on_bytes is None or not self._emitting.acquire(blocking=False):
+            return
+        try:
+            with self._lock:
+                latest = self.published
+            if latest > self.emitted:
+                self.emitted = latest
+                try:
+                    self._on_bytes(latest, self._expected)
+                except Exception:  # noqa: BLE001 — an emit never costs a delivered master
+                    self._on_bytes = None
+        finally:
+            self._emitting.release()
+
+    def flush(self):
+        """The final total, on the caller's thread once the transfer has returned — a report
+        skipped because another thread was publishing may have been the last one."""
+        self(0)
+
+
+class _AbortWatch:
+    """s3transfer's failure cleanup — `AbortMultipartUpload` — swallows its own failure (it logs at
+    DEBUG and goes on). **Registered on the client's `after-call` events for one upload**, this
+    sees the abort's own answer, so a failed abort reaches the job's error instead of leaving
+    parts under the caller's prefix with no trace (found in review). Never raises."""
+
+    EVENTS = ("after-call.s3.AbortMultipartUpload", "after-call-error.s3.AbortMultipartUpload")
+
+    def __init__(self, client):
+        self.failures = []
+        self._events = getattr(getattr(client, "meta", None), "events", None)
+        self._id = "cf-rife-abort-watch-{}".format(id(self))
+        if self._events is not None:
+            for event in self.EVENTS:
+                self._events.register(event, self._heard, unique_id=self._id + event)
+
+    def _heard(self, http_response=None, parsed=None, exception=None, **_kwargs):
+        try:
+            if exception is not None:
+                self.failures.append("{}: {}".format(type(exception).__name__, exception))
+            elif http_response is not None and http_response.status_code >= 300:
+                error = (parsed or {}).get("Error") or {}
+                # **`NoSuchUpload` is the upload already gone** — an abort that succeeded, whose
+                # answer was lost, retried by botocore. Not a failure. Found in review.
+                if error.get("Code") == "NoSuchUpload":
+                    return
+                self.failures.append("{} {}".format(error.get("Code") or http_response.status_code,
+                                                    error.get("Message") or "").strip())
+        except Exception:  # noqa: BLE001 — a hook must never break the upload
+            pass
+
+    def close(self):
+        if self._events is not None:
+            for event in self.EVENTS:
+                try:
+                    self._events.unregister(event, unique_id=self._id + event)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def said(self):
+        """The sentence a failed upload's error ends with, or empty."""
+        if not self.failures:
+            return ""
+        return (" — and aborting the multipart upload failed too ({}), so its parts may remain "
+                "under the prefix".format("; ".join(self.failures)))
+
+
+def upload(client, output, name, path, content_type, on_bytes=None, settings=None):
     """Write one file under the prefix. The key is deterministic, so a re-run overwrites.
 
     **`on_bytes(done, expected)` reports absolute bytes**, not boto3's per-part delta — the
     accumulation happens here so every caller does not repeat it, and `expected` is the file's
-    own size, which is known before the first byte moves.
+    own size, which is known before the first byte moves. *Monotonic under threads* (`_Relay`).
+
+    **§24: `settings` is `upload_settings`'s** — N parts of P bytes in flight; None is the
+    provisional default. **A part that fails fails the upload** as it always has
+    (`OUTPUT_WRITE_FAILED`), **and the multipart upload is aborted**: s3transfer registers
+    `AbortMultipartUpload` as the failure cleanup the moment the upload is created
+    (`s3transfer/tasks.py`, `CreateMultipartUploadTask`), so no parts are left under the caller's
+    prefix — **unless the abort fails too** (an expired credential refuses it as it refused the
+    part), and then the error SAYS so (`_AbortWatch`). Witnessed by the builder's
+    `tests/test_upload_wave.py`, both ways.
     """
     import botocore.exceptions
     from boto3.s3.transfer import TransferConfig
@@ -154,21 +285,24 @@ def upload(client, output, name, path, content_type, on_bytes=None):
     key = "{}{}".format(prefix if prefix.endswith("/") else prefix + "/", name)
     #: **boto3 hands the callback a DELTA and the phase wants a total.** *Accumulated here, and
     #: the expected figure is read once before the transfer rather than per part.*
-    progressed = {"done": 0, "on_bytes": on_bytes}
     try:
         expected = os.path.getsize(path)
     except OSError:
         expected = None
+    settings = settings or upload_settings()
+    relay = _Relay(on_bytes, expected)
+    config = TransferConfig(
+        multipart_threshold=MULTIPART_THRESHOLD_BYTES,
+        # §24: N parts of P bytes in flight, on boto3's threads. *"One part at a time" stood
+        # here, for a headroom the hosts this endpoint serves do not need (decisions.md §24).*
+        multipart_chunksize=settings["part_bytes"],
+        max_concurrency=settings["concurrency"],
+        use_threads=True)
+    # **A file handle's parts are read into memory, and those take a SEPARATE bound**, 10 by
+    # default: without this, N above 10 ran 10.
+    config.max_in_memory_upload_chunks = settings["concurrency"]
 
-    def _relay(delta):
-        progressed["done"] += int(delta)
-        if progressed["on_bytes"] is None:
-            return
-        try:
-            progressed["on_bytes"](progressed["done"], expected)
-        except Exception:  # noqa: BLE001 — an emit never costs a delivered master
-            progressed["on_bytes"] = None
-
+    watch = _AbortWatch(client)
     try:
         # upload_fileobj switches to multipart above the threshold and stays a single PUT below
         # it, so a poster keeps exactly the behaviour a single PUT would have given it.
@@ -178,18 +312,10 @@ def upload(client, output, name, path, content_type, on_bytes=None):
                 output["bucket"],
                 key,
                 ExtraArgs={"ContentType": content_type},
-                Callback=_relay if on_bytes is not None else None,
-                Config=TransferConfig(
-                    multipart_threshold=MULTIPART_THRESHOLD_BYTES,
-                    multipart_chunksize=MULTIPART_CHUNK_BYTES,
-                    # One part at a time. On the media worker this was because it was CPU-bound
-                    # elsewhere; here the reason is stronger and is the standing rule — parallel
-                    # parts hold more buffers resident, and this worker trades throughput for
-                    # headroom every time, without asking.
-                    max_concurrency=1,
-                    use_threads=False,
-                ),
+                Callback=relay if on_bytes is not None else None,
+                Config=config,
             )
+        relay.flush()
     except botocore.exceptions.ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in CREDENTIAL_ERROR_CODES:
@@ -203,18 +329,20 @@ def upload(client, output, name, path, content_type, on_bytes=None):
                 "expired. The work itself succeeded — resubmit the same request with a freshly "
                 "minted credential whose lifetime covers this endpoint's execution timeout. "
                 "Retrying the identical request will fail identically: the credential is the "
-                "part that has to change.".format(key, code),
+                "part that has to change{}.".format(key, code, watch.said()),
                 remedy=Remedy.RETRY_SAME,
             )
         raise WorkerError(OUTPUT_WRITE_FAILED,
-                          "could not write {}: {}".format(key, exc),
+                          "could not write {}: {}{}".format(key, exc, watch.said()),
                           remedy=Remedy.RETRY_SAME)
     except (botocore.exceptions.BotoCoreError, OSError) as exc:
         # A transport failure against the caller's own bucket. The same card would serve the same
         # job again — this is the textbook `retry_same`, and it was returning null.
         raise WorkerError(OUTPUT_WRITE_FAILED,
-                          "could not write {}: {}".format(key, exc),
+                          "could not write {}: {}{}".format(key, exc, watch.said()),
                           remedy=Remedy.RETRY_SAME)
+    finally:
+        watch.close()
     return key
 
 

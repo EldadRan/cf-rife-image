@@ -122,6 +122,11 @@ encode are one streaming loop — the writer pulls each frame through the whole 
 repair that copies counts a copied run as done the moment it is cut, and each re-encoded frame as
 it reaches its span's encoder.
 
+Every upload — the master, the derives, the reference PNGs — goes up in parallel parts: 8 parts
+of 32 MiB in flight by default (`handler/storage.py`, provisional until Suite 16's sweep), movable
+by the debug fields `upload_concurrency` and `upload_part_mb`. A part that fails fails the upload
+and the multipart upload is aborted; an abort that fails too is said in the error.
+
 The ETA exists from the moment the frame plan does, before the model loads, and it includes the
 part of any requested derives that the master's upload does not hide. `next_poll_s` never asks for
 longer than that ETA, and never less than 5 seconds. A repair's h264 encode above 4K (the 8K row)
