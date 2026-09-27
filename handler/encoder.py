@@ -587,7 +587,7 @@ class MasterWriter:
                  crf=DEFAULT_CRF, preset=DEFAULT_PRESET, codec=None, bit_depth=None,
                  threads=None, sliced_threads=None, rc_lookahead=None,
                  reference_path=None, frame_threads=None, pools=None,
-                 delivered_frames=None, source_format=False):
+                 delivered_frames=None, source_format=False, native=None):
         self.path = path
         #: **Where ffmpeg writes contract §6g's raw reference, or None for an unarmed run.**
         #: A SECOND OUTPUT of this same command rather than a copy of what crossed the pipe: the
@@ -635,6 +635,12 @@ class MasterWriter:
         #: Seconds of audio to read, or None to read it all. Bounds the carried track to the
         #: picture without the muxer being allowed to bound the picture to the track.
         self._audio_limit_s = audio_limit_s
+        #: **`decisions.md` §22: the frame_repair full path's native input**, or None — and None
+        #: builds today's command byte for byte, which is every retime and the frame loop. A dict
+        #: from `splice.native_input`: `pix_fmt` (the SOURCE's, what arrives on stdin), `frame_bytes`,
+        #: `pix_fmt_out`, `vf` (a YUV-to-YUV conversion, or None), `input_args` (`-itsoffset`),
+        #: `output_args` (colour tags, the source's timescale).
+        self._native = native
         #: Frames the container reports once ffmpeg has exited, or None where it does not say.
         #: The only frame count this class holds that was measured after the encode.
         self.verified_frames = None
@@ -819,11 +825,22 @@ class MasterWriter:
         crf, preset = self.crf, self.preset
         path = self.path
 
+        native = self._native
         command = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            # Input 0: raw frames on stdin, exactly as the model produces them.
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", "{}x{}".format(width, height), "-r", str(fps), "-i", "-",
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
+        if native is not None:
+            # §22: the source's frames in the source's own pixel format, placed on the source's
+            # timeline — `-itsoffset` restores its first PTS.
+            command += list(native["input_args"])
+        command += [
+            # Input 0: raw frames on stdin, exactly as the model produces them — or, on §22's
+            # native path, as the source's decoder produced them.
+            "-f", "rawvideo", "-pix_fmt", "rgb24" if native is None else native["pix_fmt"],
+            "-s", "{}x{}".format(width, height),
+            # **`-framerate` on the native path, never `-r`**: as an input option `-r` restamps
+            # every frame from zero and silently drops `-itsoffset`, so a source whose video
+            # starts late lost its first PTS (measured: 1001 ticks → 0, with and without audio).
+            "-r" if native is None else "-framerate", str(fps), "-i", "-",
         ]
 
         carry_audio = audio_source is not None
@@ -838,7 +855,13 @@ class MasterWriter:
                     "-preset", preset, "-crf", str(crf),
                     # §6f. `yuv420p` at 8 and `yuv420p10le` at 10, which is what makes the
                     # encode `main10` — see `PIXEL_FORMATS`.
-                    "-pix_fmt", pixel_format(self.bit_depth)]
+                    "-pix_fmt", pixel_format(self.bit_depth) if native is None
+                    else native["pix_fmt_out"]]
+        if native is not None:
+            # §22a: a codec or depth change is a conversion in YUV, never through RGB.
+            if native["vf"]:
+                command += ["-vf", native["vf"]]
+            command += list(native["output_args"])
         # `-x26N-params` rather than more `-preset` flags: the preset stays the caller's and
         # these are the specific knobs §6a and §6e name, so a reader can see which of the two
         # moved.
@@ -969,12 +992,14 @@ class MasterWriter:
             raise WorkerError(INTERNAL, "could not start ffmpeg: {}".format(exc))
 
     def write(self, frame_bytes):
-        """One frame, already `rgb24` and `width × height × 3` bytes."""
+        """One frame, already `rgb24` and `width × height × 3` bytes — or, on §22's native
+        path, one frame in the source's own pixel format."""
         # **The check the still path had and this one did not.** rawvideo carries no shape, so a
         # frame of the wrong length is not an error to ffmpeg — it is the first bytes of the next
         # frame, and the master shears from that point on while the process exits 0. Cheap to
         # check, and it turns the worst failure mode in this file into a refusal.
-        expected = self.width * self.height * 3
+        expected = (self.width * self.height * 3 if self._native is None
+                    else self._native["frame_bytes"])
         if len(frame_bytes) != expected:
             raise WorkerError(INTERNAL, "frame {} is {} bytes, expected {} for {}x{}".format(
                 self.frames_written, len(frame_bytes), expected, self.width, self.height))

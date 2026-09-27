@@ -41,6 +41,16 @@ decode across every seam — and anything that is not eligible, or fails that ch
 in full instead and says why. `params.reencode: "full"` forces the full re-encode, and a repair
 with no `params.output` keeps the source's format. The splice is `handler/splice.py`.
 
+**The full re-encode is an encode, not a frame loop.** The source is decoded once in its own YUV
+and every untouched frame goes straight to the encoder without passing through RGB; only the
+replaced frames go through RGB, with the source's colour matrix and range stated both ways, and a
+codec or depth change is a conversion in YUV in the encoder's filter graph. Decode, RIFE and the
+encode run at once. The master keeps the encoder's own B-frames and is checked before upload for
+frame count, rate, duration and every PTS equal to the source's. A source this cannot plan for,
+an armed `convert_check`, `input_check` or `reference_score`, or a native encode that fails its
+check runs the per-frame loop instead, filed as `frame_repair.pipeline` and `pipeline_reason`
+with a warning. This is `repair.run_native`.
+
 **Either operation may ask for `derive`** — a WebP poster, a 1280-px h264 proxy and a spritesheet,
 each made from the delivered master and uploaded beside it. A derive that fails is reported in
 the run record's `warnings[]` and does not cost the master. The derives are made while the master

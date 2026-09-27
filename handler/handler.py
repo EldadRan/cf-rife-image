@@ -1312,6 +1312,116 @@ def _repair_copy(request, source, source_path, items, mapping, ranges, segments,
 
 
 
+def _frame_loop(why):
+    return ("frame_repair's full path ran the frame loop — every frame through RGB — instead of "
+            "the native encode: {}.".format(why))
+
+
+def _repair_full(request, source, source_path, items, mapping, ranges, segments, master_path,
+                 interpolator, workdir, progress, clock, trace, warnings, repair_block, scale,
+                 frame_count, counted, checker, input_checker, encode_defaults, choice):
+    """`decisions.md` §22: the full path. **The native encode first** (`repair.run_native`),
+    checked before upload — §19g's three and every PTS equal to the source's (§22a); **the frame
+    loop** (`repair.run`) for what it cannot plan for, for an armed instrument, or after it fails
+    (§22b-1), filed as `pipeline` and `pipeline_reason` with a warning sentence.
+
+    **What falls back is ruling C's shape on the copy path**: anything but a refusal the frame
+    loop would make too. *A segment decoding to the wrong count and the second cap test are
+    `WorkerError`s it would repeat; an encoder that died (`INTERNAL`) is not, because the native
+    command line is the thing that differs.*
+    """
+    import splice  # noqa: PLC0415 — stdlib and ffmpeg only; imported where it is used
+
+    anchors = {item["id"]: (item["a"], item["b"]) for item in ranges}
+    armed = [name for name in ("convert_check", "input_check", "reference_score")
+             if request.get(name)]
+    why = None
+    pmap = None
+    if armed:
+        # §22b-1 Q3: the three instruments are wired into the frame loop's write path.
+        why = "armed: {}".format(", ".join(armed))
+    else:
+        try:
+            pmap = splice.PacketMap(source_path)
+            declined = splice.native_decline(source, pmap)
+        except Exception as exc:  # noqa: BLE001 — a source it cannot read is the loop's
+            declined = "{}: {}".format(type(exc).__name__, exc) if not isinstance(
+                exc, splice.NotEligible) else str(exc)
+        if declined is not None:
+            why = "not_plannable: " + declined
+    if why is None:
+        try:
+            stats = repair.run_native(
+                source, pmap, frame_count, mapping, anchors,
+                [{"id": i["id"], "a": i["a"], "b": i["b"]} for i in items], segments,
+                master_path, interpolator,
+                counted["r_frame_rate"] or source["r_frame_rate"],
+                identity_tags(request, source["width"], source["height"]), workdir,
+                crf=request.get("crf"), preset=request.get("preset"),
+                threads=request.get("threads"), sliced_threads=request.get("sliced_threads"),
+                rc_lookahead=request.get("rc_lookahead"),
+                codec=request["release_3"]["codec"], bit_depth=request["release_3"]["bit_depth"],
+                frame_threads=request["release_3"].get("frame_threads"),
+                pools=request["release_3"].get("pools"), encode_defaults=encode_defaults,
+                progress=progress,
+                audio_source=source_path if request["keep_audio"] else None, scale=scale,
+                clock=clock,
+                armed=[field for field in ("tie_check", "decode_probe") if request.get(field)],
+                cap_note=(trace.setdefault("cap", {}) if trace is not None else None),
+                source_format=choice["source_format"])
+            splice.verify_pts(master_path, pmap)
+            try:
+                repair.verify_master(master_path, counted)
+            except WorkerError as exc:
+                raise splice.CheckFailed(exc.message)
+            repair_block["pipeline"] = "native"
+            stats.update(pipeline="native")
+            return stats
+        except WorkerError as exc:
+            if exc.code != errors.INTERNAL:
+                raise
+            why = "check_failed: {}".format(exc.message)
+        except Exception as exc:  # noqa: BLE001 — ruling C's shape: fall back, and say why
+            why = "check_failed: {}".format(exc if isinstance(exc, splice.CheckFailed)
+                                            else "{}: {}".format(type(exc).__name__, exc))
+        print("[native] falling back to the frame loop — {}".format(why), flush=True)
+        if os.path.exists(master_path):
+            os.remove(master_path)
+        if progress is not None:
+            try:
+                progress.restart_frames(note="the native encode fell back; running the frame loop")
+            except Exception as problem:  # noqa: BLE001 — never at the cost of the fallback
+                print("[progress] restart not emitted ({}: {})".format(
+                    type(problem).__name__, problem), flush=True)
+    repair_block.update(pipeline="frame_loop", pipeline_reason=why)
+    warnings.append(_frame_loop(why))
+    stats = repair.run(
+        source, source_path, frame_count, mapping,
+        {item["id"]: (item["a"], item["b"]) for item in ranges}, segments, master_path,
+        interpolator,
+        # **The source's r_frame_rate AS ITS RATIONAL STRING** — §19g holds the output to it
+        # exactly, and `MasterWriter` hands it to ffmpeg's `-r` as it arrives.
+        counted["r_frame_rate"] or source["r_frame_rate"],
+        identity_tags(request, source["width"], source["height"]),
+        crf=request.get("crf"), preset=request.get("preset"), threads=request.get("threads"),
+        sliced_threads=request.get("sliced_threads"), rc_lookahead=request.get("rc_lookahead"),
+        codec=request["release_3"]["codec"], bit_depth=request["release_3"]["bit_depth"],
+        frame_threads=request["release_3"].get("frame_threads"),
+        pools=request["release_3"].get("pools"),
+        convert_check=checker, input_check=input_checker,
+        reference_score=request.get("reference_score"), encode_defaults=encode_defaults,
+        progress=progress, audio_source=source_path if request["keep_audio"] else None,
+        scale=scale, clock=clock,
+        armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe",
+                                   "reference_score") if request.get(field)],
+        cap_note=(trace.setdefault("cap", {}) if trace is not None else None),
+        source_format=choice["source_format"])
+    # **§19g's check is `_repair`'s, after the stats are banked** — the frame loop's master that
+    # fails it is the run whose encode numbers are the diagnosis.
+    stats.update(pipeline="frame_loop", pipeline_reason=why)
+    return stats
+
+
 def _repair(request, machine, warnings, workdir, progress, started, trace=None, clock=None):
     """`frame_repair` end to end — `decisions.md` §19c, §19d, §19g.
 
@@ -1497,27 +1607,10 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
                              master_path, interpolator, workdir, progress, clock, trace,
                              warnings, repair_block, scale, frame_count, counted)
     if stats is None:
-        stats = repair.run(
-            source, source_path, frame_count, mapping,
-            {item["id"]: (item["a"], item["b"]) for item in ranges}, segments, master_path,
-            interpolator,
-            # **The source's r_frame_rate AS ITS RATIONAL STRING** — §19g holds the output to it
-            # exactly, and `MasterWriter` hands it to ffmpeg's `-r` as it arrives.
-            counted["r_frame_rate"] or source["r_frame_rate"],
-            identity_tags(request, source["width"], source["height"]),
-            crf=request.get("crf"), preset=request.get("preset"), threads=request.get("threads"),
-            sliced_threads=request.get("sliced_threads"), rc_lookahead=request.get("rc_lookahead"),
-            codec=request["release_3"]["codec"], bit_depth=request["release_3"]["bit_depth"],
-            frame_threads=request["release_3"].get("frame_threads"),
-            pools=request["release_3"].get("pools"),
-            convert_check=checker, input_check=input_checker,
-            reference_score=request.get("reference_score"), encode_defaults=encode_defaults,
-            progress=progress, audio_source=source_path if request["keep_audio"] else None,
-            scale=scale, clock=clock,
-            armed=[field for field in ("convert_check", "input_check", "tie_check", "decode_probe",
-                                       "reference_score") if request.get(field)],
-            cap_note=(trace.setdefault("cap", {}) if trace is not None else None),
-            source_format=choice["source_format"])
+        stats = _repair_full(request, source, source_path, items, mapping, ranges, segments,
+                             master_path, interpolator, workdir, progress, clock, trace,
+                             warnings, repair_block, scale, frame_count, counted, checker,
+                             input_checker, encode_defaults, choice)
         stats.update(frames_copied=0, frames_encoded=stats.get("n_out"))
     # §20f: the path the master actually took, on the record's block and the response's.
     stats.update(path=repair_block["path"], path_reason=repair_block["path_reason"])
@@ -1544,8 +1637,9 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     # **§19g: BEFORE UPLOAD, OR THE JOB FAILS AND NOTHING IS DELIVERED** — and AFTER the stats are
     # banked, because a master that fails this check is the run whose encode numbers are the
     # diagnosis. Found in review. *A copy has passed §20e's stricter check already, and this
-    # one too (`_repair_copy`); a copy that failed either is no longer the master.*
-    if repair_block.get("path") == "full":
+    # one too (`_repair_copy`); a copy that failed either is no longer the master. **So has a
+    # native encode** (`_repair_full`, §22a), and one that failed fell back to the frame loop.*
+    if repair_block.get("path") == "full" and repair_block.get("pipeline") == "frame_loop":
         repair.verify_master(master_path, counted)
 
     output_entry, derived, derive_failed = _deliver(request, master, master_path, source_path,

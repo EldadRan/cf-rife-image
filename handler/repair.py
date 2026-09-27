@@ -21,8 +21,10 @@ loops is owed to the other**; they are named here so the next reader looks.
 this module on a box with no torch and `verify_master` runs on the tests tree.
 """
 import os
+import queue
 import subprocess
 import tempfile
+import threading
 import time
 from fractions import Fraction
 
@@ -124,28 +126,9 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
         n_synth = repair_plan.synthesised(mapping)
 
         # ── the encoder, resolved exactly as `routec.retime` resolves it ────────────────────────
-        encode_settings, provenance = encoder.resolve_defaults(
-            delivered_pixels, codec=codec, threads=threads, sliced_threads=sliced_threads,
-            rc_lookahead=rc_lookahead)
-        if encode_defaults is not None:
-            encode_defaults.update(provenance)
-        print("[encode] defaults {} at {} delivered pixels ({}x{}, boundary {}): {}".format(
-            provenance["basis"], delivered_pixels, width, height, provenance["boundary"],
-            " ".join("{}={}".format(name, encode_settings[name])
-                     for name in encoder.AREA_FIELDS if name in encode_settings)
-            or "no x264 thread settings — this codec has no such table"), flush=True)
-        encode_crf = crf if crf is not None else encoder.DEFAULT_CRF
-        encode_preset = preset if preset is not None else encoder.DEFAULT_PRESET
-        substituted = [name for name, value in (("crf", crf), ("preset", preset))
-                       if value is None]
-        encode_arm = dict(encode_settings, crf=encode_crf, preset=encode_preset)
-        if codec == "h265":
-            threading, threading_basis = encoder.x265_threading(
-                frame_threads, pools, delivered_height=int(height), delivered_frames=frame_count)
-            print("[encode] x265 threading: {}".format(" ".join(
-                "{}={} ({})".format(name, threading[name], threading_basis[name + "_basis"])
-                for name in ("frame_threads", "pools"))), flush=True)
-            encode_arm.update(threading)
+        encode_settings, encode_crf, encode_preset, substituted, encode_arm = _encode_setup(
+            delivered_pixels, width, height, frame_count, codec, crf, preset, threads,
+            sliced_threads, rc_lookahead, frame_threads, pools, encode_defaults)
 
         reference_block = None
         reference_format = None
@@ -296,6 +279,38 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
             except Exception as exc:  # noqa: BLE001 — a release must never displace a delivery
                 print("[decode] capture.release() failed ({}: {})".format(
                     type(exc).__name__, exc), flush=True)
+
+
+def _encode_setup(delivered_pixels, width, height, frame_count, codec, crf, preset, threads,
+                  sliced_threads, rc_lookahead, frame_threads, pools, encode_defaults):
+    """The encoder's settings, resolved exactly as `routec.retime` resolves them — for the frame
+    loop (`run`) and the native path (`run_native`) alike, so §22's thread budget reaches both
+    from one place. Returns `(settings, crf, preset, substituted, arm)`."""
+    import encoder  # noqa: PLC0415 — GPU-box import, like the rest of this path
+
+    encode_settings, provenance = encoder.resolve_defaults(
+        delivered_pixels, codec=codec, threads=threads, sliced_threads=sliced_threads,
+        rc_lookahead=rc_lookahead)
+    if encode_defaults is not None:
+        encode_defaults.update(provenance)
+    print("[encode] defaults {} at {} delivered pixels ({}x{}, boundary {}): {}".format(
+        provenance["basis"], delivered_pixels, width, height, provenance["boundary"],
+        " ".join("{}={}".format(name, encode_settings[name])
+                 for name in encoder.AREA_FIELDS if name in encode_settings)
+        or "no x264 thread settings — this codec has no such table"), flush=True)
+    encode_crf = crf if crf is not None else encoder.DEFAULT_CRF
+    encode_preset = preset if preset is not None else encoder.DEFAULT_PRESET
+    substituted = [name for name, value in (("crf", crf), ("preset", preset))
+                   if value is None]
+    encode_arm = dict(encode_settings, crf=encode_crf, preset=encode_preset)
+    if codec == "h265":
+        threading, threading_basis = encoder.x265_threading(
+            frame_threads, pools, delivered_height=int(height), delivered_frames=frame_count)
+        print("[encode] x265 threading: {}".format(" ".join(
+            "{}={} ({})".format(name, threading[name], threading_basis[name + "_basis"])
+            for name in ("frame_threads", "pools"))), flush=True)
+        encode_arm.update(threading)
+    return encode_settings, encode_crf, encode_preset, substituted, encode_arm
 
 
 def _frames_of(argv, width, height, count=None, clock=None, what="a decode"):
@@ -671,3 +686,462 @@ def verify_master(master_path, source_counted):
             "repair changes frames and nothing else, so any of these is the worker's defect."
             .format("; ".join(failures)))
     return master
+
+
+# ── §22: the full path as an encode ──────────────────────────────────────────────────────────
+
+#: Frames in flight between the decoder and the loop, and again between the loop and the
+#: encoder: the three overlap (§22a) and neither side waits on the other while the queue has
+#: room. *Bounded, because at 8K a 4:2:0 frame is 47 MiB and an unbounded queue behind a slow
+#: encoder is a host-memory leak.*
+NATIVE_QUEUE_FRAMES = 4
+
+#: How often a blocked queue call looks up to see whether the other side died.
+_POLL_S = 0.5
+
+#: Linux's `F_SETPIPE_SZ`, not exported by Python before 3.10's `fcntl`.
+_F_SETPIPE_SZ = 1031
+_PIPE_BYTES = 1 << 20
+
+_END = object()
+
+
+def _put(q, item, abort):
+    while not abort.is_set():
+        try:
+            q.put(item, timeout=_POLL_S)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
+def _get(q, abort):
+    while not abort.is_set():
+        try:
+            return q.get(timeout=_POLL_S)
+        except queue.Empty:
+            continue
+    return _END
+
+
+def _widen(pipe):
+    """A 1 MiB pipe instead of 64 KiB, where the kernel allows it: fewer wakeups per 47 MiB
+    frame. Never raises; the default pipe works, only slower."""
+    try:
+        import fcntl  # noqa: PLC0415 — POSIX only
+
+        fcntl.fcntl(pipe.fileno(), _F_SETPIPE_SZ, _PIPE_BYTES)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reader(proc, size, out, abort, box):
+    """The decoder's frames onto `out`, then `_END`. **Counts what it read** (`box["frames"]`):
+    §19d's agreement is the loop's to judge, not this thread's."""
+    try:
+        while not abort.is_set():
+            raw = _read_exactly(proc.stdout, size)
+            if not raw:
+                break
+            if len(raw) != size:
+                box["error"] = "the decode ended {} bytes into frame {}".format(
+                    len(raw), box["frames"])
+                break
+            box["frames"] += 1
+            if not _put(out, raw, abort):
+                return
+    except Exception as exc:  # noqa: BLE001 — reported by the loop, which owns the failure
+        box["error"] = "{}: {}".format(type(exc).__name__, exc)
+    _put(out, _END, abort)
+
+
+def _writer(writer, inq, abort, box):
+    """Frames off `inq` into the encoder until `_END`. A failure stops the loop (`abort`)."""
+    try:
+        while True:
+            item = _get(inq, abort)
+            if item is _END:
+                return
+            writer.write(item)
+    except BaseException as exc:  # noqa: BLE001 — handed to the loop, which re-raises it
+        box["error"] = exc
+        abort.set()
+
+
+def native_windows(frame_count, items):
+    """The windows the model works in: for each item its anchors and every frame between,
+    `[(a, b)]`, merged where they overlap — `repair_plan.spans` with every frame a seam, so each
+    span is exactly the frames an item replaces, and `[start - 1, end]` its anchors (§22a)."""
+    return [(start - 1, end) for start, end, _ in
+            repair_plan.spans(frame_count, range(frame_count), items)]
+
+
+def _native_window(pmap, lo, hi, held, mapping, anchors, segments, interpolator, workdir,
+                   tensors, to_bytes, staging, clock):
+    """The frames `lo+1 .. hi` of the output, in the source's pixel format — a generator.
+
+    **The model's input is the frames the one decode already holds**: the window's untouched
+    frames (`held`: its anchors, and any untouched frame between two merged items) go to BGR
+    through `splice.yuv_to_rgb`, the copy path's conversion with the source's matrix and range
+    stated. `repair_plan.emit` walks the window as the copy path's pass 1 does; every replaced
+    frame goes through the model and `to_bytes`, then back to the source's pixel format with the
+    same matrix and range (§20c, §22b-1), into a spool file. **Untouched frames are yielded as
+    the decoder gave them**; replaced ones are read off the spool one at a time.
+    """
+    import numpy as np  # noqa: PLC0415 — GPU-box import, as everywhere on this path
+    import splice  # noqa: PLC0415
+
+    positions = range(lo, hi + 1)
+    kept = [n for n in positions if mapping[n][0] == repair_plan.SRC]
+    replaced = [n for n in positions if mapping[n][0] != repair_plan.SRC]
+    if lo not in held or hi not in held or any(n not in held for n in kept):
+        raise splice.CheckFailed("the window [{}, {}] is missing an untouched frame".format(lo, hi))
+    size = pmap.frame_bytes
+    argv = splice.yuv_to_rgb(pmap, len(kept)) + ["-"]
+    try:
+        if clock is None:
+            done = subprocess.run(argv, input=b"".join(held[n] for n in kept),
+                                  capture_output=True, timeout=splice.FFMPEG_TIMEOUT_S)
+        else:
+            with clock.timing("decode_s"):
+                done = subprocess.run(argv, input=b"".join(held[n] for n in kept),
+                                      capture_output=True, timeout=splice.FFMPEG_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise splice.CheckFailed("the anchors' conversion at [{}, {}] timed out".format(lo, hi))
+    bgr_size = pmap.width * pmap.height * 3
+    if done.returncode != 0 or len(done.stdout) != bgr_size * len(kept):
+        raise splice.CheckFailed("the anchors' conversion at [{}, {}] returned {} of {} bytes: {}"
+                                 .format(lo, hi, len(done.stdout), bgr_size * len(kept),
+                                         done.stderr.decode(errors="replace").strip()[-300:]))
+    bgr = np.frombuffer(done.stdout, dtype=np.uint8).reshape(len(kept), pmap.height,
+                                                             pmap.width, 3)
+    kept_tensors = tensors(iter(bgr), interpolator.device, clock=clock)
+
+    def source_frames():
+        # **Positions the model never reads are None**: `emit` drops a range's damage unread.
+        for n in positions:
+            yield next(kept_tensors) if mapping[n][0] == repair_plan.SRC else None
+
+    window = [(repair_plan.SRC, n - lo) if mapping[n][0] == repair_plan.SRC else mapping[n]
+              for n in positions]
+    window_anchors = {rid: (a - lo, b - lo) for rid, (a, b) in anchors.items()
+                      if lo <= a and b <= hi}
+    spool = os.path.join(workdir, "native{:07d}.yuv".format(lo))
+    seg_frames, seg_counts, seg_gens = {}, {}, []
+    used = sorted({entry[1] for entry in window if entry[0] == repair_plan.SEG})
+    for sid in used:
+        seg = segments[sid]
+        seg_counts[sid] = _Count()
+        # The segment's OWN matrix and range, as on the copy path (`run_copy`).
+        gen = _frames_of(splice.rgb_decoder(seg["path"], ["-i", seg["path"]], None,
+                                            seg["m_file"] + 1, *splice.colour_of(seg["path"])),
+                         pmap.width, pmap.height, count=seg_counts[sid], clock=clock)
+        seg_gens.append(gen)
+        seg_frames[sid] = tensors(gen, interpolator.device, clock=clock)
+    cache = {}
+    stream = repair_plan.emit(
+        window, window_anchors, source_frames(), seg_frames,
+        lambda key, frame_a, frame_b, t: interpolator.between(cache, key, frame_a, frame_b, t,
+                                                              clock))
+    try:
+        with tempfile.TemporaryFile() as err:
+            converter = subprocess.Popen(splice.rgb_to_source(pmap, len(replaced)) + [spool],
+                                         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                         stderr=err)
+            failed = True
+            try:
+                for offset, frame in enumerate(stream):
+                    if mapping[lo + offset][0] == repair_plan.SRC:
+                        continue
+                    if clock is None:
+                        payload = to_bytes(frame, staging)
+                    else:
+                        with clock.timing("convert_out_s"):
+                            payload = to_bytes(frame, staging)
+                    try:
+                        converter.stdin.write(payload)
+                    except BrokenPipeError:
+                        _died(converter, "the RGB-to-source conversion", err)
+                    if staging is not None:
+                        staging.released()
+                # §19d's count agreement on each segment the window read, as `run_copy` does.
+                for sid, gen in zip(used, seg_gens):
+                    for _ in gen:
+                        pass
+                    if seg_counts[sid].decoded != segments[sid]["m_file"]:
+                        raise repair_plan.Refused(
+                            INVALID_SOURCE,
+                            "segment '{}' decodes to {} frames and its container holds {} video "
+                            "packets, and its M was counted from the packets — so the frames it "
+                            "contributed are not the ones the plan named.".format(
+                                sid, seg_counts[sid].decoded, segments[sid]["m_file"]), sid)
+                failed = False
+            finally:
+                stream.close()
+                for gen in seg_gens:
+                    gen.close()
+                if failed:
+                    converter.kill()
+                    converter.wait()
+            if clock is None:
+                _finish(converter, "the RGB-to-source conversion", err)
+            else:
+                with clock.timing("convert_out_s"):
+                    _finish(converter, "the RGB-to-source conversion", err)
+        if os.path.getsize(spool) != size * len(replaced):
+            raise splice.CheckFailed("the spool for the window at {} holds {} bytes, not {}"
+                                     .format(lo, os.path.getsize(spool), size * len(replaced)))
+        with open(spool, "rb") as handle:
+            for n in range(lo + 1, hi + 1):
+                yield held[n] if mapping[n][0] == repair_plan.SRC else handle.read(size)
+    finally:
+        if os.path.exists(spool):
+            os.remove(spool)
+
+
+def run_native(source, pmap, frame_count, mapping, anchors, items, segments, master_path,
+               interpolator, fps, identity, workdir, crf=None, preset=None, threads=None,
+               sliced_threads=None, rc_lookahead=None, codec=None, bit_depth=None,
+               frame_threads=None, pools=None, encode_defaults=None, progress=None,
+               audio_source=None, scale=None, clock=None, armed=None, cap_note=None,
+               source_format=False, tensors=None, to_bytes=None):
+    """`frame_repair`'s full path as an encode — `decisions.md` §22. Writes the master; returns
+    what `run` returns. Raises `splice.CheckFailed` for anything the frame loop should be tried
+    for instead (§22b-1), `WorkerError` for what the frame loop would refuse too.
+
+    **ONE DECODE, IN THE SOURCE's OWN YUV, AND THREE THINGS AT ONCE** (§22a):
+
+        decoder ──(reader thread)──▶ queue ──▶ this loop ──▶ queue ──(writer thread)──▶ encoder
+                                                  │
+                                 a window's anchors ─▶ RGB ─▶ RIFE ─▶ YUV ─┘  (`_native_window`)
+
+    An untouched frame is the decoder's bytes, handed to the encoder unchanged: **it never
+    passes through RGB**. A codec or depth change is the encoder's own `format` filter, in YUV
+    (`splice.native_input`). The encoder is `encoder.MasterWriter` — the frame loop's, with its
+    settings resolved the same way (`_encode_setup`), so `threads`/`sliced_threads` reach it and
+    the encode fields read off it.
+
+    **The stage clock runs on this loop only**, so the stages partition its wall and never
+    overlap: `decode_s` is waiting on the decoder (and the anchors' conversion), `write_wait_s`
+    waiting on the encoder, `model_s` the RIFE time, `drain_s` the encoder's close. *The two
+    threads bank nothing.*
+    """
+    import encoder  # noqa: PLC0415 — GPU-box imports, like the rest of this path
+    import ladder  # noqa: PLC0415
+    import routec  # noqa: PLC0415
+    import splice  # noqa: PLC0415
+
+    tensors = tensors or routec._tensors  # noqa: SLF001 — retime's own conversion, by design
+    to_bytes = to_bytes or routec._to_rgb24_device  # noqa: SLF001
+    codec = encoder.resolve_codec(codec)
+    if len(mapping) != pmap.count:
+        raise splice.CheckFailed("the plan holds {} frames and the packet map {}".format(
+            len(mapping), pmap.count))
+    width, height = pmap.width, pmap.height
+    delivered_pixels = width * height
+    cap_here = ladder.max_delivered_frames(delivered_pixels)
+    if cap_note is not None:
+        cap_note.update(delivered_height=height, delivered_width=width,
+                        delivered_step=ladder.step_for(delivered_pixels),
+                        delivered_pixels=delivered_pixels, frame_cap_delivered=cap_here,
+                        n_out=frame_count)
+    if frame_count > cap_here:
+        raise WorkerError(
+            CAPACITY_EXCEEDED,
+            "this repair delivers {} frames and the limit for a {} frame is {}. This is the "
+            "SECOND cap test, on the {}x{} frame the packet map reads; reaching it means the "
+            "prober and the container disagree about the source's size.".format(
+                frame_count, ladder.step_for(delivered_pixels), cap_here, width, height))
+    peak_reset = routec._reset_peak()  # noqa: SLF001
+    n_synth = repair_plan.synthesised(mapping)
+    encode_settings, encode_crf, encode_preset, substituted, encode_arm = _encode_setup(
+        delivered_pixels, width, height, frame_count, codec, crf, preset, threads,
+        sliced_threads, rc_lookahead, frame_threads, pools, encode_defaults)
+    estimate = None
+    if progress is not None:
+        progress.plan_frames(frame_count)
+        estimate = routec._seed_estimate(  # noqa: SLF001 — retime's own seeding, by design
+            progress, source, {"n_out": frame_count, "n_synth": n_synth}, scale,
+            encode_arm, armed, substituted, delivered_pixels=delivered_pixels, codec=codec)
+    native = splice.native_input(pmap, encoder.pixel_format(bit_depth))
+    windows = native_windows(frame_count, items)
+    print("[native] {}x{} {} -> {} {}{}; {} window(s)".format(
+        width, height, pmap.pix_fmt, codec, native["pix_fmt_out"],
+        " via " + native["vf"] if native["vf"] else "", len(windows)), flush=True)
+    writer_cm = encoder.MasterWriter(
+        master_path, width, height, fps, identity,
+        audio_source=audio_source, audio_codec=source.get("audio_codec"),
+        audio_limit_s=source.get("video_duration_s"), codec=codec, bit_depth=bit_depth,
+        frame_threads=frame_threads, pools=pools, delivered_frames=frame_count,
+        crf=encode_crf, preset=encode_preset, source_format=source_format, native=native,
+        **encode_settings)
+    staging = routec.PinnedStaging() if hasattr(routec, "PinnedStaging") else None
+    size = pmap.frame_bytes
+    abort = threading.Event()
+    decoded = queue.Queue(maxsize=NATIVE_QUEUE_FRAMES)
+    encoding = queue.Queue(maxsize=NATIVE_QUEUE_FRAMES)
+    read_box = {"frames": 0, "error": None}
+    write_box = {"error": None}
+    if progress is not None:
+        progress.begin_phase()
+
+    def put(frame):
+        if clock is None:
+            ok = _put(encoding, frame, abort)
+        else:
+            with clock.timing("write_wait_s"):
+                ok = _put(encoding, frame, abort)
+        if not ok or write_box["error"] is not None:
+            raise write_box["error"] or splice.CheckFailed("the encoder's feed stopped")
+        if progress is not None:
+            try:
+                progress.frames(writer_cm.frames_written, phase="interpolate")
+            except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                print("[progress] frame emit failed at {} ({}: {})".format(
+                    writer_cm.frames_written, type(exc).__name__, exc), flush=True)
+
+    def get(n):
+        if clock is None:
+            item = _get(decoded, abort)
+        else:
+            with clock.timing("decode_s"):
+                item = _get(decoded, abort)
+        if item is _END:
+            if write_box["error"] is not None:
+                raise write_box["error"]
+            # **Short is the decoder disagreeing with the packets** (§19d). The frame loop
+            # decodes with a different reader, so it is tried rather than the job refused here.
+            raise splice.CheckFailed("the source decoded to {} frame(s) of {}{}".format(
+                n, frame_count, "; " + read_box["error"] if read_box["error"] else ""))
+        return item
+
+    with tempfile.TemporaryFile() as dec_err:
+        decoder = subprocess.Popen(splice.native_decoder(pmap), stdout=subprocess.PIPE,
+                                   stderr=dec_err)
+        _widen(decoder.stdout)
+        reader = threading.Thread(target=_reader, name="native-decode",
+                                  args=(decoder, size, decoded, abort, read_box), daemon=True)
+        feeder = threading.Thread(target=_writer, name="native-encode",
+                                  args=(writer_cm, encoding, abort, write_box), daemon=True)
+        try:
+            with routec._held_alive(progress), writer_cm:  # noqa: SLF001
+                try:
+                    reader.start()
+                    feeder.start()
+                    wi, active, held = 0, None, {}
+                    for n in range(frame_count):
+                        frame = get(n)
+                        sent = False
+                        if active is not None:
+                            # Inside a window: an untouched frame is held for the window's
+                            # order, a replaced one dropped (it is the damage).
+                            lo, hi = active
+                            if mapping[n][0] == repair_plan.SRC:
+                                held[n] = frame
+                            if n == hi:
+                                for out in _native_window(
+                                        pmap, lo, hi, held, mapping, anchors, segments,
+                                        interpolator, workdir, tensors, to_bytes, staging,
+                                        clock):
+                                    put(out)
+                                active, held = None, {}
+                            sent = True
+                        if wi < len(windows) and windows[wi][0] == n:
+                            # A window opens on its first anchor, which is sent now — or was
+                            # just sent as the previous window's last.
+                            active, held = windows[wi], {n: frame}
+                            wi += 1
+                        if not sent:
+                            put(frame)
+                    # **Every window fired and closed.** *One that never opened would have put
+                    # its damaged frames through as the decoder gave them, and the count, the
+                    # PTS and §19g would all pass.* Found in review.
+                    if wi != len(windows) or active is not None:
+                        raise splice.CheckFailed(
+                            "{} of {} window(s) ran{}".format(
+                                wi - (active is not None), len(windows),
+                                "; [{}, {}] never closed".format(*active) if active else ""))
+                    # **A decoder that runs long is §19d's disagreement too**: counted, not cut.
+                    if clock is None:
+                        tail = _get(decoded, abort)
+                    else:
+                        with clock.timing("decode_s"):
+                            tail = _get(decoded, abort)
+                    if tail is not _END:
+                        raise splice.CheckFailed(
+                            "the source decoded to more frames than its {} packets".format(
+                                frame_count))
+                    # **Joined as soon as its `_END` is in hand**: a reader that had queued it
+                    # and not yet returned would still read as alive in the `finally` below,
+                    # which would take a finished run for a failed one and kill the encoder
+                    # while it flushes. Found in review.
+                    reader.join()
+                    decoder.wait()
+                    if decoder.returncode != 0 or read_box["error"]:
+                        dec_err.seek(0)
+                        raise splice.CheckFailed("the decoder exited {}: {}".format(
+                            decoder.returncode, read_box["error"] or dec_err.read().decode(
+                                errors="replace").strip()[-300:]))
+                    if not _put(encoding, _END, abort):
+                        raise write_box["error"] or splice.CheckFailed(
+                            "the encoder's feed stopped")
+                    if clock is None:
+                        feeder.join()
+                    else:
+                        with clock.timing("write_wait_s"):
+                            feeder.join()
+                    if write_box["error"] is not None:
+                        raise write_box["error"]
+                finally:
+                    # **Every exit stops both threads before the writer closes**: the decoder is
+                    # killed so the reader's read returns, the encoder so the feeder's write
+                    # does. On success both have already ended and this only reaps.
+                    if reader.is_alive() or feeder.is_alive():
+                        abort.set()
+                        decoder.kill()
+                        proc = getattr(writer_cm, "_proc", None)
+                        if proc is not None and proc.poll() is None:
+                            proc.kill()
+                    # **Only a thread that started can be joined**: `join` on one that did not
+                    # raises, and would replace the failure being unwound. Found in review.
+                    if reader.ident is not None:
+                        reader.join()
+                    if feeder.ident is not None:
+                        feeder.join()
+            if progress is not None:
+                try:
+                    progress.phase("draining", force=True)
+                except Exception as exc:  # noqa: BLE001 — never at the cost of a master
+                    print("[progress] draining phase not emitted ({}: {})".format(
+                        type(exc).__name__, exc), flush=True)
+        finally:
+            # **The decoder is reaped here, on every exit** — including one that never reached
+            # the inner `finally` (a liveness context that raised on entry). Found in review.
+            try:
+                decoder.stdout.close()
+            except Exception:  # noqa: BLE001 — a close must never displace the failure
+                pass
+            if decoder.poll() is None:
+                decoder.kill()
+            decoder.wait()
+            if clock is not None:
+                banked = [d for d in (clock.drain_s, writer_cm.drain_s) if d is not None]
+                clock.drain_s = sum(banked) if banked else None
+            print("[encode] ffmpeg peak RSS {} GiB over {} frame(s)".format(
+                writer_cm.encoder_peak_rss_gb, writer_cm.frames_written), flush=True)
+            routec._print_write_distribution(writer_cm)  # noqa: SLF001
+    return dict(
+        n_in=frame_count,
+        n_out=writer_cm.frames_written,
+        n_synth=n_synth,
+        n_replaced=sum(1 for entry in mapping if entry[0] != repair_plan.SRC),
+        scale=scale,
+        peak_vram_gb=routec._read_peak(peak_reset),  # noqa: SLF001
+        decoder_threads=None,
+        convert_check=None,
+        input_check=None,
+        estimate=estimate,
+        encoder_peak_rss_gb=writer_cm.encoder_peak_rss_gb,
+        reference=None,
+        **routec._encode_fields(writer_cm))  # noqa: SLF001

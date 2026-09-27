@@ -418,6 +418,123 @@ def rgb_to_source(pmap, frames):
             "-f", "rawvideo", "-pix_fmt", pmap.pix_fmt]
 
 
+# ── §22: the full path as one span ───────────────────────────────────────────────────────────
+#
+# **A full re-encode is one span from frame 0 to the end** (`decisions.md` §22a): the whole file
+# decoded once in the source's own YUV, untouched frames straight to the encoder, replaced frames
+# through RGB with the source's matrix and range both ways. *No seam, so none of the copy's
+# constraints: the encoder keeps the preset's B-frames and references (§22a as amended), writes
+# MP4 directly, and only the PTS are held to the source's.* What cannot be planned for runs the
+# frame loop (§22b-1), and `native_decline` says why.
+
+#: What a writer's 8- or 10-bit output is when the source already has that layout: `yuvj420p`
+#: stays `yuvj420p` (the same bytes, full range), so no conversion runs at all.
+_SAME_LAYOUT = {("yuvj420p", "yuv420p"): "yuvj420p"}
+
+
+def native_decline(source, pmap):
+    """Why the native full path cannot take this source, or None (§22b-1).
+
+    **Every reason is a timeline the encode could not reproduce, or input it does not read**:
+    h264 in MP4/MOV at 4:2:0 (the copy's own list, `ELIGIBLE_*`); a time base whose inverse is a
+    whole timescale; a frame duration that is a whole number of ticks; and every PTS exactly on
+    that grid from the first. *The encoder is fed at the rate and placed with `-itsoffset`, so
+    its PTS are the grid: a source off the grid would fail `verify_pts` after the whole encode.*
+    """
+    if source.get("codec") not in ELIGIBLE_CODECS:
+        return "the source codec is {}, and the native path reads h264".format(
+            source.get("codec"))
+    if source.get("container") not in ELIGIBLE_CONTAINERS:
+        return "the source container is {}, not MP4 or MOV".format(source.get("container"))
+    if pmap.pix_fmt not in ELIGIBLE_PIX_FMTS:
+        return "the source pixel format is {}, not one of {}".format(
+            pmap.pix_fmt, ", ".join(ELIGIBLE_PIX_FMTS))
+    timescale = 1 / pmap.time_base
+    if timescale.denominator != 1:
+        return "the source's time base {} is not a whole timescale".format(pmap.time_base)
+    tick = 1 / (pmap.rate * pmap.time_base)
+    if tick.denominator != 1:
+        return "a frame at {} fps is {} ticks of {}, not a whole number".format(
+            pmap.rate, tick, pmap.time_base)
+    if pmap.pts0 < 0:
+        return "the source's first PTS is negative ({})".format(pmap.pts0)
+    for k, row in enumerate(pmap.frames):
+        if row[0] != pmap.pts0 + k * tick.numerator:
+            return ("the source's PTS leave the {}-tick grid at frame {} ({} where {} was "
+                    "expected)".format(tick.numerator, k, row[0], pmap.pts0 + k * tick.numerator))
+    return None
+
+
+def native_input(pmap, pix_fmt_out):
+    """`encoder.MasterWriter`'s `native` block for this source (§22a).
+
+    `pix_fmt_out` is `encoder.pixel_format` of the requested depth. **The source's own layout is
+    kept where it is the same** (`_SAME_LAYOUT`); otherwise the change is a `format` in the
+    encoder's filter graph, in YUV, with the range stated on both sides so a full-range source is
+    not squeezed. The output carries the source's colour tags — a full-range source's `pc` said
+    explicitly, since a converted `yuv420p10le` carries no range of its own."""
+    out = _SAME_LAYOUT.get((pmap.pix_fmt, pix_fmt_out), pix_fmt_out)
+    _, rng = pmap.matrix()
+    vf = None
+    if out != pmap.pix_fmt:
+        vf = "scale=in_range={0}:out_range={0},format={1}".format(rng, out)
+    output_args = []
+    for key, flag in (("color_space", "-colorspace"), ("color_primaries", "-color_primaries"),
+                      ("color_transfer", "-color_trc")):
+        value = pmap.stream.get(key)
+        if value and value != "unknown":
+            output_args += [flag, str(value)]
+    tagged = pmap.stream.get("color_range")
+    if rng == "pc" or (tagged and tagged != "unknown"):
+        output_args += ["-color_range", rng]
+    output_args += ["-video_track_timescale", str((1 / pmap.time_base).numerator)]
+    lead = pmap.pts0 * pmap.time_base
+    return {"pix_fmt": pmap.pix_fmt, "frame_bytes": pmap.frame_bytes, "pix_fmt_out": out,
+            "vf": vf, "input_args": ["-itsoffset", "{:.9f}".format(float(lead))] if lead else [],
+            "output_args": output_args}
+
+
+def native_decoder(pmap):
+    """The argv that decodes the whole source, every frame once, in its own pixel format.
+    **Uncapped**, so a decoder that runs long is counted rather than cut (§19d)."""
+    return [FFMPEG, "-v", "error", "-nostdin", "-i", pmap.path, "-map", "0:v:0",
+            "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", pmap.pix_fmt, "-"]
+
+
+def yuv_to_rgb(pmap, frames):
+    """The argv that turns `frames` raw frames of the source's pixel format on stdin into
+    cv2-layout BGR — `rgb_decoder`'s conversion, with the same explicit matrix and range, fed
+    from frames the native decode already holds rather than from a second decode."""
+    matrix, rng = pmap.matrix()
+    return [FFMPEG, "-v", "error", "-y", "-nostdin", "-f", "rawvideo", "-pix_fmt", pmap.pix_fmt,
+            "-s", "{}x{}".format(pmap.width, pmap.height), "-i", "-", "-frames:v", str(frames),
+            "-vf", "scale=in_color_matrix={}:in_range={},format=bgr24".format(matrix, rng),
+            "-f", "rawvideo", "-pix_fmt", "bgr24"]
+
+
+def verify_pts(master_path, pmap):
+    """§22a's added line on the full path: the master's time base and every PTS equal to the
+    source's, tick for tick. **Not the DTS** (§22a as amended: B-frames stay). Raises
+    `CheckFailed`."""
+    data = _probe_json(["-select_streams", "v:0", "-show_entries",
+                        "stream=time_base:packet=pts", master_path],
+                       "reading the master's timestamps", CheckFailed)
+    stream = (data.get("streams") or [{}])[0]
+    if Fraction(stream.get("time_base") or "0/1") != pmap.time_base:
+        raise CheckFailed("time base {} against the source's {}".format(
+            stream.get("time_base"), pmap.time_base))
+    try:
+        got = sorted(int(p["pts"]) for p in data.get("packets") or ())
+    except (KeyError, TypeError, ValueError):
+        raise CheckFailed("a master packet carries no PTS")
+    want = [row[0] for row in pmap.frames]
+    if got != want:
+        first = next((i for i, (g, w) in enumerate(zip(got, want)) if g != w),
+                     min(len(got), len(want)))
+        raise CheckFailed("{} PTS against the source's {}; the first difference is at frame {}"
+                          .format(len(got), len(want), first))
+
+
 # ── the join and the mux ─────────────────────────────────────────────────────────────────────
 
 def join(pmap, files, workdir):
