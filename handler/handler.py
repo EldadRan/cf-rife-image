@@ -626,7 +626,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     # **The request field is read BEFORE the module is imported**, which is §2g-1's third
     # constraint and the only part of it that survived: a job nobody asked pays not one module
     # read. `request.get` is a dict lookup; the sweep behind it is a billion comparisons.
-    _seed_early(request, progress, trace, planned_frames, source["width"], source["height"])
+    _seed_early(request, progress, trace, planned_frames, source["width"], source["height"],
+                source_bytes=_size_or_none(source_path) or 0)
     if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — see above; the import IS the cost being avoided
 
@@ -881,7 +882,8 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     return _decorate(response, machine, [], warnings, progress, started)
 
 
-def _seed_early(request, progress, trace, frames, width, height, repair_seed=None):
+def _seed_early(request, progress, trace, frames, width, height, repair_seed=None,
+                source_bytes=0):
     """§23: an ETA from the moment the plan exists, not from the first frame's seed.
 
     **The caller sees the job through `next_poll_s`, and the payloads before the encode — the
@@ -908,7 +910,7 @@ def _seed_early(request, progress, trace, frames, width, height, repair_seed=Non
     except Exception as exc:  # noqa: BLE001 — an ETA must never cost a delivery
         print("[eta] not seeded before the load ({}: {})".format(type(exc).__name__, exc),
               flush=True)
-    _price_derives(request, progress, trace, frames, width, height)
+    _price_derives(request, progress, trace, frames, width, height, source_bytes)
 
 
 def _seed_repair(progress, source, frames, source_path, planned, request=None):
@@ -928,7 +930,8 @@ def _seed_repair(progress, source, frames, source_path, planned, request=None):
         encoded_frames=sum(end - start for start, end, _ in spans) if copy else None)
     derives = 0.0
     if (request or {}).get("derive"):
-        derives = ladder.derive_expected(frames, source["width"], source["height"])["added_s"]
+        derives = ladder.derive_expected(frames, source["width"], source["height"],
+                                         os.path.getsize(source_path))["added_s"]
     first = ladder.repair_first_s(work, derives)
     progress.expect((first - derives) / float(frames), basis=ladder.REPAIR_BASIS)
     print("[eta] repair seed {} s for the {} path (§26a: work {:.1f} s, derives {:.1f} s)".format(
@@ -950,7 +953,7 @@ def _plan_copy(source_path, items):
         return {"error": exc}
 
 
-def _price_derives(request, progress, trace, frames, width, height):
+def _price_derives(request, progress, trace, frames, width, height, source_bytes=0):
     """§23: the derives the request asked for, priced into every ETA the job publishes — their
     predicted wall less the master upload's, which hides the rest since §21
     (`ladder.derive_expected`). Filed as `estimate.derives` so a record can grade the pricing
@@ -958,7 +961,8 @@ def _price_derives(request, progress, trace, frames, width, height):
     if not request.get("derive"):
         return
     try:
-        priced = ladder.derive_expected(frames, width, height)
+        # §26h: the master at the one estimate, from the source's bytes.
+        priced = ladder.derive_expected(frames, width, height, source_bytes)
         progress.expect_derives(priced["added_s"])
         _note(trace, "estimate", "derives", priced)
         print("[eta] derives {} s expected against a {} s master upload: {} s added to the "
@@ -1858,7 +1862,8 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     # re-encodes — its spans, planned above.*
     _seed_early(request, progress, trace, frame_count, source["width"], source["height"],
                 repair_seed=lambda: _seed_repair(progress, source, frame_count, source_path,
-                                                 planned, request))
+                                                 planned, request),
+                source_bytes=source_block.get("bytes") or 0)
     if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — the import IS the cost being avoided, as in _retime
 

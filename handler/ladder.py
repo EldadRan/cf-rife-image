@@ -438,27 +438,23 @@ def derived_pools(delivered_height):
 DERIVE_S_PER_FRAME_FLOOR = 2.085 / 225
 DERIVE_S_PER_PIXEL_FRAME = 42.57 / (1200 * 7680 * 4320)
 
-#: **The master's size before it exists, for the upload's expected seconds — the SMALLEST real
-#: master per pixel-frame in `records/`**: 8K h265 retimes at 445,075,813 bytes for 480 frames
-#: (0.0279 B per pixel-frame; h264 8K runs 0.047, a repair master 0.091). *The smaller the master,
-#: the less upload there is to hide the derives behind, so the smallest is the estimate that
-#: cannot run short.* The fixtures' flat test patterns compress far below any real clip and are
-#: not a master anyone uploads.
-MASTER_BYTES_PER_PIXEL_FRAME_LOW = 445075813 / (480 * 7680 * 4320)
-
-
-def derive_expected(frames, width, height):
+def derive_expected(frames, width, height, source_bytes=0):
     """§23 for a master of `frames` at `width` x `height`: `{derive_expected_s,
     upload_expected_s, added_s}` — the derives' predicted wall, the master upload's predicted
     wall at `UPLOAD_PARALLEL_BYTES_PER_S` (§26i), and what the ETA takes: `max(0, derive -
     upload)`. **Pure.**
+
+    **The master's size is §26h's ONE estimate** (`master_bytes_estimate`), from the source's
+    bytes — *it replaced a per-pixel constant of this function's own (the smallest real master,
+    ~279 MB at 4K x 1,205, where Suite 17's was 480 MB): one estimate wherever a master's size is
+    predicted, the disk check included.*
     """
     pixels = int(width) * int(height)
     frames = int(frames)
     derive = frames * max(DERIVE_S_PER_FRAME_FLOOR, pixels * DERIVE_S_PER_PIXEL_FRAME)
     # **§26i (b), the gate's ruling: the master's upload at the PARALLEL rate** — one stream's
     # 13.1 MB/s hid every derive behind an upload that now takes seconds.
-    upload = frames * pixels * MASTER_BYTES_PER_PIXEL_FRAME_LOW / UPLOAD_PARALLEL_BYTES_PER_S
+    upload = master_bytes_estimate(pixels, frames, source_bytes) / UPLOAD_PARALLEL_BYTES_PER_S
     return {"derive_expected_s": round(derive, 3), "upload_expected_s": round(upload, 3),
             "added_s": round(max(0.0, derive - upload), 3)}
 
@@ -516,12 +512,20 @@ def repair_first_s(work_s, derives_s=0.0):
     return max(REPAIR_FLOOR_S, int(math.ceil(float(work_s) + float(derives_s or 0.0))))
 
 
-def repair_master_bytes(pixels, frames, source_bytes, path):
-    """§26g's expected master for the disk check: **twice the source's bytes on the copy path**
-    (§26h: the splice writes its parts before joining them, up to about twice the source); on the
-    full path the larger of the source's bytes and 0.05 MB x MP x frames. **Pure.**"""
-    source_bytes = int(source_bytes or 0)
-    if path == "copy":
-        return REPAIR_COPY_MASTER_FACTOR * source_bytes
-    return max(source_bytes,
+def master_bytes_estimate(pixels, frames, source_bytes):
+    """**§26h: THE master size, wherever one is predicted before it exists** — the disk check,
+    §23's derive term — on both operations: the larger of the source's bytes and 0.05 MB per
+    megapixel-frame. **Pure.**"""
+    return max(int(source_bytes or 0),
                int(REPAIR_MASTER_MB_PER_MP_FRAME * 1e6 * int(pixels) / 1e6 * int(frames)))
+
+
+def repair_master_bytes(pixels, frames, source_bytes, path):
+    """§26g's expected master for the disk check: `master_bytes_estimate` on the full path; on
+    the copy path **the larger of twice the source's bytes and that estimate** (§26h: the splice
+    writes its parts before joining them, up to about twice the source — and K4: a copy that
+    fails at run time falls back to the full path and writes ITS master). **Pure.**"""
+    full = master_bytes_estimate(pixels, frames, source_bytes)
+    if path == "copy":
+        return max(REPAIR_COPY_MASTER_FACTOR * int(source_bytes or 0), full)
+    return full

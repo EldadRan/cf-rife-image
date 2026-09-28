@@ -63,8 +63,9 @@ transparent pixel is refused. The disk is checked twice, each with 10% to spare:
 before any file's body is fetched, for every listed file's size (from a ranged probe) plus the
 source's again as the master's floor; and after the source's probe, for the files still to come
 plus the master at its path's estimate — the larger of the source's size and 0.05 MB per
-megapixel-frame on the full path, twice the source's size on the copy path, whose parts are written
-before they are joined. A video whose rate or size differs from the source's, or a still of
+megapixel-frame on the full path, and on the copy path the larger of that and twice the source's
+size, since a copy writes its parts before joining them and can fall back to the full path. The
+same size estimate prices the master's upload inside the ETA's derive term. A video whose rate or size differs from the source's, or a still of
 another size, is refused `sources_mismatch`, and a range past a video's end
 `segment_exceeds_source`; neither is retryable. This is `handler/repair_files.py`.
 
