@@ -34,14 +34,26 @@ from errors import (FIELD_NOT_SUPPORTED, INVALID_FIELD_VALUE, MISSING_REQUIRED_F
 #: not at risk: N parts in flight hold ~N x P of buffers — 8 x 32 MiB is 256 MiB against 46-116 GB
 #: hosts whose peaks since §22 are 11-24 GB.* **N bounds the parts HELD IN MEMORY too**
 #: (`max_in_memory_upload_chunks`, which s3transfer otherwise caps at 10 whatever N is — so an arm
-#: of 16 or 32 ran 10 and filed its own number; found in review), plus the one being read. **PROVISIONAL**: Suite 16's sweep sets the ruled
-#: default (the fastest arm whose added host memory stays under 1 GB). The request's debug fields
-#: `upload_concurrency` / `upload_part_mb` move it for the sweep and nothing else. *A part is MiB —
-#: the unit the fixed 32 MiB part it replaces was written in — and is recorded in bytes.*
-UPLOAD_CONCURRENCY_DEFAULT = 8
-UPLOAD_PART_MB_DEFAULT = 32
+#: of 16 or 32 ran 10 and filed its own number; found in review), plus the one being read.
+#: **§25b: RULED 16 x 64 MiB by Suite 16's sweep** — 14.6 s at 8K against 33.5 s for 8 x 32; *17
+#: parts of 64 MiB bound the buffers at ~1.09 GB, the memory rule's edge, stated in the section.*
+#: The request's debug fields `upload_concurrency` / `upload_part_mb` move it for a sweep and
+#: nothing else. *A part is MiB and is recorded in bytes.*
+UPLOAD_CONCURRENCY_DEFAULT = 16
+UPLOAD_PART_MB_DEFAULT = 64
 UPLOAD_CONCURRENCY_MIN, UPLOAD_CONCURRENCY_MAX = 1, 32
 UPLOAD_PART_MB_MIN, UPLOAD_PART_MB_MAX = 8, 256
+
+#: **§25a: THE SOURCE IS FETCHED IN PARALLEL RANGES** — N streams of P MiB written in place, every
+#: range held to the probe's ETag. **PROVISIONAL**: Suite 17 sweeps 1 / 8 / 16 and rules it by
+#: §24's rule. `fetch_concurrency` / `fetch_part_mb` move it for the sweep; `fetch_sha256` hashes
+#: the finished source into the record so the kit can prove the reassembly byte-exact. **A source
+#: under `FETCH_RANGED_MIN_MB` is fetched as one stream**, as it always was.
+FETCH_CONCURRENCY_DEFAULT = 8
+FETCH_PART_MB_DEFAULT = 32
+FETCH_CONCURRENCY_MIN, FETCH_CONCURRENCY_MAX = 1, 32
+FETCH_PART_MB_MIN, FETCH_PART_MB_MAX = 8, 256
+FETCH_RANGED_MIN_MB = 64
 
 
 #: **`source` means "match the input's codec"**, which is a release-3 field and not a default.

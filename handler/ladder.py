@@ -450,3 +450,50 @@ def derive_expected(frames, width, height):
     upload = frames * pixels * MASTER_BYTES_PER_PIXEL_FRAME_LOW / UPLOAD_BYTES_PER_S
     return {"derive_expected_s": round(derive, 3), "upload_expected_s": round(upload, 3),
             "added_s": round(max(0.0, derive - upload), 3)}
+
+
+# ── §25c: A REPAIR's OWN FIRST ETA ──────────────────────────────────────────────────────────────
+#
+# **Retime's table priced a repair at 1.0 s x 1,200 frames = 1,200 s at 8K, where the same request
+# delivers in 211-420 s since §20-§24** (F-2026-09-27-3). *PROVISIONAL, AND THE SECTION SAYS SO:
+# Suite 17 recalibrates every number below.* The frame LIMITS stay retime's table.
+#: `(pixels above, s/frame)`, the first row that matches. 8K reads 0.128 (L40S) - 0.184 (A40) at
+#: 32 threads, 4K 0.081 - 0.101 at 16; the last row is a placeholder (720p read 0.011, 1080p none).
+REPAIR_RATE_BY_AREA = ((8.3e6, 0.15), (2.1e6, 0.10), (0.0, 0.03))
+#: The copy path's term per source MB, as §25c states it.
+REPAIR_COPY_S_PER_MB = 0.027
+REPAIR_UPLOAD_MB_PER_S = 200.0
+#: A full path's master is at least this per megapixel-frame, or the source's size if larger.
+REPAIR_MASTER_MB_PER_MP_FRAME = 0.1
+REPAIR_FIXED_S = 5.0
+#: `eta_basis` as `progress.expect` publishes it: "predicted_" + this.
+REPAIR_BASIS = "repair_v1"
+
+
+def repair_rate(pixels):
+    """§25c's R(area): seconds per encoded frame. **Pure.**"""
+    return next(rate for above, rate in REPAIR_RATE_BY_AREA if pixels > above)
+
+
+def repair_seed(pixels, frames, source_bytes, path, encoded_frames=None):
+    """§25c's first ETA for a repair, in seconds, WITHOUT §23's derive term (the progress channel
+    adds that to every ETA it publishes). **Pure.**
+
+        first_s = 5 + encode + upload [+ derives]
+        encode  full: frames x R      copy: encoded_frames x R + source MB x 0.027
+        upload  master MB / 200       copy: the source's bytes
+                                      full: max(the source's bytes, 0.1 MB x MP x frames)
+
+    **MB and MP are 10^6** — the units the section's rates were measured in, and the kit's
+    restatement (`record_witness.repair_seed`) reads them the same way.
+    """
+    pixels, frames = int(pixels), int(frames)
+    source_mb = float(source_bytes) / 1e6
+    rate = repair_rate(pixels)
+    if path == "copy":
+        encode = int(encoded_frames or 0) * rate + source_mb * REPAIR_COPY_S_PER_MB
+        master_mb = source_mb
+    else:
+        encode = frames * rate
+        master_mb = max(source_mb, REPAIR_MASTER_MB_PER_MP_FRAME * pixels / 1e6 * frames)
+    return REPAIR_FIXED_S + encode + master_mb / REPAIR_UPLOAD_MB_PER_S

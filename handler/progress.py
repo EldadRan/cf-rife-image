@@ -242,6 +242,10 @@ class Progress:
         if ladder:
             self._eta_ladder = str(ladder)
 
+    def seed_basis(self):
+        """The basis of the seeded rate as `expect` normalised it ("predicted_…"), or None."""
+        return self._expected_basis
+
     def expect_derives(self, added_s):
         """§23: the derives' exposed seconds, added to every ETA this job publishes from now on.
         `None` or zero adds nothing. Never raises."""

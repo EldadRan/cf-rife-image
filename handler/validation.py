@@ -204,9 +204,13 @@ PARAMS_DEBUG = (
     # plan as the ruled answer before the benchmark that decides it has run.
     "snap_tolerance",
     # **§24: Suite 16's sweep of the upload's parts**, both operations, and for that and nothing
-    # else. Absent means `storage`'s provisional default.
+    # else. Absent means `storage`'s ruled default.
     "upload_concurrency",
     "upload_part_mb",
+    # §25a: the fetch's ranges, and the source's hash, for Suite 17. Both operations.
+    "fetch_concurrency",
+    "fetch_part_mb",
+    "fetch_sha256",
 )
 
 #: **`frame_repair`'s own `params`** (§19c). *Each operation owns its list, and a name belonging
@@ -241,9 +245,12 @@ REPAIR_PARAMS_DEBUG = (
     "threads",
     "sliced_threads",
     "rc_lookahead",
-    # §24, as on retime.
+    # §24 and §25a, as on retime.
     "upload_concurrency",
     "upload_part_mb",
+    "fetch_concurrency",
+    "fetch_part_mb",
+    "fetch_sha256",
 )
 
 #: §19e's roles and the fields each takes — **the ffmpeg service's, `ffmpeg@9d7495b`
@@ -665,24 +672,31 @@ def validate(job_input):
     reference_score = (False if reference_score is None
                        else _as_bool(reference_score, "reference_score"))
 
-    # ── §24: the upload's parts, range-checked here and resolved in `storage` ─────────────────
+    # ── §24 / §25a: the upload's parts and the fetch's ranges, range-checked here and resolved
+    # in `storage` ────────────────────────────────────────────────────────────────────────────
     upload_fields = {}
-    for name, low, high in (("upload_concurrency", envelope.UPLOAD_CONCURRENCY_MIN,
-                             envelope.UPLOAD_CONCURRENCY_MAX),
-                            ("upload_part_mb", envelope.UPLOAD_PART_MB_MIN,
-                             envelope.UPLOAD_PART_MB_MAX)):
+    for name, low, high, default, sweep in (
+            ("upload_concurrency", envelope.UPLOAD_CONCURRENCY_MIN,
+             envelope.UPLOAD_CONCURRENCY_MAX, envelope.UPLOAD_CONCURRENCY_DEFAULT,
+             "Suite 16's upload sweep (decisions.md §24)"),
+            ("upload_part_mb", envelope.UPLOAD_PART_MB_MIN, envelope.UPLOAD_PART_MB_MAX,
+             envelope.UPLOAD_PART_MB_DEFAULT, "Suite 16's upload sweep (decisions.md §24)"),
+            ("fetch_concurrency", envelope.FETCH_CONCURRENCY_MIN,
+             envelope.FETCH_CONCURRENCY_MAX, envelope.FETCH_CONCURRENCY_DEFAULT,
+             "Suite 17's fetch sweep (decisions.md §25a)"),
+            ("fetch_part_mb", envelope.FETCH_PART_MB_MIN, envelope.FETCH_PART_MB_MAX,
+             envelope.FETCH_PART_MB_DEFAULT, "Suite 17's fetch sweep (decisions.md §25a)")):
         value = params.get(name)
         if value is not None:
             value = _as_int(value, name)
             if not low <= value <= high:
                 raise WorkerError(
                     INVALID_FIELD_VALUE,
-                    "field '{}' must be within {}-{}, got {}. It is Suite 16's upload sweep "
-                    "(decisions.md §24); send nothing for this worker's default of {}.".format(
-                        name, low, high, value,
-                        envelope.UPLOAD_CONCURRENCY_DEFAULT if name == "upload_concurrency"
-                        else envelope.UPLOAD_PART_MB_DEFAULT))
+                    "field '{}' must be within {}-{}, got {}. It is {}; send nothing for this "
+                    "worker's default of {}.".format(name, low, high, value, sweep, default))
         upload_fields[name] = value
+    fetch_sha256 = params.get("fetch_sha256")
+    fetch_sha256 = False if fetch_sha256 is None else _as_bool(fetch_sha256, "fetch_sha256")
 
     rc_lookahead = params.get("rc_lookahead")
     if rc_lookahead is not None:
@@ -902,6 +916,10 @@ def validate(job_input):
         # §24: None where the caller sent nothing — `storage.upload_settings` fills the default.
         "upload_concurrency": upload_fields["upload_concurrency"],
         "upload_part_mb": upload_fields["upload_part_mb"],
+        # §25a: None where the caller sent nothing — `storage.fetch_settings` fills the default.
+        "fetch_concurrency": upload_fields["fetch_concurrency"],
+        "fetch_part_mb": upload_fields["fetch_part_mb"],
+        "fetch_sha256": fetch_sha256,
         "convert_check": convert_check,
         "tie_check": tie_check,
         "input_check": input_check,

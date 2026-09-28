@@ -122,10 +122,20 @@ encode are one streaming loop — the writer pulls each frame through the whole 
 repair that copies counts a copied run as done the moment it is cut, and each re-encoded frame as
 it reaches its span's encoder.
 
-Every upload — the master, the derives, the reference PNGs — goes up in parallel parts: 8 parts
-of 32 MiB in flight by default (`handler/storage.py`, provisional until Suite 16's sweep), movable
-by the debug fields `upload_concurrency` and `upload_part_mb`. A part that fails fails the upload
-and the multipart upload is aborted; an abort that fails too is said in the error.
+Every upload — the master, the derives, the reference PNGs — goes up in parallel parts: 16 parts
+of 64 MiB in flight by default (`handler/envelope.py`, ruled from Suite 16's sweep), movable by the
+debug fields `upload_concurrency` and `upload_part_mb`. A part that fails fails the upload and the
+multipart upload is aborted; an abort that fails too is said in the error.
+
+The source, and every segment, comes down in parallel ranges: a `Range: bytes=0-0` probe must
+answer 206 with a total size and a strong ETag, and then 8 streams of 32 MiB (provisional until
+Suite 17's sweep) write each slice in place into a pre-sized file. Every range carries `If-Match`
+with the probe's ETag, so a source replaced mid-fetch fails rather than being stitched from two
+versions; a slice is tried three times before the job fails `source_fetch_failed`, and the
+finished size must equal the probe's total. A server that refuses the probe, or a source under
+64 MB, is fetched as one stream, and the record says why (`transfer.fetch_mode_reason`). The debug
+fields `fetch_concurrency`, `fetch_part_mb` and `fetch_sha256` move it; the last hashes the
+fetched source into `transfer.fetch_sha256`.
 
 The ETA exists from the moment the frame plan does, before the model loads, and it includes the
 part of any requested derives that the master's upload does not hide. `next_poll_s` never asks for
@@ -133,6 +143,12 @@ longer than that ETA, and never less than 5 seconds. A repair's h264 encode abov
 runs 32 x264 threads, not sliced, as Suite 14's sweep measured; every other row is unchanged, and
 the request's debug fields still override. The rates live in `handler/ladder.py`
 (`derive_expected`) and `handler/encoder.py` (`REPAIR_AREA_DEFAULTS`).
+
+A repair's first ETA is its own, not retime's table: `5 + encode + upload` plus the derives' exposed
+part, published once the path is known, with `eta_basis` `predicted_repair_v1`. The encode is
+priced per frame by frame area (per re-encoded frame, plus a term per source MB, on the copy
+path), and the upload from the expected master size. The rates are provisional until Suite 17
+and live in `handler/ladder.py` (`repair_seed`). Retime keeps its table.
 
 ## Tests
 

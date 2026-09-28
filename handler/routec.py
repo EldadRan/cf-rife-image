@@ -1597,6 +1597,11 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
     # **The ladder is a dict lookup and the fit is a model**, so the cheap, ruled, always-present
     # answer is published first and the fit refines nothing that this already said.
     seed, step, priced_by_table = None, None, False
+    # **§25c: A REPAIR SEEDED FROM ITS OWN FORMULA KEEPS IT.** *`handler._seed_repair` set the rate
+    # before the load; re-seeding here from retime's table would put the 3x-high ETA
+    # (F-2026-09-27-3) back on every payload after the first.* **The estimate is still computed
+    # and returned for the record, and the phase still published; only the rate is left alone.**
+    held = _holds_repair_seed(progress)
     try:
         seed, step = ladder.seconds_per_frame(
             delivered_pixels, stats.get("n_out"), codec=codec)
@@ -1605,7 +1610,10 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # `observed` ETA.* Not reachable from today's rows; the condition is the one `expect`
         # actually applies.
         priced_by_table = seed is not None and seed > 0
-        if priced_by_table:
+        if held:
+            print("[eta] the repair's own seed stands (§25c); the table does not re-seed it",
+                  flush=True)
+        elif priced_by_table:
             # **THE BASIS GOES ON *THIS* CALL AND THE FIRST DRAFT PUT IT ONLY ON THE REPUBLISH.**
             # *This one is inside the same `try` as the fit, and it is the seed that survives when
             # the fit RAISES — so on exactly the runs where the ruled table is the ONLY pricer,
@@ -1695,12 +1703,13 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # of the first two delivered runs: `predicted_estimator_v3/crf12` beside 26 s at 1080p,
         # which is 225 x 0.115, and beside 1440 s at 8K, which is 1500 x 0.96. *`estimate.time.
         # basis` is a corpus key, so every row claimed a pricer that did not price it.*
-        progress.expect(seed if priced_by_table else per_frame,
-                        basis=(ladder.basis_for((encode_arm or {}).get("crf"))
-                               if priced_by_table
-                               else (estimate or {}).get("basis") or estimator.BASIS),
-                        band_frac=(estimate or {}).get("band_frac"),
-                        ladder=step if priced_by_table else None)
+        if not held:
+            progress.expect(seed if priced_by_table else per_frame,
+                            basis=(ladder.basis_for((encode_arm or {}).get("crf"))
+                                   if priced_by_table
+                                   else (estimate or {}).get("basis") or estimator.BASIS),
+                            band_frac=(estimate or {}).get("band_frac"),
+                            ladder=step if priced_by_table else None)
         # **PUBLISHED HERE, and without this line the seed is unreachable.** `eta_s()` answers
         # from `_seconds_per_frame` whenever it exists, and route C sets it on the FIRST written
         # frame — every frame is a boundary on a one-frame-at-a-time stream — before that frame's
@@ -1748,6 +1757,16 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
                 print("[eta] OUTSIDE THE CORPUS: {}".format(sentence), flush=True)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _holds_repair_seed(progress):
+    """Whether `progress` carries §25c's repair seed. **Never raises.**"""
+    import ladder  # noqa: PLC0415
+
+    try:
+        return str(progress.seed_basis() or "").startswith("predicted_" + ladder.REPAIR_BASIS)
+    except Exception:  # noqa: BLE001 — a Progress without the method holds no repair seed
+        return False
 
 
 def _reset_peak():

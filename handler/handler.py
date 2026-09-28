@@ -449,14 +449,20 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         print("[progress] fetching phase not emitted ({}: {})".format(
             type(exc).__name__, exc), flush=True)
     fetch_started = time.time()
+    fetch_stats = {}
+    fetch_conf = storage.fetch_settings(request)
     try:
         fetch_bytes = storage.fetch_source(
             request["source_url"], download,
             on_bytes=_byte_reporter(progress, "fetching",
-                                    bytes_per_s=ladder.FETCH_BYTES_PER_S))
+                                    bytes_per_s=ladder.FETCH_BYTES_PER_S),
+            settings=fetch_conf, stats=fetch_stats)
     finally:
         _note(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))
+        # §25a: how it was attempted, filed on failure too (found in review).
+        _note_fetch(trace, fetch_stats)
     _note(trace, "transfer", "fetch_bytes", fetch_bytes)
+    _hash_source(trace, fetch_conf, download)
     extension = probe.detect_extension(download)
     source_path = probe.named_with_extension(download, extension)
     source = probe.probe_source(source_path)
@@ -864,7 +870,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     return _decorate(response, machine, [], warnings, progress, started)
 
 
-def _seed_early(request, progress, trace, frames, width, height):
+def _seed_early(request, progress, trace, frames, width, height, repair_seed=None):
     """§23: an ETA from the moment the plan exists, not from the first frame's seed.
 
     **The caller sees the job through `next_poll_s`, and the payloads before the encode — the
@@ -873,18 +879,56 @@ def _seed_early(request, progress, trace, frames, width, height):
     T2c). *The seed is the ruled table's, exactly what `routec._seed_estimate` sets again later
     with the estimator's band beside it*; the derives' exposed part is priced here too
     (`_price_derives`). **Never raises**: without it the job behaves as before.
+
+    **§25c: a repair passes `repair_seed`** (`_seed_repair`, bound to its inputs) and is seeded
+    from its own formula instead of the table; `routec._seed_estimate` then leaves that rate
+    alone. *A repair seed that raises leaves no seed, and the table seeds it later as before.*
     """
     try:
         progress.plan_frames(frames)
-        crf = request.get("crf") if request.get("crf") is not None else encoder.DEFAULT_CRF
-        seed, step = ladder.seconds_per_frame(int(width) * int(height), frames,
-                                              codec=request["release_3"]["codec"])
-        if seed is not None and seed > 0:
-            progress.expect(seed, basis=ladder.basis_for(crf), ladder=step)
+        if repair_seed is not None:
+            repair_seed()
+        else:
+            crf = request.get("crf") if request.get("crf") is not None else encoder.DEFAULT_CRF
+            seed, step = ladder.seconds_per_frame(int(width) * int(height), frames,
+                                                  codec=request["release_3"]["codec"])
+            if seed is not None and seed > 0:
+                progress.expect(seed, basis=ladder.basis_for(crf), ladder=step)
     except Exception as exc:  # noqa: BLE001 — an ETA must never cost a delivery
         print("[eta] not seeded before the load ({}: {})".format(type(exc).__name__, exc),
               flush=True)
     _price_derives(request, progress, trace, frames, width, height)
+
+
+def _seed_repair(progress, source, frames, source_path, planned):
+    """§25c: seed a repair's ETA from its own formula (`ladder.repair_seed`) — the copy's when
+    `planned` holds the copy's spans, the full path's otherwise. **Raises** on a missing input;
+    the callers catch it. *The source's bytes are the source file's alone, as the section says —
+    a segment's are not the source's.*"""
+    pixels = int(source["width"]) * int(source["height"])
+    spans = (planned or {}).get("spans")
+    copy = spans is not None
+    seconds = ladder.repair_seed(
+        pixels, frames, os.path.getsize(source_path), "copy" if copy else "full",
+        encoded_frames=sum(end - start for start, end, _ in spans) if copy else None)
+    progress.expect(seconds / float(frames), basis=ladder.REPAIR_BASIS)
+    print("[eta] repair seed {:.1f} s for the {} path (§25c)".format(
+        seconds, "copy" if copy else "full"), flush=True)
+
+
+def _plan_copy(source_path, items):
+    """§20c's spans, planned BEFORE the load so §25c's seed can count the frames a copy
+    re-encodes: `{"pmap", "spans", "delay"}`, or `{"error": exc}` — which `_repair_copy` raises
+    inside its own `try`, so a decline falls back exactly as it did when it was planned there."""
+    import splice  # noqa: PLC0415 — stdlib and ffmpeg only; imported where it is used
+
+    try:
+        pmap = splice.PacketMap(source_path)
+        spans, delay = splice.plan(pmap, [{"id": i["id"], "a": i["a"], "b": i["b"]}
+                                          for i in items])
+        return {"pmap": pmap, "spans": spans, "delay": delay}
+    except Exception as exc:  # noqa: BLE001 — carried to `_repair_copy`, which classifies it
+        return {"error": exc}
 
 
 def _price_derives(request, progress, trace, frames, width, height):
@@ -1130,7 +1174,7 @@ def _no_clock():
     yield
 
 
-def _fetch_into(url, destination, trace, progress, what="source"):
+def _fetch_into(url, destination, trace, progress, what="source", request=None):
     """Fetch one file for a repair — the source or a segment — `_retime`'s fetch, as a function.
 
     **The same `storage.fetch_source`, the same phase and the same throttled byte reports**, and
@@ -1138,6 +1182,10 @@ def _fetch_into(url, destination, trace, progress, what="source"):
     so a job that fetches a source and three segments files four downloads' worth under the two
     names `wall_s`'s identity already reads. *`_retime`'s own block is left inline and untouched
     (§19a).* Returns the path with its sniffed extension.
+
+    **§25a: every fetch runs at the request's settings, and only the SOURCE's files the
+    `transfer.fetch_*` fields** — they describe one fetch, and the kit's hash is of the source
+    (Suite 17). A segment's mode is printed, not filed.
     """
     try:
         progress.phase("fetching", force=True)
@@ -1145,14 +1193,41 @@ def _fetch_into(url, destination, trace, progress, what="source"):
         print("[progress] fetching phase not emitted ({}: {})".format(
             type(exc).__name__, exc), flush=True)
     fetch_started = time.time()
+    fetch_stats = {}
+    fetch_conf = storage.fetch_settings(request)
     try:
         fetch_bytes = storage.fetch_source(
             url, destination, on_bytes=_byte_reporter(progress, "fetching",
-                                                      bytes_per_s=ladder.FETCH_BYTES_PER_S))
+                                                      bytes_per_s=ladder.FETCH_BYTES_PER_S),
+            settings=fetch_conf, stats=fetch_stats)
     finally:
         _add(trace, "timings", "fetch_s", round(time.time() - fetch_started, 3))
+        # §25a: how it was attempted, filed on failure too (found in review).
+        if what == "source":
+            _note_fetch(trace, fetch_stats)
+        else:
+            print("[fetch] {}: {} ({})".format(what, fetch_stats.get("mode"),
+                                               fetch_stats.get("mode_reason") or "ranged"),
+                  flush=True)
     _add(trace, "transfer", "fetch_bytes", fetch_bytes)
+    if what == "source":
+        _hash_source(trace, fetch_conf, destination)
     return probe.named_with_extension(destination, probe.detect_extension(destination))
+
+
+def _note_fetch(trace, fetch_stats):
+    """§25a's `transfer.fetch_*`, from `storage.fetch_source`'s stats. Never raises."""
+    for field, key in (("fetch_mode", "mode"), ("fetch_mode_reason", "mode_reason"),
+                       ("fetch_streams", "streams"), ("fetch_part_bytes", "part_bytes")):
+        _note(trace, "transfer", field, fetch_stats.get(key))
+
+
+def _hash_source(trace, fetch_conf, path):
+    """§25a's `fetch_sha256`, when armed: the fetched source's hash, **taken after `fetch_s` is
+    banked** — it re-reads the whole file, and Suite 17 sweeps `fetch_s` with it armed (found in
+    review). Its seconds fall in `compute_s`, so `wall_s`'s identity still closes."""
+    if fetch_conf.get("sha256"):
+        _note(trace, "transfer", "fetch_sha256", storage.sha256_file(path))
 
 
 #: A URL's query, wherever it appears in a message. `requests` quotes the whole URL in an HTTP
@@ -1256,7 +1331,7 @@ def _full_instead(why):
 
 def _repair_copy(request, source, source_path, items, mapping, ranges, segments, master_path,
                  interpolator, workdir, progress, clock, trace, warnings, repair_block, scale,
-                 frame_count, counted):
+                 frame_count, counted, planned=None):
     """§20: plan, splice and check a copy. Returns its stats, or None after filing why it fell
     back (CF ruling C) — `path` "full", `path_reason` and a warning sentence — so the caller
     runs the full path into the same `master_path`.
@@ -1270,10 +1345,13 @@ def _repair_copy(request, source, source_path, items, mapping, ranges, segments,
     import splice  # noqa: PLC0415
 
     anchors = {item["id"]: (item["a"], item["b"]) for item in ranges}
+    planned = planned if planned is not None else _plan_copy(source_path, items)
     try:
-        pmap = splice.PacketMap(source_path)
-        spans, delay = splice.plan(pmap, [{"id": i["id"], "a": i["a"], "b": i["b"]}
-                                          for i in items])
+        # **Planned before the load** (`_plan_copy`, for §25c's seed); a decline it caught is
+        # raised HERE, so the fallback below classifies it exactly as before.
+        if planned.get("error") is not None:
+            raise planned["error"]
+        pmap, spans, delay = planned["pmap"], planned["spans"], planned["delay"]
         repair_block["spans"] = [{"start": a, "end": b, "items": ids} for a, b, ids in spans]
         crf = request.get("crf") if request.get("crf") is not None else encoder.DEFAULT_CRF
         preset = (request.get("preset") if request.get("preset") is not None
@@ -1338,6 +1416,13 @@ def _repair_copy(request, source, source_path, items, mapping, ranges, segments,
         if os.path.exists(master_path):
             os.remove(master_path)
         if progress is not None:
+            # **§25c: the full path's seed BEFORE the restart payload**, which publishes an ETA —
+            # after it, that payload carried the copy's (found in review).
+            try:
+                _seed_repair(progress, source, frame_count, source_path, None)
+            except Exception as problem:  # noqa: BLE001 — an ETA must never cost a delivery
+                print("[eta] no full-path seed after the fallback ({}: {})".format(
+                    type(problem).__name__, problem), flush=True)
             try:
                 progress.restart_frames(note="the copy fell back; re-encoding every frame")
             except Exception as problem:  # noqa: BLE001 — never at the cost of the fallback
@@ -1485,7 +1570,7 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     import rife  # noqa: PLC0415
 
     source_path = _fetch_into(request["source_url"], os.path.join(workdir, "source"), trace,
-                              progress)
+                              progress, request=request)
     source = probe.probe_source(source_path)
     counted = probe.counted_frames(source_path)
     frame_count = counted["frames"]
@@ -1564,7 +1649,8 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
             os.makedirs(segment_dir, exist_ok=True)
             path = _fetch_into(item["source_url"],
                                os.path.join(segment_dir, "segment-{}".format(len(segments))),
-                               trace, progress, what="segment '{}'".format(sid))
+                               trace, progress, what="segment '{}'".format(sid),
+                               request=request)
             seg = probe.probe_source(path)
             seg_counted = probe.counted_frames(path, errors.INVALID_SOURCE,
                                                "counting the segment's packets")
@@ -1602,7 +1688,12 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     if choice["warning"]:
         warnings.append(choice["warning"])
 
-    _seed_early(request, progress, trace, frame_count, source["width"], source["height"])
+    # **§25c: a repair's own seed, once the path is known.** *A copy's counts the frames it
+    # re-encodes, so its spans are planned here rather than after the load.*
+    planned = _plan_copy(source_path, items) if choice["path"] == "copy" else None
+    _seed_early(request, progress, trace, frame_count, source["width"], source["height"],
+                repair_seed=lambda: _seed_repair(progress, source, frame_count, source_path,
+                                                 planned))
     if request.get("tie_check"):
         import tiecheck  # noqa: PLC0415 — the import IS the cost being avoided, as in _retime
 
@@ -1651,7 +1742,7 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     if choice["path"] == "copy":
         stats = _repair_copy(request, source, source_path, items, mapping, ranges, segments,
                              master_path, interpolator, workdir, progress, clock, trace,
-                             warnings, repair_block, scale, frame_count, counted)
+                             warnings, repair_block, scale, frame_count, counted, planned)
     if stats is None:
         stats = _repair_full(request, source, source_path, items, mapping, ranges, segments,
                              master_path, interpolator, workdir, progress, clock, trace,
@@ -2031,7 +2122,15 @@ def _transfer(trace):
             # §24: what the uploads ran at; null on a run that never reached one.
             "upload_concurrency": measured.get("upload_concurrency"),
             "upload_part_bytes": measured.get("upload_part_bytes"),
-            "upload_parts": measured.get("upload_parts")}
+            "upload_parts": measured.get("upload_parts"),
+            # §25a: how the source came down; null on a run refused before its fetch.
+            "fetch_mode": measured.get("fetch_mode"),
+            "fetch_mode_reason": measured.get("fetch_mode_reason"),
+            "fetch_streams": measured.get("fetch_streams"),
+            "fetch_part_bytes": measured.get("fetch_part_bytes"),
+            # **Only when `fetch_sha256` was armed** (§25a): absent, never null.
+            **({"fetch_sha256": measured["fetch_sha256"]}
+               if measured.get("fetch_sha256") else {})}
 
 
 def _add(trace, block, field, value):
