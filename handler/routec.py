@@ -1703,7 +1703,11 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # of the first two delivered runs: `predicted_estimator_v3/crf12` beside 26 s at 1080p,
         # which is 225 x 0.115, and beside 1440 s at 8K, which is 1500 x 0.96. *`estimate.time.
         # basis` is a corpus key, so every row claimed a pricer that did not price it.*
-        if not held:
+        if held:
+            # **§25d (C2): the repair's rate stands and the BAND is retime's** — the flat fraction
+            # `api.md` §3a documents, so a caller finds it on both operations.
+            progress.expect(None, band_frac=(estimate or {}).get("band_frac"))
+        else:
             progress.expect(seed if priced_by_table else per_frame,
                             basis=(ladder.basis_for((encode_arm or {}).get("crf"))
                                    if priced_by_table

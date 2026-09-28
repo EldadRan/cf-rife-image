@@ -145,7 +145,8 @@ the request's debug fields still override. The rates live in `handler/ladder.py`
 (`derive_expected`) and `handler/encoder.py` (`REPAIR_AREA_DEFAULTS`).
 
 A repair's first ETA is its own, not retime's table: `5 + encode + upload` plus the derives' exposed
-part, published once the path is known, with `eta_basis` `predicted_repair_v1`. The encode is
+part, published once the path is known, with `eta_basis` `predicted_repair_v1` and, once the job
+is priced, retime's flat band (`eta_low_s` / `eta_high_s`). The encode is
 priced per frame by frame area (per re-encoded frame, plus a term per source MB, on the copy
 path), and the upload from the expected master size. The rates are provisional until Suite 17
 and live in `handler/ladder.py` (`repair_seed`). Retime keeps its table.

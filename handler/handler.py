@@ -21,7 +21,6 @@ import contextlib
 import datetime
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -857,8 +856,9 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
         # written against padded area are two axes that agree on nothing in particular, and the
         # difference is recoverable only by someone who remembers the padding rule of the day the
         # row was written. READ FROM `interp_plan`, which owns the rule, so the two cannot disagree.
-        "source": dict(source_block, padded_megapixels=interp_plan.padded_megapixels(
-            source["width"], source["height"], scale)),
+        "source": dict(_response_source(source_block),
+                       padded_megapixels=interp_plan.padded_megapixels(
+                           source["width"], source["height"], scale)),
         "build": build_identity(),
     }
     # §19e — absent when no derive was asked for, so such a response is what it was before.
@@ -963,7 +963,23 @@ def _source_block(source, frames, source_path):
             "r_frame_rate": source.get("r_frame_rate"), "frames": frames,
             "has_audio": source.get("has_audio"), "has_alpha": source.get("has_alpha"),
             "faststart": probe.is_faststart(source_path),
-            "container": source.get("container")}
+            "container": source.get("container"),
+            # §25d: the source file's OWN size — `transfer.fetch_bytes` adds every segment, and
+            # §25c's seed prices the source alone.
+            "bytes": _size_or_none(source_path)}
+
+
+def _response_source(block):
+    """The response's `source` block: the record's, less `bytes` — §25d rules it into the
+    record, and the response's surface is not widened without a ruling."""
+    return {k: v for k, v in block.items() if k != "bytes"}
+
+
+def _size_or_none(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
 
 
 class _DeriveRun:
@@ -1230,9 +1246,6 @@ def _hash_source(trace, fetch_conf, path):
         _note(trace, "transfer", "fetch_sha256", storage.sha256_file(path))
 
 
-#: A URL's query, wherever it appears in a message. `requests` quotes the whole URL in an HTTP
-#: error, and a segment's query is a presigned grant exactly as the source's is.
-_URL_QUERY = re.compile(r"(https?://[^\s?'\"]+)\?[^\s'\"]*")
 
 
 def _segment_refusal(item_id, exc):
@@ -1243,7 +1256,8 @@ def _segment_refusal(item_id, exc):
     *`diagnostics.redact` catches `X-Amz-` and a few generic names and not, for one, GCS V4's
     `X-Goog-Signature` — found in review.* Cutting the query whole needs no list of names.
     """
-    message = _URL_QUERY.sub(r"\1?<query removed>", exc.message)
+    # §25d: every form — a bare path's too (urllib3), which the `https://` pattern missed.
+    message = storage.scrub_query(exc.message)
     return repair_plan.Refused(exc.code, "segment '{}': {}".format(item_id, message),
                                item_id, remedy=exc.remedy, shortfall=exc.shortfall)
 
@@ -1790,7 +1804,7 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
                              **{k: v for k, v in stats.items()
                                 if k not in ("estimate", "convert_check", "input_check",
                                              "reference", "recipe", "encode_provenance")}),
-        "source": dict(_source_block(source, frame_count, source_path),
+        "source": dict(_response_source(_source_block(source, frame_count, source_path)),
                        padded_megapixels=interp_plan.padded_megapixels(
                            source["width"], source["height"], scale)),
         "build": build_identity(),

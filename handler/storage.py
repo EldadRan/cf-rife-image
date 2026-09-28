@@ -158,9 +158,18 @@ class _SliceError(Exception):
     """One attempt at one slice failed in a way another attempt may not."""
 
 
-#: A URL's query — or a bare path's, which is how urllib3 names the URL in a connection error.
-#: A presigned query is a grant, and it must not reach a log line or an error (found in review).
-_QUERY = re.compile(r"\?[^\s'\")]*")
+#: **A query in either form a message carries it**: after a full URL (`requests`' HTTPError) or
+#: after a bare path (urllib3's `Max retries exceeded with url: /a.mp4?X-Amz-...`, which no
+#: `https://` pattern sees). A presigned query is a credential and must reach no log line, record
+#: or bundle (§25d). **Cut whole, to the next space or quote** — whatever it holds (a `(` in a
+#: value, an empty name, no `=`: found in review). *Anchored on the URL or on a path that starts a
+#: word, so a sentence's question mark is left alone.*
+_QUERY = re.compile(r"(https?://[^\s?'\"]+|(?<![^\s'\"(=:])/[^\s?'\"]*)\?[^\s'\"]*")
+
+
+def scrub_query(text):
+    """`text` with every URL query replaced by `?<query removed>`. **Pure; never raises.**"""
+    return _QUERY.sub(r"\1?<query removed>", str(text))
 
 
 def _fetch_ranged(url, destination, total, etag, part, streams, on_bytes):
@@ -264,7 +273,7 @@ def _fetch_slice(session, url, fd, first, last, total, etag, relay, stop):
                 return want
             why = "{} of {} bytes".format(got, want)
         except (requests.exceptions.RequestException, _SliceError) as exc:
-            why = _QUERY.sub("", str(exc))
+            why = scrub_query(exc)
         relay(-got)
         print("[fetch] bytes {}-{}, attempt {} of {}: {}".format(
             first, last, attempt, FETCH_ATTEMPTS, why), flush=True)
@@ -326,7 +335,9 @@ def _fetch_single(source_url, destination, on_bytes=None):
                         except Exception:  # noqa: BLE001 — an emit never costs a delivery
                             on_bytes = None
     except requests.exceptions.RequestException as exc:
-        raise WorkerError(SOURCE_FETCH_FAILED, "could not fetch source_url: {}".format(exc))
+        # §25d: the text can carry the presigned query, in either form `scrub_query` knows.
+        raise WorkerError(SOURCE_FETCH_FAILED,
+                          "could not fetch source_url: {}".format(scrub_query(exc)))
 
     received = os.path.getsize(destination)
     if received == 0:
