@@ -451,6 +451,11 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     fetch_started = time.time()
     fetch_stats = {}
     fetch_conf = storage.fetch_settings(request)
+    if trace is not None:
+        # §26f/§26g N2: one video, no stills — and a source whose hash, sniff or probe fails
+        # after its download is still the one download, filed (the review's C-F2 and D-F2).
+        trace["source_probes"] = []
+        trace["stills"] = []
     try:
         fetch_bytes = storage.fetch_source(
             request["source_url"], download,
@@ -464,10 +469,12 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     _note(trace, "transfer", "fetch_bytes", fetch_bytes)
     # §26f/§26g N2: a retime makes one download, and says so like a repair does.
     _note(trace, "transfer", "files_fetched", 1)
-    _hash_source(trace, fetch_conf, download)
-    extension = probe.detect_extension(download)
-    source_path = probe.named_with_extension(download, extension)
-    source = probe.probe_source(source_path)
+
+    def read_source():
+        _hash_source(trace, fetch_conf, download)
+        named = probe.named_with_extension(download, probe.detect_extension(download))
+        return named, probe.probe_source(named)
+    source_path, source = _filed(trace, "source_probes", {"index": 0}, read_source)
     # **Into `trace`, so the `finally` can file it.** `trace` is the shared dict `handle` creates
     # for exactly this — a crashed run's most diagnostic numbers are the ones it learned before
     # it died — and `_retime` never wrote to it, so EVERY route-C run record filed `source` and
@@ -485,9 +492,7 @@ def _retime(request, machine, warnings, workdir, progress, started, trace=None, 
     source_block = _source_block(source, source_frames, source_path)
     if trace is not None:
         trace["source"] = source_block
-        # §26f/§26g N2: one video, no stills.
-        trace["source_probes"] = [source_block]
-        trace["stills"] = []
+        trace["source_probes"].append(source_block)
 
     # **The retime's own fields sit flat in the normalised config now.** *They arrived inside an
     # `interpolate` sub-object that existed to distinguish a retime from an upscale; with one
@@ -1248,16 +1253,38 @@ def _fetch_into(url, destination, trace, progress, what="source", request=None):
     return probe.named_with_extension(destination, probe.detect_extension(destination))
 
 
+def _fetched_or_filed(trace, listing, stub, fetch_it):
+    """`fetch_it()`'s result; **when it refuses AFTER its download was counted** (a file whose
+    type cannot be sniffed, say), a stub naming the file and why is filed in `trace[listing]` —
+    the download was made and the record counts it (§26f; the §26 review's C-F2)."""
+    before = ((trace or {}).get("transfer") or {}).get("files_fetched") or 0
+    try:
+        return fetch_it()
+    except Exception as exc:  # noqa: BLE001 — ANY failure after the count (the review's D-F2)
+        after = ((trace or {}).get("transfer") or {}).get("files_fetched") or 0
+        if trace is not None and after > before:
+            trace[listing].append(dict(stub, error=_why(exc)))
+        raise
+
+
 def _filed(trace, listing, stub, probe_it):
     """`probe_it()`'s result; **when the probe itself refuses, a stub naming the file and why is
     filed in `trace[listing]` first** — a file that was fetched and could not be read is still
     one of the downloads the record counts (§26f)."""
     try:
         return probe_it()
-    except WorkerError as exc:
+    except Exception as exc:  # noqa: BLE001 — any failure, a WorkerError or not (D-F2)
         if trace is not None:
-            trace[listing].append(dict(stub, error=exc.message))
+            trace[listing].append(dict(stub, error=_why(exc)))
         raise
+
+
+def _why(exc):
+    """A failure as the record files it: a `WorkerError`'s message, else its type and text —
+    query-scrubbed either way (§25d)."""
+    text = exc.message if isinstance(exc, WorkerError) else "{}: {}".format(
+        type(exc).__name__, exc)
+    return storage.scrub_query(text)
 
 
 def _note_fetch(trace, fetch_stats):
@@ -1413,6 +1440,7 @@ def _repair_copy(request, source, source_path, items, mapping, ranges, segments,
                 [name for name in ("crf", "preset") if request.get(name) is None],
                 delivered_pixels=delivered_pixels, codec="h264")
         peak_reset = routec._reset_peak()  # noqa: SLF001
+        _fresh_counters(segments)
         with routec._held_alive(progress):  # noqa: SLF001
             stats = repair.run_copy(
                 pmap, spans, delay, mapping, anchors, segments, master_path, interpolator,
@@ -1471,6 +1499,14 @@ def _repair_copy(request, source, source_path, items, mapping, ranges, segments,
 
 
 
+def _fresh_counters(segments):
+    """Each attempt at the master starts its segments' decode counts from nothing — a fallback
+    that raises before its own decode must not file the count of the attempt before it (§26f; the
+    review's D-F1). *`_segment_feed` sets a live one as each decode starts.*"""
+    for seg in (segments or {}).values():
+        seg.pop("counter", None)
+
+
 def _frame_loop(why):
     return ("frame_repair's full path ran the frame loop — every frame through RGB — instead of "
             "the native encode: {}.".format(why))
@@ -1510,6 +1546,7 @@ def _repair_full(request, source, source_path, items, mapping, ranges, segments,
             why = "not_plannable: " + declined
     if why is None:
         try:
+            _fresh_counters(segments)
             stats = repair.run_native(
                 source, pmap, frame_count, mapping, anchors,
                 [{"id": i["id"], "a": i["a"], "b": i["b"]} for i in items], segments,
@@ -1554,6 +1591,7 @@ def _repair_full(request, source, source_path, items, mapping, ranges, segments,
                     type(problem).__name__, problem), flush=True)
     repair_block.update(pipeline="frame_loop", pipeline_reason=why)
     warnings.append(_frame_loop(why))
+    _fresh_counters(segments)
     stats = repair.run(
         source, source_path, frame_count, mapping,
         {item["id"]: (item["a"], item["b"]) for item in ranges}, segments, master_path,
@@ -1607,17 +1645,24 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
                                       block.get("stills") or ())
     repair_files.disk_before_bodies(sizes, workdir, warnings)
 
-    source_path = _fetch_into(request["source_url"], os.path.join(workdir, "source"), trace,
-                              progress, request=request)
-    source = probe.probe_source(source_path)
-    counted = probe.counted_frames(source_path)
+    if trace is not None:
+        # §26f: one probe per video, source 0 first; the rest land as each is probed.
+        trace["source_probes"] = []
+        trace["stills"] = []
+    source_path = _fetched_or_filed(
+        trace, "source_probes", {"index": 0},
+        lambda: _fetch_into(request["source_url"], os.path.join(workdir, "source"), trace,
+                            progress, request=request))
+    # **A source that cannot be probed is still one download** — filed, or the record's count
+    # does not close (the §26 review's C-F2).
+    source, counted = _filed(trace, "source_probes", {"index": 0},
+                             lambda: (probe.probe_source(source_path),
+                                      probe.counted_frames(source_path)))
     frame_count = counted["frames"]
     source_block = _source_block(source, frame_count, source_path)
     if trace is not None:
         trace["source"] = source_block
-        # §26f: one probe per video, source 0 first; the rest land as each is probed.
-        trace["source_probes"] = [source_block]
-        trace["stills"] = []
+        trace["source_probes"].append(source_block)
 
     # ── §19d, AFTER THE PROBE: WHAT NEEDS THE FILE ──────────────────────────────────────────
     #
@@ -1682,9 +1727,14 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     choice = _repair_path(request, source)
     request["release_3"] = dict(request["release_3"], codec=choice["codec"],
                                 bit_depth=choice["bit_depth"])
+    # **§25c/§26a: a copy's spans are planned before the load**, and — the §26 review's C-F5 —
+    # before check 2 too: a copy its own plan declines runs the FULL path, and the disk it needs
+    # is the full path's master, not the copy's parts.
+    planned = _plan_copy(source_path, items) if choice["path"] == "copy" else None
+    will_run = ("copy" if planned is not None and planned.get("error") is None else "full")
     repair_files.disk_after_source(
         sizes, ladder.repair_master_bytes(delivered_pixels, frame_count,
-                                          source_block.get("bytes") or 0, choice["path"]),
+                                          source_block.get("bytes") or 0, will_run),
         workdir)
 
     # ── §26e: the other videos and the stills, each fetched ONCE and probed ONCE ────────────
@@ -1696,8 +1746,10 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
         try:
             # **Their own directory, as the master has** — a caller's `output.name` is free text,
             # and a master named like a fetched file would be written over one being read.
-            path = _fetch_into(url, os.path.join(files_dir, "source-{}".format(index)), trace,
-                               progress, what=label, request=request)
+            path = _fetched_or_filed(
+                trace, "source_probes", {"index": index},
+                lambda: _fetch_into(url, os.path.join(files_dir, "source-{}".format(index)),
+                                    trace, progress, what=label, request=request))
         except Exception as exc:  # noqa: BLE001 — any failure, named (the review's F4)
             raise repair_files.named_failure(label, exc) from exc
         # **Filed BEFORE it is judged** (the §26 review): a refused video was still fetched, and
@@ -1735,14 +1787,27 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
             _add(trace, "timings", "fetch_s", round(time.time() - stills_started, 3))
             _add(trace, "transfer", "fetch_bytes", sum(n for _i, _p, n in landed))
             _add(trace, "transfer", "files_fetched", len(landed))
+        # **Every still is probed and filed, THEN each is judged** — the batch landed whole, so a
+        # refusal at index 0 must not leave 1 .. n counted and unfiled (the §26 review's C-F1).
+        # *Judged in INDEX order* — the first refusal is the lowest index's, whichever kind
+        # (the review's D-F4).
+        verdicts = []
         for index, path in enumerate(still_paths):
-            # Filed before it is judged, as each video is.
-            entry, pix_fmt = _filed(trace, "stills", repair_files.still_stub(
-                index, _size_or_none(path), None),
-                lambda: repair_files.probe_still(index, path))
+            try:
+                entry, pix_fmt = repair_files.probe_still(index, path)
+            except Exception as exc:  # noqa: BLE001 — any failure, filed and judged in order (E-F1)
+                if trace is not None:
+                    trace["stills"].append(repair_files.still_stub(
+                        index, _size_or_none(path), _why(exc)))
+                verdicts.append((exc, None))
+                continue
             if trace is not None:
                 trace["stills"].append({k: v for k, v in entry.items() if k != "codec"})
-            repair_files.check_still(entry, path, pix_fmt, source)
+            verdicts.append((None, (entry, path, pix_fmt)))
+        for unreadable, described in verdicts:
+            if unreadable is not None:
+                raise unreadable
+            repair_files.check_still(described[0], described[1], described[2], source)
 
     # ── the plan: every segment's M against its own video's frames ─────────────────────────
     ranges = [item for item in items if item["type"] == "range"]
@@ -1752,7 +1817,9 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
     # **§26e: each video segment decodes from the keyframe at or before its start_frame** — K,
     # found once per segment on its own video (§26g N1), and filed on the item.
     segments = {}
-    maps = {}                     # one packet map per video, however many segments use it (§26e)
+    # One packet map per video, however many segments use it (§26e) — source 0's is the copy
+    # plan's when it read one.
+    maps = {source_path: planned["pmap"]} if (planned or {}).get("pmap") is not None else {}
     by_id = {entry["id"]: entry for entry in summary}
     for item in segment_items:
         sid = item["id"]
@@ -1766,6 +1833,9 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
         segments[sid] = {"kind": "video", "path": video_paths[item["source"]], "first": first,
                          "last": entry["end_frame"], "from": seek, "colour": colour}
         entry["decode_start_frame"] = first
+        # 0 until its decoder runs — true of a job that dies before it does (the review's C-F3);
+        # the live count replaces it once the pipelines have run (below).
+        entry["frames_decoded"] = 0
     # **§19d/§19f: the pair for a program in `frame_repair.near_ranges[]`, and a sentence naming
     # both ids for a person in `warnings[]`** — which stays a list of strings (CF, 2026-09-26).
     near_ranges = [{"ids": pair["ids"], "good_gap": pair["good_gap"]} for pair in near]
@@ -1785,8 +1855,7 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
         warnings.append(choice["warning"])
 
     # **§25c: a repair's own seed, once the path is known.** *A copy's counts the frames it
-    # re-encodes, so its spans are planned here rather than after the load.*
-    planned = _plan_copy(source_path, items) if choice["path"] == "copy" else None
+    # re-encodes — its spans, planned above.*
     _seed_early(request, progress, trace, frame_count, source["width"], source["height"],
                 repair_seed=lambda: _seed_repair(progress, source, frame_count, source_path,
                                                  planned, request))
@@ -1835,24 +1904,29 @@ def _repair(request, machine, warnings, workdir, progress, started, trace=None, 
 
     progress.phase("interpolate", pct=10, force=True)
     stats = None
-    if choice["path"] == "copy":
-        stats = _repair_copy(request, source, source_path, items, mapping, ranges, segments,
-                             master_path, interpolator, workdir, progress, clock, trace,
-                             warnings, repair_block, scale, frame_count, counted, planned)
-    if stats is None:
-        stats = _repair_full(request, source, source_path, items, mapping, ranges, segments,
-                             master_path, interpolator, workdir, progress, clock, trace,
-                             warnings, repair_block, scale, frame_count, counted, checker,
-                             input_checker, encode_defaults, choice)
-        stats.update(frames_copied=0, frames_encoded=stats.get("n_out"))
+    try:
+        if choice["path"] == "copy":
+            stats = _repair_copy(request, source, source_path, items, mapping, ranges, segments,
+                                 master_path, interpolator, workdir, progress, clock, trace,
+                                 warnings, repair_block, scale, frame_count, counted, planned)
+        if stats is None:
+            stats = _repair_full(request, source, source_path, items, mapping, ranges, segments,
+                                 master_path, interpolator, workdir, progress, clock, trace,
+                                 warnings, repair_block, scale, frame_count, counted, checker,
+                                 input_checker, encode_defaults, choice)
+            stats.update(frames_copied=0, frames_encoded=stats.get("n_out"))
+    finally:
+        # **§26f's `frames_decoded`, off each video segment's LIVE counter, on every exit** — a
+        # segment refused for decoding short (a seek past K) or a job that died later files what
+        # its decoder produced (the §26 review's C-F3). *A stills segment has no such field.*
+        for sid, seg in segments.items():
+            if seg["kind"] == "video":
+                counter = seg.get("counter")
+                by_id[sid]["frames_decoded"] = counter.decoded if counter is not None else 0
     # §20f: the path the master actually took, on the record's block and the response's.
     stats.update(path=repair_block["path"], path_reason=repair_block["path_reason"])
     # **§26f: what each segment's decoder produced, on its item** — a video's from K through its
     # end_frame, a stills segment's one decode per still it read.
-    # *A stills segment carries none of the four frame fields* (§26f; the review's F2).
-    for sid, count in (stats.pop("frames_decoded", None) or {}).items():
-        if sid in by_id and count is not None and "stills" not in by_id[sid]:
-            by_id[sid]["frames_decoded"] = count
     if repair_block["path"] == "copy" and trace is not None:
         # **The span encoders' provenance**: the same area table resolved their thread bound
         # (`_repair_copy`), so §13 files who chose it exactly as it does for the full path.
@@ -1949,8 +2023,11 @@ def _deliver(request, master, master_path, source_path, stats, trace, progress, 
     # a factor of four before any per-run variation — *and the fetch spread is 35.5x against the
     # upload's 3.3x, so the run's own fetch was the least reproducible number available to price
     # it with.* **From the corpus rate it would have said 214 s against 236, a 9 per cent error.**
+    # **§26i: and the corpus rate was ONE STREAM's.** *Parallel parts (§24, §25b) took an 8K master
+    # up in 19.1 s against the 275 s it priced, so the phase is priced at 200 MB/s now.*
     try:
-        _upload_expected = (float(upload_bytes) / ladder.UPLOAD_BYTES_PER_S
+        # §26i: the parallel rate, master MB / 200 — so §23's cadence asks again when it is done.
+        _upload_expected = (float(upload_bytes) / ladder.UPLOAD_PARALLEL_BYTES_PER_S
                             if upload_bytes else None)
     except Exception:  # noqa: BLE001 — no figure is a state §18b already rules honest
         _upload_expected = None
@@ -1998,7 +2075,7 @@ def _deliver_with(request, master, master_path, source_path, stats, trace, progr
                                     keys.content_type(master),
                                     on_bytes=_byte_reporter(
                                         progress, "uploading",
-                                        bytes_per_s=ladder.UPLOAD_BYTES_PER_S),
+                                        bytes_per_s=ladder.UPLOAD_PARALLEL_BYTES_PER_S),
                                     settings=upload_settings, stats=upload_stats)
     except BaseException:
         if derive_run is not None:

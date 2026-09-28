@@ -326,7 +326,7 @@ def keyframe_before(path, start_frame, end_frame, label, cache=None):
     packets cannot be mapped or that has no keyframe at or before the frame.
 
     **The seek is the copy path's `PacketMap.from_frame(K)` — a rough input `-ss` 3 s before K
-    — and the select is BOUNDED ON BOTH SIDES by PTS**, K's and `end_frame`'s. *A select open at
+    — and the filter is BOUNDED ON BOTH SIDES by PTS**, K's and `end_frame`'s (`trim`). *A select open at
     the top, capped by a frame count, could not fail: a seek that landed PAST K passed the frames
     after it, and they were labelled K .. end, every placed frame shifted and nothing refused (the
     §26 review's F1).* Bounded, an overshoot decodes SHORT of `end - K + 1`, and `Window` and
@@ -352,6 +352,10 @@ def keyframe_before(path, start_frame, end_frame, label, cache=None):
                                   "decode can begin there".format(label, start_frame), label)
     k = keys[-1]
     inputs, _open_select = pmap.from_frame(k)
-    select = "select=between(pts\\,{}\\,{})".format(pmap.frames[k][0],
-                                                     pmap.frames[end_frame][0])
+    # **`trim`, not `select`**: `select` drops frames and never ends the stream, so the decoder ran
+    # on to the end of the file and the drain waited for it — a segment near the start of an 8K
+    # source decoded the rest of it (the §26 review's C-F4). `trim` ends the stream at
+    # `end_pts` (exclusive: end_frame's PTS + 1 tick) and ffmpeg stops.
+    select = "trim=start_pts={}:end_pts={}".format(pmap.frames[k][0],
+                                                   pmap.frames[end_frame][0] + 1)
     return k, (inputs, select), pmap.matrix()

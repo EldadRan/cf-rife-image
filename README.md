@@ -59,8 +59,12 @@ output order, repeats allowed — and is fitted to the frames it replaces as bef
 `resample`). Every listed file is fetched once and probed once however many segments use it, and
 a video segment is decoded from the keyframe at or before its `start_frame`, never from frame 0.
 A still is converted with the source's matrix and range, as RIFE's output is; a still with any
-transparent pixel is refused. Before any file is fetched, the disk must hold every listed file,
-the master and 10% more. A video whose rate or size differs from the source's, or a still of
+transparent pixel is refused. The disk is checked twice, each with 10% to spare:
+before any file's body is fetched, for every listed file's size (from a ranged probe) plus the
+source's again as the master's floor; and after the source's probe, for the files still to come
+plus the master at its path's estimate — the larger of the source's size and 0.05 MB per
+megapixel-frame on the full path, twice the source's size on the copy path, whose parts are written
+before they are joined. A video whose rate or size differs from the source's, or a still of
 another size, is refused `sources_mismatch`, and a range past a video's end
 `segment_exceeds_source`; neither is retryable. This is `handler/repair_files.py`.
 
@@ -141,7 +145,8 @@ it reaches its span's encoder.
 Every upload — the master, the derives, the reference PNGs — goes up in parallel parts, 16 in
 flight, each file's part taken from its own size: a thirty-second of the file, rounded up to a
 whole MiB and kept within 8-64 MiB, and multipart from 16 MiB (`handler/envelope.py`). The caller
-has no say. `transfer.upload_part_bytes` is the master's. A part that fails fails the upload and
+has no say. `transfer.upload_part_bytes` is the master's. The upload phase is priced at 200 MB/s — the
+parallel rate — so the poll cadence asks again when the upload should be done. A part that fails fails the upload and
 the multipart upload is aborted; an abort that fails too is said in the error.
 
 The source, and every other video, comes down in parallel ranges: a `Range: bytes=0-0` probe must

@@ -104,6 +104,12 @@ ROWS = {
 #: false precision.**
 UPLOAD_BYTES_PER_S = 13.1 * 1000 * 1000
 FETCH_BYTES_PER_S = 54.5 * 1000 * 1000
+#: **§26i (CF, 2026-09-28; closes F-2026-09-28-3): the UPLOAD PHASE is priced at the parallel
+#: rate**, master MB / 200 (§25c's rate, MB = 10^6). *The corpus rate above is one stream's, which
+#: §24 replaced: it priced an 8K master that went up in 19.1 s at 275.4 s, so `next_poll_s` read
+#: 90 and the caller saw the end ~73 s late (S17d).* **§23's derives are priced against the same
+#: rate** (`derive_expected`, §26i (b)); `UPLOAD_BYTES_PER_S` is the corpus's record of one stream.
+UPLOAD_PARALLEL_BYTES_PER_S = 200 * 1000 * 1000
 
 #: **TWO BAND FRACTIONS STOOD HERE AND THEY ARE DELETED. THE COMMENT CALLED THEM DERIVED FROM
 #: THE RANGES ABOVE AND THEY WERE NOT** — and nothing read them, so the file carried a false
@@ -444,12 +450,15 @@ MASTER_BYTES_PER_PIXEL_FRAME_LOW = 445075813 / (480 * 7680 * 4320)
 def derive_expected(frames, width, height):
     """§23 for a master of `frames` at `width` x `height`: `{derive_expected_s,
     upload_expected_s, added_s}` — the derives' predicted wall, the master upload's predicted
-    wall at `UPLOAD_BYTES_PER_S`, and what the ETA takes: `max(0, derive - upload)`. **Pure.**
+    wall at `UPLOAD_PARALLEL_BYTES_PER_S` (§26i), and what the ETA takes: `max(0, derive -
+    upload)`. **Pure.**
     """
     pixels = int(width) * int(height)
     frames = int(frames)
     derive = frames * max(DERIVE_S_PER_FRAME_FLOOR, pixels * DERIVE_S_PER_PIXEL_FRAME)
-    upload = frames * pixels * MASTER_BYTES_PER_PIXEL_FRAME_LOW / UPLOAD_BYTES_PER_S
+    # **§26i (b), the gate's ruling: the master's upload at the PARALLEL rate** — one stream's
+    # 13.1 MB/s hid every derive behind an upload that now takes seconds.
+    upload = frames * pixels * MASTER_BYTES_PER_PIXEL_FRAME_LOW / UPLOAD_PARALLEL_BYTES_PER_S
     return {"derive_expected_s": round(derive, 3), "upload_expected_s": round(upload, 3),
             "added_s": round(max(0.0, derive - upload), 3)}
 
@@ -471,6 +480,8 @@ REPAIR_BASIS = "repair_v2"
 #: **§26g: the disk check's full-path master**, MB per megapixel-frame, or the source's size if
 #: larger — Suite 17's 4K and 1080p masters were half of §25c's 0.1.
 REPAIR_MASTER_MB_PER_MP_FRAME = 0.05
+#: §26h: the copy path's disk, in source sizes — its parts, then the joined master.
+REPAIR_COPY_MASTER_FACTOR = 2
 
 
 def repair_t(pixels):
@@ -506,10 +517,11 @@ def repair_first_s(work_s, derives_s=0.0):
 
 
 def repair_master_bytes(pixels, frames, source_bytes, path):
-    """§26g's expected master for the disk check: the source's bytes on the copy path; on the full
-    path the larger of those and 0.05 MB x MP x frames. **Pure.**"""
+    """§26g's expected master for the disk check: **twice the source's bytes on the copy path**
+    (§26h: the splice writes its parts before joining them, up to about twice the source); on the
+    full path the larger of the source's bytes and 0.05 MB x MP x frames. **Pure.**"""
     source_bytes = int(source_bytes or 0)
     if path == "copy":
-        return source_bytes
+        return REPAIR_COPY_MASTER_FACTOR * source_bytes
     return max(source_bytes,
                int(REPAIR_MASTER_MB_PER_MP_FRAME * 1e6 * int(pixels) / 1e6 * int(frames)))

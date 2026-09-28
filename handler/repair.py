@@ -59,8 +59,6 @@ class _Stills:
         self._to_frame = to_frame
         self._clock = clock
         self._held = {}
-        #: Decodes made — §26f's `frames_decoded` for a stills segment.
-        self.decoded = 0
 
     def at(self, index, keep=()):
         if index not in self._held:
@@ -68,7 +66,6 @@ class _Stills:
                 del self._held[stale]
             self._held[index] = self._to_frame(_still_bgr(
                 self._paths[index], self._size[0], self._size[1], self._sid, self._clock))
-            self.decoded += 1
         return self._held[index]
 
 
@@ -107,7 +104,11 @@ def _segment_feed(sid, seg, width, height, tensors, device, clock, colour=None):
     1` it should hold so a long decode is counted, not cut; and read through a
     `repair_plan.Window` whose first index is K, so the plan's indices are the video's own. *Converted with `colour` when given (the frame loop's), else the video's
     own matrix and range (`seg["colour"]`).* A STILLS segment is read by index (`_Stills`).
-    `counter.decoded` is what that segment's decoder produced: §26f's `frames_decoded`.
+
+    **`seg["counter"]` is set to the live counter** — `counter.decoded` is what this decoder has
+    produced so far, §26f's `frames_decoded` — so the CALLER files it on every exit, a refusal
+    and a later failure included (the §26 review's C-F3). *The spec dict is the handler's; a
+    fallback's new decode replaces the counter, so the record describes the last attempt.*
     """
     import splice  # noqa: PLC0415
 
@@ -115,8 +116,9 @@ def _segment_feed(sid, seg, width, height, tensors, device, clock, colour=None):
         feed = _Stills(sid, seg["paths"], width, height,
                        lambda bgr: next(iter(tensors(iter([bgr]), device, clock=clock))),
                        clock)
-        return feed, feed, None
+        return feed, None, None
     counter = _Count()
+    seg["counter"] = counter
     inputs, select = seg["from"]
     gen = _frames_of(splice.rgb_decoder(seg["path"], list(inputs), select,
                                         seg["last"] - seg["first"] + 2,
@@ -131,9 +133,9 @@ def _check_segment(sid, seg, counter, gen):
     """§19d's count agreement on a VIDEO segment after the plan has read it: the rest of its
     decode drained and counted, which must be exactly K .. end_frame — **short is a seek that
     landed past K** (the select is bounded by PTS both sides), long a decoder that disagrees with
-    the packets. Returns the count: §26f's `frames_decoded`. A stills segment has none (None)."""
+    the packets. *The count itself is filed off `seg["counter"]` (`_segment_feed`).*"""
     if gen is None:
-        return None
+        return
     for _ in gen:
         pass
     want = seg["last"] - seg["first"] + 1
@@ -144,7 +146,6 @@ def _check_segment(sid, seg, counter, gen):
             "end_frame {}. The video's packets were counted and its decoder disagrees, so the "
             "frames it contributed are not the ones the plan named.".format(
                 sid, counter.decoded, seg["first"], want, seg["last"]), sid)
-    return counter.decoded
 
 
 def run(source, source_path, frame_count, mapping, anchors, segments, master_path,
@@ -157,7 +158,7 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
 
     `frame_count` is the source's COUNTED packets, which the plan was built from; `mapping` is
     `repair_plan.plan`'s; `anchors` `{range_id: (a, b)}`; `segments` `{segment_id: feed spec}` —
-    `_segment_feed`'s (§26e). **`stats["frames_decoded"]` is `{segment_id: count}`.** **`fps` is the source's `r_frame_rate` STRING**, handed to the writer as it came,
+    `_segment_feed`'s (§26e). **`fps` is the source's `r_frame_rate` STRING**, handed to the writer as it came,
     because §19g holds the output to it as a rational and a float cannot carry `30000/1001`.
 
     `tensors` and `to_bytes` default to retime's own two conversions (`routec._tensors`,
@@ -320,8 +321,8 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
                 "Frame indices are exact or they are wrong, so a repair addressed by index is "
                 "refused rather than delivered shifted (retime's two-frame tolerance does not "
                 "apply to this operation).".format(source_decoded, frame_count))
-        frames_decoded = {sid: _check_segment(sid, seg, seg_counts[sid], seg_gens[sid])
-                          for sid, seg in segments.items()}
+        for sid, seg in segments.items():
+            _check_segment(sid, seg, seg_counts[sid], seg_gens[sid])
 
         if reference_path is not None:
             if progress is not None:
@@ -354,7 +355,6 @@ def run(source, source_path, frame_count, mapping, anchors, segments, master_pat
             estimate=estimate,
             encoder_peak_rss_gb=writer.encoder_peak_rss_gb,
             reference=reference_block,
-            frames_decoded=frames_decoded,
             **routec._encode_fields(writer))  # noqa: SLF001
     finally:
         # Retime's order and retime's reason: the reference's disk first, then the captures, and a
@@ -529,8 +529,6 @@ def run_copy(pmap, spans, delay, mapping, anchors, segments, master_path, interp
     drain_s = 0.0
     span_sets = []
     files = []
-    #: §26f: `{segment_id: frames its decoder produced}`.
-    frames_decoded = {}
     if progress is not None:
         progress.begin_phase()
     for kind, start, end in runs:
@@ -609,8 +607,7 @@ def run_copy(pmap, spans, delay, mapping, anchors, segments, master_path, interp
                     # **§19d's count agreement, on each segment this span read**: the rest of its
                     # capped decode is drained and counted (`_check_segment`).
                     for sid, gen in zip(used, seg_gens):
-                        frames_decoded[sid] = _check_segment(sid, segments[sid],
-                                                             seg_counts[sid], gen)
+                        _check_segment(sid, segments[sid], seg_counts[sid], gen)
                     failed = False
                 except repair_plan.Refused as exc:
                     # **The source window running short is the splice's seek, not the caller's
@@ -725,7 +722,6 @@ def run_copy(pmap, spans, delay, mapping, anchors, segments, master_path, interp
         crf=crf,
         preset=preset,
         recipe=recipe,
-        frames_decoded=frames_decoded,
     )
 
 
@@ -868,7 +864,7 @@ def native_windows(frame_count, items):
 
 
 def _native_window(pmap, lo, hi, held, mapping, anchors, segments, interpolator, workdir,
-                   tensors, to_bytes, staging, clock, frames_decoded=None):
+                   tensors, to_bytes, staging, clock):
     """The frames `lo+1 .. hi` of the output, in the source's pixel format — a generator.
 
     **The model's input is the frames the one decode already holds**: the window's untouched
@@ -953,9 +949,7 @@ def _native_window(pmap, lo, hi, held, mapping, anchors, segments, interpolator,
                         staging.released()
                 # §19d's count agreement on each segment the window read, as `run_copy` does.
                 for sid, gen in zip(used, seg_gens):
-                    count = _check_segment(sid, segments[sid], seg_counts[sid], gen)
-                    if frames_decoded is not None:
-                        frames_decoded[sid] = count
+                    _check_segment(sid, segments[sid], seg_counts[sid], gen)
                 failed = False
             finally:
                 stream.close()
@@ -1064,8 +1058,7 @@ def run_native(source, pmap, frame_count, mapping, anchors, items, segments, mas
     encoding = queue.Queue(maxsize=NATIVE_QUEUE_FRAMES)
     read_box = {"frames": 0, "error": None}
     write_box = {"error": None}
-    #: §26f: `{segment_id: frames its decoder produced}`, filled per window.
-    frames_decoded = {}
+
     if progress is not None:
         progress.begin_phase()
 
@@ -1126,7 +1119,7 @@ def run_native(source, pmap, frame_count, mapping, anchors, items, segments, mas
                                 for out in _native_window(
                                         pmap, lo, hi, held, mapping, anchors, segments,
                                         interpolator, workdir, tensors, to_bytes, staging,
-                                        clock, frames_decoded):
+                                        clock):
                                     put(out)
                                 active, held = None, {}
                             sent = True
@@ -1238,5 +1231,4 @@ def run_native(source, pmap, frame_count, mapping, anchors, items, segments, mas
         estimate=estimate,
         encoder_peak_rss_gb=writer_cm.encoder_peak_rss_gb,
         reference=None,
-        frames_decoded=frames_decoded,
         **routec._encode_fields(writer_cm))  # noqa: SLF001
