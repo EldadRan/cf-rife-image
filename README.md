@@ -3,7 +3,8 @@
 A RunPod serverless GPU worker that **does what RIFE can do, one operation per job**: `retime`
 changes a clip's frame rate by synthesising the frames between the ones it was given, and
 `frame_repair` replaces damaged frames in place — by RIFE between the good frames either side, or
-by frames from a clip the caller supplies. No upscaler. Bytes move
+by frames the caller supplies: a frame range from the source itself or from up to three other
+videos, or a list of stills. No upscaler. Bytes move
 through S3-compatible object storage in both directions: a job names a source URL and an output
 destination, and no image data travels in the job envelope.
 
@@ -50,6 +51,18 @@ frame count, rate, duration and every PTS equal to the source's. A source this c
 an armed `convert_check`, `input_check` or `reference_score`, or a native encode that fails its
 check runs the per-frame loop instead, filed as `frame_repair.pipeline` and `pipeline_reason`
 with a warning. This is `repair.run_native`.
+
+**A segment names its frames by index.** `params.sources` lists up to three videos beyond the
+source (source 0 is `source_url`) and `params.stills` any number of PNG, WebP or JPEG images; a
+segment takes `source` with an inclusive `start_frame`/`end_frame`, or `stills` — indices in
+output order, repeats allowed — and is fitted to the frames it replaces as before (`exact` or
+`resample`). Every listed file is fetched once and probed once however many segments use it, and
+a video segment is decoded from the keyframe at or before its `start_frame`, never from frame 0.
+A still is converted with the source's matrix and range, as RIFE's output is; a still with any
+transparent pixel is refused. Before any file is fetched, the disk must hold every listed file,
+the master and 10% more. A video whose rate or size differs from the source's, or a still of
+another size, is refused `sources_mismatch`, and a range past a video's end
+`segment_exceeds_source`; neither is retryable. This is `handler/repair_files.py`.
 
 **Either operation may ask for `derive`** — a WebP poster, a 1280-px h264 proxy and a spritesheet,
 each made from the delivered master and uploaded beside it. A derive that fails is reported in
@@ -104,7 +117,10 @@ an A40 whether or not anyone remembered to bank its padded area. So every envelo
   `peak_vram_gb`, `encoder_peak_rss_gb` and all five encode settings (`crf`, `preset`,
   `x264_params`)
 - `source` and `output` — each file's ffprobe, the rate as its exact rational and the frames
-  counted from its packets, so a repair's claim to have changed nothing but frames is checkable
+  counted from its packets, so a repair's claim to have changed nothing but frames is checkable;
+  `source_probes[]`, one per video (source 0 first), and `stills[]`, one per still. A segment item
+  names its `source` or `stills`, its `start_frame` and `end_frame`, the keyframe its decode began
+  at (`decode_start_frame`) and the frames its decoder produced (`frames_decoded`)
 - `derived[]` — one entry per derive delivered, when any was asked for
 - `source.padded_megapixels` — the padded area, **computed by `interp_plan`, which owns the
   padding rule**, rather than restated. Raw dimensions and padded area differ by
@@ -122,34 +138,36 @@ encode are one streaming loop — the writer pulls each frame through the whole 
 repair that copies counts a copied run as done the moment it is cut, and each re-encoded frame as
 it reaches its span's encoder.
 
-Every upload — the master, the derives, the reference PNGs — goes up in parallel parts: 16 parts
-of 64 MiB in flight by default (`handler/envelope.py`, ruled from Suite 16's sweep), movable by the
-debug fields `upload_concurrency` and `upload_part_mb`. A part that fails fails the upload and the
-multipart upload is aborted; an abort that fails too is said in the error.
+Every upload — the master, the derives, the reference PNGs — goes up in parallel parts, 16 in
+flight, each file's part taken from its own size: a thirty-second of the file, rounded up to a
+whole MiB and kept within 8-64 MiB, and multipart from 16 MiB (`handler/envelope.py`). The caller
+has no say. `transfer.upload_part_bytes` is the master's. A part that fails fails the upload and
+the multipart upload is aborted; an abort that fails too is said in the error.
 
-The source, and every segment, comes down in parallel ranges: a `Range: bytes=0-0` probe must
-answer 206 with a total size and a strong ETag, and then 8 streams of 32 MiB (provisional until
-Suite 17's sweep) write each slice in place into a pre-sized file. Every range carries `If-Match`
+The source, and every other video, comes down in parallel ranges: a `Range: bytes=0-0` probe must
+answer 206 with a total size and a strong ETag, and then 8 streams of 32 MiB write each slice in
+place into a pre-sized file. Stills come down as single streams, up to 8 at a time. Every range carries `If-Match`
 with the probe's ETag, so a source replaced mid-fetch fails rather than being stitched from two
 versions; a slice is tried three times before the job fails `source_fetch_failed`, and the
 finished size must equal the probe's total. A server that refuses the probe, or a source under
-64 MB, is fetched as one stream, and the record says why (`transfer.fetch_mode_reason`). The debug
-fields `fetch_concurrency`, `fetch_part_mb` and `fetch_sha256` move it; the last hashes the
-fetched source into `transfer.fetch_sha256`.
+64 MB, is fetched as one stream, and the record says why (`transfer.fetch_mode_reason`);
+`transfer.files_fetched` counts the downloads. The debug field `fetch_sha256` hashes the fetched
+source into `transfer.fetch_sha256`.
 
 The ETA exists from the moment the frame plan does, before the model loads, and it includes the
 part of any requested derives that the master's upload does not hide. `next_poll_s` never asks for
-longer than that ETA, and never less than 5 seconds. A repair's h264 encode above 4K (the 8K row)
-runs 32 x264 threads, not sliced, as Suite 14's sweep measured; every other row is unchanged, and
-the request's debug fields still override. The rates live in `handler/ladder.py`
-(`derive_expected`) and `handler/encoder.py` (`REPAIR_AREA_DEFAULTS`).
+longer than that ETA, and never less than 5 seconds. A repair's h264 encode takes the most x264
+threads of 64, 32 and 16 whose predicted host memory — 0.0222 GB per megapixel per thread — stays
+under 27.94 GB, not sliced: 64 at 4K and below, 32 at 8K. Retime and h265 are unchanged, and the
+request's debug fields still override. The rules live in `handler/ladder.py` (`derive_expected`)
+and `handler/encoder.py` (`repair_threads`).
 
-A repair's first ETA is its own, not retime's table: `5 + encode + upload` plus the derives' exposed
-part, published once the path is known, with `eta_basis` `predicted_repair_v1` and, once the job
-is priced, retime's flat band (`eta_low_s` / `eta_high_s`). The encode is
-priced per frame by frame area (per re-encoded frame, plus a term per source MB, on the copy
-path), and the upload from the expected master size. The rates are provisional until Suite 17
-and live in `handler/ladder.py` (`repair_seed`). Retime keeps its table.
+A repair's first ETA is its own, not retime's table: frames times a per-frame time taken from the
+frame's pixels — linear between 1080p, 4K and 8K and flat beyond — plus the derives' exposed part,
+never below 5 s. On the copy path the frames are the ones re-encoded, plus a term per source MB. It
+is published once the path is known, with `eta_basis` `predicted_repair_v2` and, once the job is
+priced, retime's flat band (`eta_low_s` / `eta_high_s`). The rates live in `handler/ladder.py`
+(`repair_t`, `repair_work`). Retime keeps its table.
 
 ## Tests
 

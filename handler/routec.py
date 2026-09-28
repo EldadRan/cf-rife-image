@@ -1611,7 +1611,7 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
         # actually applies.
         priced_by_table = seed is not None and seed > 0
         if held:
-            print("[eta] the repair's own seed stands (§25c); the table does not re-seed it",
+            print("[eta] the repair's own seed stands (§26a); the table does not re-seed it",
                   flush=True)
         elif priced_by_table:
             # **THE BASIS GOES ON *THIS* CALL AND THE FIRST DRAFT PUT IT ONLY ON THE REPUBLISH.**
@@ -1764,7 +1764,7 @@ def _seed_estimate(progress, source, stats, scale, encode_arm=None, armed=None,
 
 
 def _holds_repair_seed(progress):
-    """Whether `progress` carries §25c's repair seed. **Never raises.**"""
+    """Whether `progress` carries a repair's own seed (§25c, §26a). **Never raises.**"""
     import ladder  # noqa: PLC0415
 
     try:

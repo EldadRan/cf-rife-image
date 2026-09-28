@@ -8,9 +8,11 @@ run consults it. *The GPU wiring is `repair.py`, and it owns nothing this file d
 
 **THREE THINGS, AND WHICH MOMENT OWNS EACH IS §19d's RULE:**
 
-  `validate_items(params)`       at the door — everything the request alone can settle
-  `plan(frames, ranges, segs)`   after the probe — the bound on `b`, each segment's `M`, and the
-                                 whole output mapping, with the near-item warnings
+  `validate_items(params, url)`  at the door — everything the request alone can settle, §26e's
+                                 file lists included
+  `plan(frames, ranges, segs,    after the probes — the bound on `b`, each segment's `M` against
+        sources, stills)`        its video's frames, and the whole output mapping, with the
+                                 near-item warnings
   `emit(mapping, ...)`           the one forward pass that turns the mapping into frames
 
 **Every refusal names the item `id`, and carries it as `.item`**, because the conformance test
@@ -22,7 +24,7 @@ never use floats* — the copy-or-blend decision is `t == 0`, and it is exact he
 from fractions import Fraction
 
 from errors import (FIELD_NOT_SUPPORTED, INVALID_FIELD_VALUE, INVALID_SOURCE,
-                    MISSING_REQUIRED_FIELD, WorkerError)
+                    MISSING_REQUIRED_FIELD, SEGMENT_EXCEEDS_SOURCE, WorkerError)
 
 #: §19d — a range's ceiling. *A safety bound, not a policy: the caller applies its own.* **Ranges
 #: only**; a segment carries its own frames and has no synthesis to bound.
@@ -35,7 +37,12 @@ FITS = ("exact", "resample")
 DEFAULT_FIT = "exact"
 
 RANGE_FIELDS = ("id", "a", "b")
-SEGMENT_FIELDS = ("id", "a", "b", "source_url", "trim_head", "trim_tail", "fit")
+#: §26e: a video by index with an inclusive frame range, or a list of stills. *`source_url`,
+#: `trim_head` and `trim_tail` — the pre-§26 form — are unlisted, so refused as any unlisted name.*
+SEGMENT_FIELDS = ("id", "a", "b", "fit", "source", "start_frame", "end_frame", "stills")
+
+#: §26e — videos beyond source 0. *Stills are not counted (CF: frames do not cost).*
+MAX_SOURCES = 3
 
 #: The entry kinds `plan` puts in a mapping, spelled once. **The tuple shapes are the kit's**
 #: (`repair_oracle.plan`'s docstring) so the conformance test compares like with like — the VALUES
@@ -55,6 +62,18 @@ def _label(item):
     return "{} '{}'".format(item["type"], item["id"])
 
 
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _shape(value):
+    """What a refused value IS, never what it says — `a str`, `a list of 2` — so no URL a caller
+    put where an index belongs is echoed back (§25d: a presigned query is a credential)."""
+    if isinstance(value, list):
+        return "a list of {}".format(len(value))
+    return "a {}".format(type(value).__name__)
+
+
 # ── the door ─────────────────────────────────────────────────────────────────────────────────
 
 def _int_field(entry, field, where, item_id, default=None, minimum=None):
@@ -66,7 +85,7 @@ def _int_field(entry, field, where, item_id, default=None, minimum=None):
             return default
         raise Refused(MISSING_REQUIRED_FIELD,
                       "field '{}' is required on {}".format(field, where), item_id)
-    if isinstance(value, bool) or not isinstance(value, int):
+    if not _is_int(value):
         raise Refused(INVALID_FIELD_VALUE,
                       "field '{}' on {} must be an integer frame index, got {!r}".format(
                           field, where, value), item_id)
@@ -77,8 +96,66 @@ def _int_field(entry, field, where, item_id, default=None, minimum=None):
     return value
 
 
-def _entry(entry, kind, position):
-    """One item off the wire, normalised. Structure only; the rules between items are `_rules`."""
+def _segment_source(entry, named, item_id, n_videos, n_stills):
+    """§26e's segment fields, normalised: `source`, `start_frame`, `end_frame` (None = the video's
+    last frame, resolved by `plan`) and `stills` (None on a video segment). **An absent field and
+    a null one are the same absence**, so a normalised item passes through here unchanged.
+
+    `n_videos` counts source 0, so a valid `source` is `0 .. n_videos - 1`."""
+    source, picks = entry.get("source"), entry.get("stills")
+    if (source is None) == (picks is None):
+        raise Refused(INVALID_FIELD_VALUE,
+                      "{} names {}: a segment takes EXACTLY ONE of 'source' (a video by index, "
+                      "with start_frame/end_frame) and 'stills' (indices into "
+                      "'params.stills')".format(named, "both" if source is not None else
+                                                "neither"), item_id)
+    if picks is not None:
+        # **No value is echoed that is not an index**: the pre-§26 caller sends URLs here, and a
+        # presigned query is a credential (the §26 review's F6).
+        if not isinstance(picks, list) or not picks:
+            raise Refused(INVALID_FIELD_VALUE,
+                          "field 'stills' on {} must be a non-empty list of indices into "
+                          "'params.stills', got {}".format(named, _shape(picks)), item_id)
+        for pick in picks:
+            if not _is_int(pick) or not 0 <= pick < n_stills:
+                raise Refused(INVALID_FIELD_VALUE,
+                              "field 'stills' on {} holds {}, and 'params.stills' lists {} "
+                              "still(s) — an index must be 0 .. {}".format(
+                                  named, pick if _is_int(pick) else _shape(pick), n_stills,
+                                  n_stills - 1), item_id)
+        for field in ("start_frame", "end_frame"):
+            if entry.get(field) is not None:
+                raise Refused(INVALID_FIELD_VALUE,
+                              "field '{}' on {} is a video's frame range, and this segment "
+                              "is stills: its frames are the stills it lists, in order".format(
+                                  field, named), item_id)
+        return {"source": None, "start_frame": None, "end_frame": None, "stills": list(picks)}
+    if not _is_int(source) or not 0 <= source < n_videos:
+        raise Refused(INVALID_FIELD_VALUE,
+                      "field 'source' on {} is {}, and the request lists {} video(s) — source 0 "
+                      "is source_url and 1 .. 3 are 'params.sources', so an index must be "
+                      "0 .. {}".format(named, source if _is_int(source) else _shape(source),
+                                       n_videos, n_videos - 1), item_id)
+    start = _int_field(entry, "start_frame", named, item_id, default=0, minimum=0)
+    end = entry.get("end_frame")
+    if end is not None:
+        end = _int_field(entry, "end_frame", named, item_id)
+        if end < start:
+            raise Refused(INVALID_FIELD_VALUE,
+                          "{}: end_frame {} is before start_frame {} — the range is inclusive, so "
+                          "end_frame must be start_frame or later".format(named, end, start),
+                          item_id)
+    return {"source": source, "start_frame": start, "end_frame": end, "stills": None}
+
+
+def _entry(entry, kind, position, n_videos=1, n_stills=0, normalised=False):
+    """One item off the wire, normalised. Structure only; the rules between items are `_rules`.
+
+    **Idempotent on its own output** (a null field is an absent one), so `plan` can take either
+    the door's items or the wire's — the kit's cases are the latter. **`type` is the normalised
+    item's own key and is accepted only there** (`normalised`, `plan`'s call on an item that
+    carries its own kind): on the wire it is an unlisted field like any other (the §26 review's
+    F5)."""
     listing = "ranges" if kind == "range" else "segments"
     where = "entry {} of 'params.{}'".format(position, listing)
     if not isinstance(entry, dict):
@@ -86,7 +163,8 @@ def _entry(entry, kind, position):
     allowed = RANGE_FIELDS if kind == "range" else SEGMENT_FIELDS
     # **Strict, like every other level of the request.** *`fit` on a range is the likely mistake
     # — it is a segment's field — and accepting it would read as honoured.*
-    for name in sorted(set(entry) - set(allowed)):
+    own = {"type"} if normalised and entry.get("type") == kind else set()
+    for name in sorted(set(entry) - set(allowed) - own):
         raise Refused(FIELD_NOT_SUPPORTED,
                       "field '{}' on {} is not accepted on a {}; a {} takes {}".format(
                           name, where, kind, kind, ", ".join(allowed)),
@@ -103,17 +181,6 @@ def _entry(entry, kind, position):
             "a": _int_field(entry, "a", named, item_id),
             "b": _int_field(entry, "b", named, item_id)}
     if kind == "segment":
-        url = entry.get("source_url")
-        if url is None:
-            raise Refused(MISSING_REQUIRED_FIELD,
-                          "field 'source_url' is required on {}".format(named), item_id)
-        if not isinstance(url, str) or not url.strip():
-            raise Refused(INVALID_FIELD_VALUE,
-                          "field 'source_url' on {} must be a non-empty string".format(named),
-                          item_id)
-        item["source_url"] = url
-        item["trim_head"] = _int_field(entry, "trim_head", named, item_id, default=0, minimum=0)
-        item["trim_tail"] = _int_field(entry, "trim_tail", named, item_id, default=0, minimum=0)
         fit = DEFAULT_FIT if entry.get("fit") is None else entry["fit"]
         if fit not in FITS:
             raise Refused(INVALID_FIELD_VALUE,
@@ -121,6 +188,7 @@ def _entry(entry, kind, position):
                           "name of what the handoff called 'retime', which is now an "
                           "operation.".format(named, ", ".join(FITS), fit), item_id)
         item["fit"] = fit
+        item.update(_segment_source(entry, named, item_id, n_videos, n_stills))
     return item
 
 
@@ -173,11 +241,79 @@ def _rules(items, last_frame=None):
     return ordered
 
 
-def validate_items(params):
-    """The door: `params.ranges` and `params.segments`, normalised, or `Refused`.
+def _unused(items, n_videos, n_stills):
+    """§26e: **a listed file no segment uses is refused**, naming it — it would be fetched for
+    nothing. *Source 0 is the source itself and is always used.*"""
+    videos = {it["source"] for it in items if it.get("source") is not None}
+    stills = {pick for it in items for pick in (it.get("stills") or ())}
+    for index in range(1, n_videos):
+        if index not in videos:
+            raise Refused(INVALID_FIELD_VALUE,
+                          "sources[{}] is listed and no segment uses it; every listed file is "
+                          "fetched, so an unused one is refused rather than downloaded for "
+                          "nothing".format(index), "sources[{}]".format(index))
+    for index in range(n_stills):
+        if index not in stills:
+            raise Refused(INVALID_FIELD_VALUE,
+                          "stills[{}] is listed and no segment uses it; every listed file is "
+                          "fetched, so an unused one is refused rather than downloaded for "
+                          "nothing".format(index), "stills[{}]".format(index))
 
-    Returns the items in submission order — ranges first, then segments — each carrying `type`.
+
+def _url_list(params, listing, cap=None):
+    """`params.sources` / `params.stills`: absent, or a list of non-empty strings."""
+    raw = params.get(listing)
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(u, str) or not u.strip() for u in raw):
+        # **The value is NOT echoed**: it is a list of presigned URLs, and a query is a
+        # credential (the §26 review). Its shape is enough to act on.
+        if not isinstance(raw, list):
+            bad = "got a {}".format(type(raw).__name__)
+        else:
+            i, entry = next((i, u) for i, u in enumerate(raw)
+                            if not isinstance(u, str) or not u.strip())
+            bad = "entry {} is {}".format(i, "an empty string" if isinstance(entry, str)
+                                          else "a {}".format(type(entry).__name__))
+        raise Refused(INVALID_FIELD_VALUE,
+                      "field 'params.{}' must be a list of URL strings; {}".format(listing, bad),
+                      listing)
+    if cap is not None and len(raw) > cap:
+        raise Refused(INVALID_FIELD_VALUE,
+                      "field 'params.sources' lists {} videos and a repair takes at most {} "
+                      "beyond source 0 (source_url) — videos cost, stills do not (CF)".format(
+                          len(raw), cap), listing)
+    return raw
+
+
+def _without_query(url):
+    return url.split("?", 1)[0]
+
+
+def validate_items(params, source_url=None):
+    """The door: `params.ranges`, `params.segments`, `params.sources` and `params.stills`,
+    normalised, or `Refused`. Returns the items in submission order — ranges first, then segments
+    — each carrying `type`.
+
+    **§26e: one object listed twice is refused, `source_url` included, compared without its query
+    string** — two presigned URLs for one object differ only there, and fetching it twice is what
+    "every file is fetched once" rules out.
     """
+    sources = _url_list(params, "sources", cap=MAX_SOURCES)
+    stills = _url_list(params, "stills")
+    seen = {}
+    if isinstance(source_url, str):
+        seen[_without_query(source_url)] = "source_url"
+    for name, urls, first in (("sources", sources, 1), ("stills", stills, 0)):
+        for position, url in enumerate(urls, start=first):
+            label = "{}[{}]".format(name, position)
+            key = _without_query(url)
+            if key in seen:
+                raise Refused(INVALID_FIELD_VALUE,
+                              "{} names the same object as {} (compared without the query "
+                              "string); each file is listed once and fetched once, however "
+                              "many segments use it".format(label, seen[key]), label)
+            seen[key] = label
     items = []
     for kind, listing in (("range", "ranges"), ("segment", "segments")):
         raw = params.get(listing)
@@ -186,7 +322,10 @@ def validate_items(params):
         if not isinstance(raw, list):
             raise Refused(INVALID_FIELD_VALUE,
                           "field 'params.{}' must be an array, got {!r}".format(listing, raw))
-        items.extend(_entry(entry, kind, position) for position, entry in enumerate(raw))
+        items.extend(_entry(entry, kind, position, 1 + len(sources), len(stills))
+                     for position, entry in enumerate(raw))
+    if items:
+        _unused(items, 1 + len(sources), len(stills))
     _rules(items)
     return items
 
@@ -194,7 +333,7 @@ def validate_items(params):
 def check_bounds(frame_count, items):
     """§19d's first file-dependent rule, on its own: `b` against the source's last frame.
 
-    **Called straight after the source's probe, before any segment is fetched**, so a request
+    **Called straight after the source's probe, before any other file is fetched**, so a request
     whose anchors are off the end does not pay for its segments' downloads before it is told.
     """
     _rules(items, last_frame=frame_count - 1)
@@ -202,25 +341,41 @@ def check_bounds(frame_count, items):
 
 # ── the plan ─────────────────────────────────────────────────────────────────────────────────
 
-def _segment_positions(item):
-    """`[(lo, hi, t), ...]` for output i = 0 .. N-1, 0-based in the FILE (trim_head included).
+def _segment_positions(item, counts):
+    """`([(lo, hi, t), ...], m)` for output i = 0 .. N-1 — `lo`/`hi` are frame indices in the
+    segment's VIDEO (start_frame included), or indices into `params.stills`.
 
-    §19c: `exact` needs M == N; `resample` puts output i at `p = i·(M−1)/(N−1)` of the trimmed
-    segment (`(M−1)/2` when N = 1) and blends frames ⌊p⌋ and ⌈p⌉ at `t = p − ⌊p⌋` — **a copy when
-    t = 0**. M == N is a straight copy under either fit.
+    §19c's fit on §26e's M: `exact` needs M == N; `resample` puts output i at
+    `p = i·(M−1)/(N−1)` (`(M−1)/2` when N = 1) and blends positions ⌊p⌋ and ⌈p⌉ at `t = p − ⌊p⌋`
+    — **a copy when t = 0**. M == N is a straight copy under either fit.
     """
     n = item["b"] - item["a"] - 1
-    head = item.get("trim_head", 0)
-    m = item["m_file"] - head - item.get("trim_tail", 0)
     fit = item.get("fit", DEFAULT_FIT)
-    if m < 1:
-        raise Refused(INVALID_FIELD_VALUE,
-                      "{}: {} frames in the file less trim_head {} and trim_tail {} leaves {} — "
-                      "nothing to splice".format(_label(item), item["m_file"], head,
-                                                 item.get("trim_tail", 0), m), item["id"])
+    if item.get("stills") is not None:
+        picks = item["stills"]
+        m = len(picks)
+        at = picks.__getitem__
+    else:
+        last = counts[item["source"]] - 1
+        start = item["start_frame"]
+        end = last if item.get("end_frame") is None else item["end_frame"]
+        if end > last:
+            raise Refused(SEGMENT_EXCEEDS_SOURCE,
+                          "{}: end_frame {} and source {}'s last frame is {} — a segment's frames "
+                          "must exist in the video it names".format(
+                              _label(item), end, item["source"], last), item["id"])
+        m = end - start + 1
+        if m < 1:
+            raise Refused(INVALID_FIELD_VALUE,
+                          "{}: start_frame {} is past source {}'s last frame {}, so the segment "
+                          "holds no frames".format(_label(item), start, item["source"], last),
+                          item["id"])
+
+        def at(offset):
+            return start + offset
     if fit == "exact" and m != n:
         raise Refused(INVALID_FIELD_VALUE,
-                      "{}: fit 'exact' needs the trimmed segment to hold exactly the {} frames it "
+                      "{}: fit 'exact' needs the segment to hold exactly the {} frames it "
                       "replaces, and it holds {}. Send fit 'resample' to have it fitted".format(
                           _label(item), n, m), item["id"])
     if fit == "resample" and m != n and m < 2:
@@ -237,27 +392,40 @@ def _segment_positions(item):
             p = Fraction(i * (m - 1), n - 1)
         lo = p.numerator // p.denominator
         t = p - lo
-        positions.append((head + lo, head + (lo if t == 0 else lo + 1), t))
+        positions.append((at(lo), at(lo if t == 0 else lo + 1), t))
     return positions, m
 
 
-def plan(frame_count, ranges=(), segments=()):
+def plan(frame_count, ranges=(), segments=(), sources=(), stills=0):
     """`(mapping, warnings, summary)` or `Refused`.
 
     `mapping[n]` for output index n is one of — the kit's own shapes (`repair_oracle.plan`):
 
         ("src", n)                           source frame n, untouched
         ("range", id, k, t)                  RIFE(a, b) at t = k/(N+1)
-        ("seg", id, i, lo, hi, t)            segment file frames lo/hi; t == 0 is a copy of lo
+        ("seg", id, i, lo, hi, t)            §26e: a video segment's frames lo/hi in ITS video,
+                                             or a stills segment's still indices; t == 0 is a
+                                             copy of lo
 
-    `ranges` and `segments` are item dicts — off `validate_items`, or the kit's cases — and each
-    segment carries `m_file`, its decoded frame count. `summary` is the record's `items[]`.
+    `ranges` and `segments` are item dicts — off `validate_items`, or the wire's (the kit's cases).
+    **`sources` are the FRAME COUNTS of `params.sources`** (videos 1 .. 3; source 0's is
+    `frame_count`) and `stills` how many `params.stills` are listed — only the files know the
+    counts. `summary` is the record's `items[]`.
 
     **Anchors are read from the source and nowhere else** (§19c), so an item's entries depend on
     its own fields alone: one item's patch is the same whether it is sent alone or with others.
     """
-    items = [dict(r, type="range") for r in ranges or ()] + \
-            [dict(s, type="segment") for s in segments or ()]
+    counts = [frame_count] + list(sources or ())
+    if len(counts) - 1 > MAX_SOURCES:
+        raise Refused(INVALID_FIELD_VALUE,
+                      "{} videos beyond source 0, and a repair takes at most {}".format(
+                          len(counts) - 1, MAX_SOURCES), "sources")
+    items = [_entry(r, "range", k, normalised=True) for k, r in enumerate(ranges or ())] + \
+            [_entry(s, "segment", k, len(counts), stills, normalised=True)
+             for k, s in enumerate(segments or ())]
+    # **The oracle's order**: no items, then an unused file, then the anchors.
+    if items:
+        _unused(items, len(counts), stills)
     ordered = _rules(items, last_frame=frame_count - 1)
 
     warnings = []
@@ -277,13 +445,18 @@ def plan(frame_count, ranges=(), segments=()):
             for k in range(1, n + 1):
                 mapping[a + k] = (RANGE, item["id"], k, Fraction(k, n + 1))
         else:
-            positions, m = _segment_positions(item)
+            positions, m = _segment_positions(item, counts)
             for i, (lo, hi, t) in enumerate(positions):
                 mapping[a + 1 + i] = (SEG, item["id"], i, lo, hi, t)
-            # **`fit_applied` is what RAN, not what was asked**: a `resample` whose trimmed M
-            # already equals N is a straight copy, and the record says so.
-            entry.update(segment_frames_in=item["m_file"], segment_frames_used=m,
-                         fit_applied="exact" if m == n else "resample")
+            # **`fit_applied` is what RAN, not what was asked**: a `resample` whose M already
+            # equals N is a straight copy, and the record says so. §26f: which file, and — for a
+            # video — the inclusive range as resolved (an absent end_frame is the last frame).
+            if item.get("stills") is not None:
+                entry["stills"] = list(item["stills"])
+            else:
+                entry.update(source=item["source"], start_frame=item["start_frame"],
+                             end_frame=item["start_frame"] + m - 1)
+            entry.update(segment_frames_used=m, fit_applied="exact" if m == n else "resample")
         summary[item["id"]] = entry
     # The record lists items in the order they were SENT, which is the order a caller reads back.
     return mapping, warnings, [summary[item["id"]] for item in items]
@@ -324,21 +497,31 @@ def synthesised(mapping):
 
 # ── the one forward pass ─────────────────────────────────────────────────────────────────────
 
-class _Window:
+class Window:
     """Forward-only access to a decoded stream, holding only the frames still needed.
 
     **The plan's source indices never go backwards**, so a frame behind the lowest index anything
     still needs can be dropped — two frames in hand at most, whatever the clip length.
+
+    **`first` is the index of the stream's first frame** (§26e): a segment's video is decoded
+    from the keyframe at or before its `start_frame`, not from frame 0, so its first decoded
+    frame is frame `first` and the plan's indices are that video's own.
     """
 
-    def __init__(self, frames, what, item=None):
+    def __init__(self, frames, what, item=None, first=0):
         self._frames = iter(frames)
         self._held = {}
-        self.highest = -1
+        self.first = int(first)
+        self.highest = self.first - 1
         self._what = what
         self._item = item
 
     def at(self, index, keep=()):
+        if index < self.first:
+            raise Refused(INVALID_SOURCE,
+                          "{} was decoded from frame {} and the plan needs frame {} — before "
+                          "where its decode began".format(self._what, self.first, index),
+                          self._item)
         while self.highest < index:
             try:
                 frame = next(self._frames)
@@ -348,8 +531,8 @@ class _Window:
                               "The count the plan was built from was read from the container's "
                               "packets, and the decoder disagrees with it — frame indices are "
                               "exact or they are wrong, so this is refused rather than "
-                              "delivered shifted".format(self._what, self.highest + 1, index),
-                              self._item)
+                              "delivered shifted".format(self._what, self.highest + 1 - self.first,
+                                                         index), self._item)
             self.highest += 1
             self._held[self.highest] = frame
             for stale in [k for k in self._held if k < self.highest and k not in keep]:
@@ -363,16 +546,19 @@ def emit(mapping, anchors, source, segments, synth):
     """Yield the output frames in order. **Frames are opaque here**: this decides WHICH, never HOW.
 
     `anchors` is `{range_id: (a, b)}`; `source` an iterable of the source's decoded frames in
-    order; `segments` `{segment_id: iterable of that file's decoded frames}`; `synth(key, frame_a,
-    frame_b, t)` returns the synthesis at `t` (a `Fraction`, never 0 here) between two frames,
-    `key` naming the pair so a caller can cache it. **How many frames each stream handed over
-    is the CALLER's count** (`routec.DecodeCount`, at the decoder), not this function's.
+    order; `segments` `{segment_id: frames}`, where `frames` is an iterable decoded from that
+    segment's frame 0, **or anything with `at(index, keep=())`** — a `Window` over a video decoded
+    from its keyframe (§26e), or a caller's stills reader, whose indices need not rise. `synth(key,
+    frame_a, frame_b, t)` returns the synthesis at `t` (a `Fraction`, never 0 here) between two
+    frames, `key` naming the PAIR so a caller can cache it. **How many frames each stream handed
+    over is the CALLER's count** (`routec.DecodeCount`, at the decoder), not this function's.
 
     **A range's anchors are SOURCE frames a and b.** *The frames between them are decoded and
     dropped unread — they are the damage* — and b is held until its own output index copies it.
     """
-    src = _Window(source, "the source")
-    windows = {sid: _Window(frames, "segment '{}'".format(sid), sid)
+    src = Window(source, "the source")
+    windows = {sid: (frames if hasattr(frames, "at")
+                     else Window(frames, "segment '{}'".format(sid), sid))
                for sid, frames in segments.items()}
     for n, entry in enumerate(mapping):
         kind = entry[0]
@@ -392,4 +578,6 @@ def emit(mapping, anchors, source, segments, synth):
             else:
                 frame_lo = window.at(lo, keep=(lo, hi))
                 frame_hi = window.at(hi, keep=(lo, hi))
-                yield synth((SEG, sid, lo), frame_lo, frame_hi, t)
+                # **`hi` is in the key** (§26e): a stills segment may pair one still with two
+                # different neighbours, and a key naming only `lo` would reuse the wrong pair.
+                yield synth((SEG, sid, lo, hi), frame_lo, frame_hi, t)

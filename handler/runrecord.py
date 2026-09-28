@@ -129,7 +129,7 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
           retime=None, transfer=None, eta=None, estimate=None, tie_check=None,
           convert_check=None, input_check=None, decode_probe=None, encode_defaults=None,
           codec=None, bit_depth=None, reference=None, cap=None, op=None, frame_repair=None,
-          derived=None, derive_failed=None):
+          derived=None, derive_failed=None, source_probes=None, stills=None):
     """The record body. Metadata only — every argument here is a number, a name or a shape."""
     body = {
         "kind": "run-record",
@@ -162,7 +162,11 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         # `retime` block and a `frame_repair` one in its place, and `op` and `derive_s` are
         # mandatory from 3* — **a shape that moved under an unchanged version is what the
         # harvester's version gate exists to stop.** The 2026-09-26 build shipped this at 2.
-        "record_version": 3,
+        # **4 FROM 2026-09-28, ON BOTH OPERATIONS** (`decisions.md` §26f): a segment item's shape
+        # moved (`source`/`stills`, `start_frame`, `end_frame`, `decode_start_frame`,
+        # `frames_decoded`; `segment_frames_in` dropped), and `transfer` gained `files_fetched`
+        # while its upload part became the master's own.
+        "record_version": 4,
         "utc": diagnostics._now(),
         "status": status,
         "build": build_identity,
@@ -240,6 +244,11 @@ def build(status, build_identity, machine, request=None, rationale=None, source=
         "cap": cap,
         "rationale": rationale,
         "source": source,
+        # **§26f: one probe per VIDEO, source 0 first**, each the `source` block's fields —
+        # `source` stays source 0's alone. *And the stills a repair listed, one entry each.* Both
+        # on both operations (§26g N2): a retime's are `[source]` and `[]`.
+        "source_probes": source_probes,
+        "stills": stills,
         "output": output,
         # **The strip that used to be silent**, measured in halves because its two costs have
         # different causes: a CPU-and-page-cache-bound import, and a checkpoint read whose price

@@ -37,23 +37,32 @@ from errors import (FIELD_NOT_SUPPORTED, INVALID_FIELD_VALUE, MISSING_REQUIRED_F
 #: of 16 or 32 ran 10 and filed its own number; found in review), plus the one being read.
 #: **§25b: RULED 16 x 64 MiB by Suite 16's sweep** — 14.6 s at 8K against 33.5 s for 8 x 32; *17
 #: parts of 64 MiB bound the buffers at ~1.09 GB, the memory rule's edge, stated in the section.*
-#: The request's debug fields `upload_concurrency` / `upload_part_mb` move it for a sweep and
-#: nothing else. *A part is MiB and is recorded in bytes.*
+#: **§26d: THE PART SIZE IS TAKEN FROM THE FILE, AND THE CALLER HAS NO SAY** (CF, 2026-09-28): the
+#: debug fields §24 added for Suite 16's sweep are deleted and refused as unlisted. *A part is MiB
+#: and is recorded in bytes.*
+#:
+#:     part       ceil(file bytes / 32), rounded up to a whole MiB, kept within 8-64 MiB
+#:     in flight  16 (§25b)
+#:     multipart  from 16 MiB (was 100 MB) — so a 103 MB 1080p master goes in 13 parts of 8 MiB
 UPLOAD_CONCURRENCY_DEFAULT = 16
-UPLOAD_PART_MB_DEFAULT = 64
-UPLOAD_CONCURRENCY_MIN, UPLOAD_CONCURRENCY_MAX = 1, 32
-UPLOAD_PART_MB_MIN, UPLOAD_PART_MB_MAX = 8, 256
+UPLOAD_PARTS_TARGET = 32
+UPLOAD_PART_MIB_MIN, UPLOAD_PART_MIB_MAX = 8, 64
+UPLOAD_MULTIPART_THRESHOLD_MIB = 16
 
 #: **§25a: THE SOURCE IS FETCHED IN PARALLEL RANGES** — N streams of P MiB written in place, every
-#: range held to the probe's ETag. **PROVISIONAL**: Suite 17 sweeps 1 / 8 / 16 and rules it by
-#: §24's rule. `fetch_concurrency` / `fetch_part_mb` move it for the sweep; `fetch_sha256` hashes
-#: the finished source into the record so the kit can prove the reassembly byte-exact. **A source
-#: under `FETCH_RANGED_MIN_MB` is fetched as one stream**, as it always was.
+#: range held to the probe's ETag. **§26d: always 8 x 32 MiB; the sweep's knobs are deleted.**
+#: `fetch_sha256` stays (debug): it hashes the finished source into the record so the kit can
+#: prove the reassembly byte-exact. **A file under `FETCH_RANGED_MIN_MB` is one stream**, as it
+#: always was.
 FETCH_CONCURRENCY_DEFAULT = 8
 FETCH_PART_MB_DEFAULT = 32
-FETCH_CONCURRENCY_MIN, FETCH_CONCURRENCY_MAX = 1, 32
-FETCH_PART_MB_MIN, FETCH_PART_MB_MAX = 8, 256
 FETCH_RANGED_MIN_MB = 64
+
+
+def upload_part_bytes(nbytes):
+    """§26d: the part size, in bytes, for a file of `nbytes`. **Pure.**"""
+    mib = -(-int(nbytes) // (UPLOAD_PARTS_TARGET * 1024 * 1024))
+    return min(max(mib, UPLOAD_PART_MIB_MIN), UPLOAD_PART_MIB_MAX) * 1024 * 1024
 
 
 #: **`source` means "match the input's codec"**, which is a release-3 field and not a default.

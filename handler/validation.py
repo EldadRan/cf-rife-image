@@ -203,13 +203,8 @@ PARAMS_DEBUG = (
     # **No default, and absent is not zero** — a `snap_tolerance` of 0 would ship the unsnapped
     # plan as the ruled answer before the benchmark that decides it has run.
     "snap_tolerance",
-    # **§24: Suite 16's sweep of the upload's parts**, both operations, and for that and nothing
-    # else. Absent means `storage`'s ruled default.
-    "upload_concurrency",
-    "upload_part_mb",
-    # §25a: the fetch's ranges, and the source's hash, for Suite 17. Both operations.
-    "fetch_concurrency",
-    "fetch_part_mb",
+    # §25a: the fetched source's hash, so the kit can prove a fetch byte-exact. Both operations.
+    # *§26d deleted the four part knobs beside it — the caller has no say (CF, 2026-09-28).*
     "fetch_sha256",
 )
 
@@ -227,6 +222,10 @@ REPAIR_PARAMS_PRODUCTION = (
     # §20a: "auto" copies what the repair does not change where it can; "full" forces the
     # full re-encode. *A repair's name only, so on a retime it is refused as unlisted.*
     "reencode",
+    # §26e: the videos beyond source 0 (source 0 is `source_url`), and the stills — each a URL,
+    # each fetched once however many segments name it.
+    "sources",
+    "stills",
 )
 
 #: §20a. The first is the default.
@@ -245,11 +244,7 @@ REPAIR_PARAMS_DEBUG = (
     "threads",
     "sliced_threads",
     "rc_lookahead",
-    # §24 and §25a, as on retime.
-    "upload_concurrency",
-    "upload_part_mb",
-    "fetch_concurrency",
-    "fetch_part_mb",
+    # §25a, as on retime.
     "fetch_sha256",
 )
 
@@ -625,14 +620,14 @@ def validate(job_input):
                 "a large host means up to {} frame-threads and is the setting this worker exists "
                 "to bound — so auto is not reachable through this field. Send nothing and this "
                 "field is not a constant: it is chosen by the DELIVERED frame size against a "
-                "boundary of {} pixels, and the two rows say {} and {} respectively ({} above "
-                "it on a frame_repair, §22b).".format(
+                "boundary of {} pixels, and the two rows say {} and {} respectively (a "
+                "frame_repair takes the largest of {} its frame size allows, §26c).".format(
                     encoder.THREADS_MIN, encoder.THREADS_MAX, threads,
                     encoder.THREADS_MAX,
                     encoder.AREA_BOUNDARY_DELIVERED_PIXELS,
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_SMALL]["threads"],
                     encoder.AREA_DEFAULTS[encoder.AREA_ROW_LARGE]["threads"],
-                    encoder.REPAIR_AREA_DEFAULTS[encoder.REPAIR_AREA_ROW_LARGE]["threads"]),
+                    ", ".join(str(n) for n in encoder.REPAIR_THREAD_CHOICES)),
             )
 
     sliced_threads = params.get("sliced_threads")
@@ -672,29 +667,7 @@ def validate(job_input):
     reference_score = (False if reference_score is None
                        else _as_bool(reference_score, "reference_score"))
 
-    # ── §24 / §25a: the upload's parts and the fetch's ranges, range-checked here and resolved
-    # in `storage` ────────────────────────────────────────────────────────────────────────────
-    upload_fields = {}
-    for name, low, high, default, sweep in (
-            ("upload_concurrency", envelope.UPLOAD_CONCURRENCY_MIN,
-             envelope.UPLOAD_CONCURRENCY_MAX, envelope.UPLOAD_CONCURRENCY_DEFAULT,
-             "Suite 16's upload sweep (decisions.md §24)"),
-            ("upload_part_mb", envelope.UPLOAD_PART_MB_MIN, envelope.UPLOAD_PART_MB_MAX,
-             envelope.UPLOAD_PART_MB_DEFAULT, "Suite 16's upload sweep (decisions.md §24)"),
-            ("fetch_concurrency", envelope.FETCH_CONCURRENCY_MIN,
-             envelope.FETCH_CONCURRENCY_MAX, envelope.FETCH_CONCURRENCY_DEFAULT,
-             "Suite 17's fetch sweep (decisions.md §25a)"),
-            ("fetch_part_mb", envelope.FETCH_PART_MB_MIN, envelope.FETCH_PART_MB_MAX,
-             envelope.FETCH_PART_MB_DEFAULT, "Suite 17's fetch sweep (decisions.md §25a)")):
-        value = params.get(name)
-        if value is not None:
-            value = _as_int(value, name)
-            if not low <= value <= high:
-                raise WorkerError(
-                    INVALID_FIELD_VALUE,
-                    "field '{}' must be within {}-{}, got {}. It is {}; send nothing for this "
-                    "worker's default of {}.".format(name, low, high, value, sweep, default))
-        upload_fields[name] = value
+    # §25a: the fetched source's hash. *§26d deleted the part knobs beside it.*
     fetch_sha256 = params.get("fetch_sha256")
     fetch_sha256 = False if fetch_sha256 is None else _as_bool(fetch_sha256, "fetch_sha256")
 
@@ -844,7 +817,10 @@ def validate(job_input):
     # **§19c/§19d — a repair's items, AFTER every scalar field and every cross-field rule.** *What
     # the request alone can settle is refused here and writes no record; the bound on `b`, the
     # source's cadence and each segment's M need the files and are `handler._repair`'s.*
-    items = repair_plan.validate_items(params) if repair else None
+    # §26e: `sources` and `stills` are checked there too, against `source_url`, because which
+    # file each segment names — and whether each listed file is named at all — is one rule.
+    items = (repair_plan.validate_items(params, _as_str(job_input["source_url"], "source_url"))
+             if repair else None)
 
     # **§20a — `reencode`, a string from two.** *A bool is refused rather than read as "full":
     # `true` says "yes" to a question the field does not ask.*
@@ -898,6 +874,9 @@ def validate(job_input):
         # `params.output` on a repair means the source's format, and only the probe knows it,
         # so `release_3`'s defaults cannot say it (they are retime's h264 8-bit).
         "frame_repair": {"items": items, "reencode": reencode,
+                         # §26e: URLs as sent; the door has checked them (`repair_plan`).
+                         "sources": list(params.get("sources") or ()),
+                         "stills": list(params.get("stills") or ()),
                          "output_given": {name: (params.get("output") or {}).get(name)
                                           for name in ("codec", "bit_depth")}}
         if repair else None,
@@ -913,12 +892,6 @@ def validate(job_input):
         "threads": threads,
         "sliced_threads": sliced_threads,
         "rc_lookahead": rc_lookahead,
-        # §24: None where the caller sent nothing — `storage.upload_settings` fills the default.
-        "upload_concurrency": upload_fields["upload_concurrency"],
-        "upload_part_mb": upload_fields["upload_part_mb"],
-        # §25a: None where the caller sent nothing — `storage.fetch_settings` fills the default.
-        "fetch_concurrency": upload_fields["fetch_concurrency"],
-        "fetch_part_mb": upload_fields["fetch_part_mb"],
         "fetch_sha256": fetch_sha256,
         "convert_check": convert_check,
         "tie_check": tie_check,

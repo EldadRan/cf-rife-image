@@ -120,24 +120,33 @@ AREA_DEFAULTS = {
     AREA_ROW_LARGE: {"threads": 16, "sliced_threads": True, "rc_lookahead": 10},
 }
 
-#: **§22b: A REPAIR's h264 ENCODE HAS ITS OWN ROW ABOVE THE BOUNDARY, MEASURED** (Suite 14's sweep,
-#: W-2026-09-27d: A40, 96 cores, 8K full path, no derives). *§11's rows were ruled for retime, whose
-#: encoder waits on RIFE; on a repair the encoder is the job.*
+#: **§26c: A REPAIR's h264 THREADS ARE CHOSEN FROM THE FRAME SIZE** (replaces §22b's per-area row).
+#: *§11's rows were ruled for retime, whose encoder waits on RIFE; on a repair the encoder is the
+#: job, and more x264 threads cost host memory in proportion to the frame.* **The largest of
+#: `REPAIR_THREAD_CHOICES` whose predicted peak stays under the bound**, not sliced, rc_lookahead 10:
 #:
-#:     16 sliced       compute 689 s   host memory peak 12.9 GB
-#:     32 not sliced   compute 221 s                    23.6 GB  (51% of 46.57)   <- this row
-#:     64 not sliced   compute 218 s                    32.8 GB  (70%, over §22b's 60%)
+#:     0.0222 GB x MP x threads  <=  27.94 GB   (60% of the smallest host served, 46.57 GB)
+#:     0.0222 is the worst reading: 8K at 32 threads peaked 23.6 GB (Suite 14, W-2026-09-27d)
+#:     -> 64 threads up to ~19.6 MP, 32 up to ~39.3 MP (8K is 33.2), 16 above
 #:
-#: **Only the large row is swept**, so the small row — 4K and 1080p — is §11's, unchanged. Read by
-#: `resolve_defaults(..., operation="frame_repair")`: the full path (both pipelines) and the copy
-#: path's span encoders. *Retime never passes it.* The caller's debug fields still win, as on every
-#: row. **Its own basis name**, so a record says which table chose its threads.
-REPAIR_AREA_ROW_LARGE = "area:large:repair"
-REPAIR_AREA_DEFAULTS = {
-    #                       threads  sliced_threads  rc_lookahead
-    AREA_ROW_SMALL: AREA_DEFAULTS[AREA_ROW_SMALL],
-    REPAIR_AREA_ROW_LARGE: {"threads": 32, "sliced_threads": False, "rc_lookahead": 10},
-}
+#: Read by `resolve_defaults(..., operation="frame_repair")`: the full path (both pipelines) and
+#: the copy path's span encoders. *Retime never passes it, and h265 has no such rule.* The caller's
+#: debug fields still win, as on every row. **Its own basis name**, so a record says who chose.
+REPAIR_BASIS_RULE = "rule:repair_memory"
+REPAIR_THREAD_CHOICES = (64, 32, 16)
+REPAIR_GB_PER_MP_THREAD = 0.0222
+REPAIR_MEMORY_BOUND_GB = 27.94
+REPAIR_RULE_FIXED = {"sliced_threads": False, "rc_lookahead": 10}
+
+
+def repair_threads(delivered_pixels):
+    """§26c's thread count for a repair's h264 encode at this frame size. **Pure.**"""
+    mp = int(delivered_pixels) / 1e6
+    for threads in REPAIR_THREAD_CHOICES:
+        if REPAIR_GB_PER_MP_THREAD * mp * threads <= REPAIR_MEMORY_BOUND_GB:
+            return threads
+    return REPAIR_THREAD_CHOICES[-1]
+
 
 #: The three fields the table decides. `crf` and `preset` are NOT among them — they are §6a
 #: fields with their own defaults and the table says nothing about either, so a job that sends
@@ -390,7 +399,8 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
     `codec` of `None` means the caller named none, which is `envelope.DEFAULT_CODEC` — resolved
     here rather than at the call site so the default has one home.
 
-    **`operation="frame_repair"` reads `REPAIR_AREA_DEFAULTS`** (§22b); anything else, §11's.
+    **`operation="frame_repair"` takes §26c's rule** (`repair_threads`), basis
+    `"rule:repair_memory"`; anything else, §11's rows.
     """
     codec = resolve_codec(codec)
     if codec not in CODEC_LIBRARIES:
@@ -429,14 +439,15 @@ def resolve_defaults(delivered_pixels, codec=None, threads=None, sliced_threads=
             "boundary": AREA_BOUNDARY_DELIVERED_PIXELS,
         }
     row = area_row(delivered_pixels)
-    table = AREA_DEFAULTS
     if operation == "frame_repair":
-        table = REPAIR_AREA_DEFAULTS
-        if row == AREA_ROW_LARGE:
-            row = REPAIR_AREA_ROW_LARGE
+        # §26c: no row and no boundary decides it — the frame's pixels do.
+        row = REPAIR_BASIS_RULE
+        rowed = dict(REPAIR_RULE_FIXED, threads=repair_threads(delivered_pixels))
+    else:
+        rowed = AREA_DEFAULTS[row]
     sent = {"threads": threads, "sliced_threads": sliced_threads, "rc_lookahead": rc_lookahead}
     chosen = {name: value for name, value in sent.items() if value is not None}
-    settings = dict(table[row])
+    settings = dict(rowed)
     settings.update(chosen)
     # **Three states, and the middle one is the reason `basis` is one field.** Nothing sent is the
     # row; everything sent is the caller; anything else is genuinely mixed and says so rather than

@@ -30,6 +30,8 @@ terms that overrun a cap, because those are exactly the ones nobody can isolate.
 **THE POOL IS THE BAND, NOT THE CELL**, so the low-volume figures carry the deliberately bad `ft=1`
 and `ft=2` runs. *That is the conservative direction and it is deliberate.*
 """
+import math
+
 
 #: HEVC's coding-tree-unit size, which is what makes the row count `height / 64`.
 CTU_SIZE = 64
@@ -452,48 +454,62 @@ def derive_expected(frames, width, height):
             "added_s": round(max(0.0, derive - upload), 3)}
 
 
-# ── §25c: A REPAIR's OWN FIRST ETA ──────────────────────────────────────────────────────────────
+# ── §26a: A REPAIR's FIRST ETA IS FRAMES x A PER-FRAME TIME FROM THE FRAME SIZE ─────────────────
 #
-# **Retime's table priced a repair at 1.0 s x 1,200 frames = 1,200 s at 8K, where the same request
-# delivers in 211-420 s since §20-§24** (F-2026-09-27-3). *PROVISIONAL, AND THE SECTION SAYS SO:
-# Suite 17 recalibrates every number below.* The frame LIMITS stay retime's table.
-#: `(pixels above, s/frame)`, the first row that matches. 8K reads 0.128 (L40S) - 0.184 (A40) at
-#: 32 threads, 4K 0.081 - 0.101 at 16; the last row is a placeholder (720p read 0.011, 1080p none).
-REPAIR_RATE_BY_AREA = ((8.3e6, 0.15), (2.1e6, 0.10), (0.0, 0.03))
-#: The copy path's term per source MB, as §25c states it.
+# **Replaces §25c's formula (CF, 2026-09-28).** *Simple on purpose: one per-frame time — fetch,
+# compute and upload in one number — with a tolerance, not a model of each stage.* The frame
+# LIMITS stay retime's table; retime keeps its own seed and basis.
+#: `(pixels, seconds per frame)`: T(P) is linear in P between these and flat beyond the ends —
+#: 1080p S17k (derives excluded), 4K S17i at 64 threads, 8K S17d x 2.
+REPAIR_T_POINTS = ((2_073_600, 0.017), (8_294_400, 0.025), (33_177_600, 0.205))
+#: The copy path's term per source MB (§25c's, kept by §26a).
 REPAIR_COPY_S_PER_MB = 0.027
-REPAIR_UPLOAD_MB_PER_S = 200.0
-#: A full path's master is at least this per megapixel-frame, or the source's size if larger.
-REPAIR_MASTER_MB_PER_MP_FRAME = 0.1
-REPAIR_FIXED_S = 5.0
+#: A first ETA is never below this many seconds (§26a).
+REPAIR_FLOOR_S = 5
 #: `eta_basis` as `progress.expect` publishes it: "predicted_" + this.
-REPAIR_BASIS = "repair_v1"
+REPAIR_BASIS = "repair_v2"
+#: **§26g: the disk check's full-path master**, MB per megapixel-frame, or the source's size if
+#: larger — Suite 17's 4K and 1080p masters were half of §25c's 0.1.
+REPAIR_MASTER_MB_PER_MP_FRAME = 0.05
 
 
-def repair_rate(pixels):
-    """§25c's R(area): seconds per encoded frame. **Pure.**"""
-    return next(rate for above, rate in REPAIR_RATE_BY_AREA if pixels > above)
+def repair_t(pixels):
+    """§26a's T(P): a repair's whole-job wall per frame at `pixels`. **Pure.**"""
+    points = REPAIR_T_POINTS
+    pixels = int(pixels)
+    if pixels <= points[0][0]:
+        return points[0][1]
+    for (p0, t0), (p1, t1) in zip(points, points[1:]):
+        if pixels <= p1:
+            return t0 + (t1 - t0) * (pixels - p0) / float(p1 - p0)
+    return points[-1][1]
 
 
-def repair_seed(pixels, frames, source_bytes, path, encoded_frames=None):
-    """§25c's first ETA for a repair, in seconds, WITHOUT §23's derive term (the progress channel
-    adds that to every ETA it publishes). **Pure.**
+def repair_work(pixels, frames, source_bytes, path, encoded_frames=None):
+    """§26a's seconds for a repair, BEFORE §23's derive term, the floor and the ceiling (the
+    caller adds the derives, then takes `max(5, ceil(...))` — `repair_first_s`). **Pure.**
 
-        first_s = 5 + encode + upload [+ derives]
-        encode  full: frames x R      copy: encoded_frames x R + source MB x 0.027
-        upload  master MB / 200       copy: the source's bytes
-                                      full: max(the source's bytes, 0.1 MB x MP x frames)
+        full  frames x T(P)
+        copy  planned re-encoded frames x T(P) + source MB x 0.027
 
-    **MB and MP are 10^6** — the units the section's rates were measured in, and the kit's
-    restatement (`record_witness.repair_seed`) reads them the same way.
+    **MB is 10^6**, as the kit's restatement reads it (`record_witness.repair_seed_v2`).
     """
-    pixels, frames = int(pixels), int(frames)
-    source_mb = float(source_bytes) / 1e6
-    rate = repair_rate(pixels)
+    t = repair_t(pixels)
     if path == "copy":
-        encode = int(encoded_frames or 0) * rate + source_mb * REPAIR_COPY_S_PER_MB
-        master_mb = source_mb
-    else:
-        encode = frames * rate
-        master_mb = max(source_mb, REPAIR_MASTER_MB_PER_MP_FRAME * pixels / 1e6 * frames)
-    return REPAIR_FIXED_S + encode + master_mb / REPAIR_UPLOAD_MB_PER_S
+        return int(encoded_frames or 0) * t + float(source_bytes) / 1e6 * REPAIR_COPY_S_PER_MB
+    return int(frames) * t
+
+
+def repair_first_s(work_s, derives_s=0.0):
+    """§26a: whole seconds, rounded up, never below `REPAIR_FLOOR_S`."""
+    return max(REPAIR_FLOOR_S, int(math.ceil(float(work_s) + float(derives_s or 0.0))))
+
+
+def repair_master_bytes(pixels, frames, source_bytes, path):
+    """§26g's expected master for the disk check: the source's bytes on the copy path; on the full
+    path the larger of those and 0.05 MB x MP x frames. **Pure.**"""
+    source_bytes = int(source_bytes or 0)
+    if path == "copy":
+        return source_bytes
+    return max(source_bytes,
+               int(REPAIR_MASTER_MB_PER_MP_FRAME * 1e6 * int(pixels) / 1e6 * int(frames)))

@@ -112,6 +112,14 @@ DEADLINE_EXCEEDED = "deadline_exceeded"
 #: constants rather than merely explaining the refusal.
 HOST_CAPACITY_EXCEEDED = "host_capacity_exceeded"
 
+#: **§26e: a listed file does not fit source 0** — a video whose frame rate is off source 0's by
+#: more than 0.1% or whose displayed size differs, or a still whose size differs. *`media_splice`'s
+#: code, kept consistent on purpose.* The same files mismatch forever, so never retryable.
+SOURCES_MISMATCH = "sources_mismatch"
+
+#: **§26e: a segment's `end_frame` is past its video's last frame.** *`media_splice`'s code.*
+SEGMENT_EXCEEDS_SOURCE = "segment_exceeds_source"
+
 
 # ── Something failed. May not fail again; CF's ordinary retry classification applies ─────────
 #
@@ -158,6 +166,9 @@ NEVER_RETRYABLE = (
     # Never retryable **on the same endpoint**: the host slice is a property of the machine, so
     # an identical resend meets an identical slice. Routing is what changes the answer.
     HOST_CAPACITY_EXCEEDED,
+    # §26e: "the two new codes are not retryable".
+    SOURCES_MISMATCH,
+    SEGMENT_EXCEEDS_SOURCE,
 )
 RETRYABLE = (
     SOURCE_FETCH_FAILED,

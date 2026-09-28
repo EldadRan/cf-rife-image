@@ -39,10 +39,14 @@ R2_REGION = "auto"
 # actions are one decision, not two.** All five are proved working against real R2
 # (`docs/decisions.md` 3.2); what is still owed CF is the master's real size, which is what
 # should set this number rather than the inherited default.
-MULTIPART_THRESHOLD_BYTES = int(os.environ.get("MULTIPART_THRESHOLD_BYTES", 100 * 1024 * 1024))
+#
+# **§26d: 16 MiB, and no longer an environment reading.** *The part size follows from the file and
+# the kit grades the part COUNT against the same threshold, so a deployment that moved it would
+# file parts the rule cannot produce.*
+MULTIPART_THRESHOLD_BYTES = envelope.UPLOAD_MULTIPART_THRESHOLD_MIB * 1024 * 1024
 
-#: **§24's part settings live in `envelope`** (the request surface, importable with no third-party
-#: package, which `validation` and the kit rely on); `upload_settings` below resolves them.
+#: **§26d's part rule lives in `envelope`** (importable with no third-party package, which the
+#: tests rely on); `upload_settings` below applies it to one file.
 
 # Errors R2 returns for a credential that has expired or was never valid for this prefix.
 CREDENTIAL_ERROR_CODES = {
@@ -63,16 +67,11 @@ _CONTENT_RANGE = re.compile(r"^\s*bytes\s+(\d+)-(\d+)/(\d+)\s*$", re.IGNORECASE)
 
 
 def fetch_settings(request=None):
-    """§25a: `{"concurrency", "part_bytes", "sha256"}` for this job's fetches — the request's debug
-    fields where it sent them (validated), the provisional default where it did not. One
-    resolution for every fetch of the job, the source's and each segment's."""
+    """§25a: `{"concurrency", "part_bytes", "sha256"}` for this job's fetches. **§26d: always 8 x
+    32 MiB** — the request's part knobs are deleted; only `fetch_sha256` is read off it."""
     request = request or {}
-    concurrency = request.get("fetch_concurrency")
-    part_mb = request.get("fetch_part_mb")
-    return {"concurrency": int(concurrency if concurrency is not None
-                               else envelope.FETCH_CONCURRENCY_DEFAULT),
-            "part_bytes": int(part_mb if part_mb is not None
-                              else envelope.FETCH_PART_MB_DEFAULT) * 1024 * 1024,
+    return {"concurrency": envelope.FETCH_CONCURRENCY_DEFAULT,
+            "part_bytes": envelope.FETCH_PART_MB_DEFAULT * 1024 * 1024,
             "sha256": bool(request.get("fetch_sha256"))}
 
 
@@ -118,6 +117,30 @@ def fetch_source(source_url, destination, on_bytes=None, settings=None, stats=No
         print("[fetch] one stream: {}".format(reason), flush=True)
         received = _fetch_single(source_url, destination, on_bytes)
     return received
+
+
+def remote_size(url):
+    """§26e/§26g: a listed file's size in bytes WITHOUT its body — a `Range: bytes=0-0` GET's
+    `Content-Range` total, else its `Content-Length` when the server ignored the range — or None
+    when neither says. **Never raises**: the disk check counts an unknown size as 0 and says so.
+    *A GET, not a HEAD, because a presigned URL is signed for one method.*"""
+    try:
+        with requests.get(url, headers={"Range": "bytes=0-0"}, stream=True,
+                          timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S)) as response:
+            if response.status_code == 206:
+                match = _CONTENT_RANGE.match(response.headers.get("Content-Range") or "")
+                return int(match.group(3)) if match else None
+            if response.status_code == 200:
+                declared = response.headers.get("Content-Length")
+                return int(declared) if declared and declared.isdigit() else None
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+    return None
+
+
+def fetch_single(url, destination):
+    """§26e: a still's fetch — the single stream (`_fetch_single`), no progress. Returns bytes."""
+    return _fetch_single(url, destination)
 
 
 def sha256_file(path):
@@ -378,17 +401,17 @@ def client_for(output):
     )
 
 
-def upload_settings(request=None):
-    """§24: `{"concurrency", "part_bytes"}` for this job's uploads — the request's debug fields
-    where it sent them (validated), the provisional default where it did not. One resolution
-    for every upload of the job, so the record's two fields describe all of them."""
-    request = request or {}
-    concurrency = request.get("upload_concurrency")
-    part_mb = request.get("upload_part_mb")
-    return {"concurrency": int(concurrency if concurrency is not None
-                               else envelope.UPLOAD_CONCURRENCY_DEFAULT),
-            "part_bytes": int(part_mb if part_mb is not None
-                              else envelope.UPLOAD_PART_MB_DEFAULT) * 1024 * 1024}
+def upload_settings(path):
+    """§26d: `{"concurrency", "part_bytes"}` for uploading the file at `path` — 16 in flight, the
+    part from the file's own size (`envelope.upload_part_bytes`). **Per file, not per job**: the
+    master, each derive and each PNG take their own. A size that cannot be read takes the floor;
+    the upload then fails on its own terms, as it always did."""
+    try:
+        nbytes = os.path.getsize(path)
+    except OSError:
+        nbytes = 0
+    return {"concurrency": envelope.UPLOAD_CONCURRENCY_DEFAULT,
+            "part_bytes": envelope.upload_part_bytes(nbytes)}
 
 
 class _Relay:
@@ -525,8 +548,8 @@ def upload(client, output, name, path, content_type, on_bytes=None, settings=Non
     accumulation happens here so every caller does not repeat it, and `expected` is the file's
     own size, which is known before the first byte moves. *Monotonic under threads* (`_Relay`).
 
-    **§24: `settings` is `upload_settings`'s** — N parts of P bytes in flight; None is the
-    provisional default. **A part that fails fails the upload** as it always has
+    **§26d: `settings` is `upload_settings`'s** — N parts of P bytes in flight; None resolves them
+    from this file. **A part that fails fails the upload** as it always has
     (`OUTPUT_WRITE_FAILED`), **and the multipart upload is aborted**: s3transfer registers
     `AbortMultipartUpload` as the failure cleanup the moment the upload is created
     (`s3transfer/tasks.py`, `CreateMultipartUploadTask`), so no parts are left under the caller's
@@ -548,7 +571,7 @@ def upload(client, output, name, path, content_type, on_bytes=None, settings=Non
         expected = os.path.getsize(path)
     except OSError:
         expected = None
-    settings = settings or upload_settings()
+    settings = settings or upload_settings(path)
     relay = _Relay(on_bytes, expected)
     config = TransferConfig(
         multipart_threshold=MULTIPART_THRESHOLD_BYTES,
